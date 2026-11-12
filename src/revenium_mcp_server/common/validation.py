@@ -24,6 +24,8 @@ __all__ = [
     "validate_string_params",
     "apply_filter_allowlist",
     "refuse_arguments_the_action_ignores",
+    "refuse_every_argument_the_read_ignores",
+    "is_blank",
     "SAFE_INT_MAX",
 ]
 
@@ -526,12 +528,14 @@ def refuse_arguments_the_action_ignores(
     *,
     honoured_by: Collection[str],
     known_actions: Collection[str],
+    alternative: Optional[str] = None,
 ) -> None:
     """Refuse a call that sends an argument ``action`` never reads.
 
     Only a known action is checked, so a mistyped one still gets the tool's
     unknown-action answer. The refusal names the arguments and never quotes
-    their values, which carry emails, names and free-form data.
+    their values, which carry emails, names and free-form data. ``alternative``
+    ends the refusal when the action has another way to take what they carry.
 
     Raises:
         ToolError: when ``action`` is known, is not in ``honoured_by`` and
@@ -539,7 +543,51 @@ def refuse_arguments_the_action_ignores(
     """
     if action not in known_actions or action in honoured_by:
         return
+    # The registries pass an argument the caller left out as None, so any other value, a blank
+    # one included, was sent to an action that has no use for it.
     sent = [name for name in names if arguments.get(name) is not None]
+    readers = ", ".join(sorted(honoured_by))
+    _refuse_sent(action, sent, f"; it is read only by {readers}", alternative)
+
+
+def refuse_every_argument_the_read_ignores(
+    action: str,
+    arguments: Mapping[str, Any],
+    *,
+    reads: Collection[str],
+    sent_on_every_call: Collection[str],
+    alternative: str,
+) -> None:
+    """Refuse every argument a read does not take, so its answer never reads as narrowed.
+
+    The refused set is what the call carries minus what the read takes and what the registry
+    sends on every call, so an argument a tool declares later is refused without being listed.
+    A blank value narrows nothing and is not refused. The refusal names the arguments, never
+    their values.
+
+    Raises:
+        ToolError: when an argument outside ``reads`` and ``sent_on_every_call`` is not blank.
+    """
+    # A registry passes an unsent ``filters`` as {}, and a blank value narrows nothing, so only a
+    # value that is not blank is a narrowing the caller expects to see applied.
+    sent = [
+        name
+        for name, value in arguments.items()
+        if name not in reads and name not in sent_on_every_call and not is_blank(value)
+    ]
+    _refuse_sent(action, sent, "", alternative)
+
+
+def is_blank(value: Any) -> bool:
+    """True for None, text that is only whitespace, and an empty collection."""
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, (Mapping, list, tuple, set)):
+        return not value
+    return value is None
+
+
+def _refuse_sent(action: str, sent: List[str], readers_clause: str, alternative: Optional[str]) -> None:
     if not sent:
         return
 
@@ -547,9 +595,9 @@ def refuse_arguments_the_action_ignores(
     from .error_handling import create_structured_validation_error
 
     refused = ", ".join(sent)
-    readers = ", ".join(sorted(honoured_by))
+    message = f"{action} does not read {refused}{readers_clause}."
     raise create_structured_validation_error(
-        message=f"{action} does not read {refused}; it is read only by {readers}.",
+        message=f"{message} {alternative}." if alternative else message,
         field=sent[0],
         value=None,
         suggestions=[f"Drop {refused} from this {action} call."],

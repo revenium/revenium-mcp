@@ -53,6 +53,7 @@ _TOOL_REPORT_METHODS = (
     "get_top_tools_by_call_count",
     "get_cost_by_tool_agent",
     "get_cost_by_tool_provider",
+    "get_tool_cost_and_call_volume",
 )
 
 

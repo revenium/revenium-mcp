@@ -516,8 +516,54 @@ def _format_price_per_token(price: Any) -> str:
     return "n/a" if rendered == "n/a" else f"{rendered}/token"
 
 
+def _token_count(value: Any) -> Optional[int]:
+    """A band bound as a whole number of tokens, or None when it is not one."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _prompt_size_range(band: Dict[str, Any]) -> str:
+    """Which prompt sizes a band covers: larger than abovePromptTokens, at most throughPromptTokens.
+
+    A bound that cannot be read as a whole number is named as not given rather
+    than printed, and a band with neither bound readable says so.
+    """
+    above = _token_count(band.get("abovePromptTokens"))
+    through = band.get("throughPromptTokens")
+    ceiling = _token_count(through)
+    if above is None:
+        if ceiling is not None:
+            return f"prompts through {ceiling:,} tokens, lower bound not given"
+        return "prompt sizes not given"
+    # The platform's pricing sync stores a band starting at the first token as -1.
+    starts_at_first_token = above < 0
+    if starts_at_first_token:
+        if ceiling is not None:
+            return f"prompts of at most {ceiling:,} tokens"
+        return "every prompt" if through is None else "prompt sizes not given"
+    if ceiling is not None:
+        return f"prompts above {above:,} through {ceiling:,} tokens"
+    if through is None:
+        return f"prompts above {above:,} tokens"
+    return f"prompts above {above:,} tokens, upper bound not given"
+
+
+def _context_price_bands(model: Dict[str, Any], indent: str = "") -> str:
+    """One bullet per contextPricing band; nothing when the model bills every prompt at its ordinary prices."""
+    context_pricing = model.get("contextPricing")
+    bands = context_pricing.get("bands") if isinstance(context_pricing, dict) else None
+    if not isinstance(bands, list):
+        return ""
+    return "".join(
+        f"{indent}- Long-prompt price ({_prompt_size_range(band)}): "
+        f"Input {_format_price_per_token(band.get('inputCostPerToken'))}, "
+        f"Output {_format_price_per_token(band.get('outputCostPerToken'))}\n"
+        for band in bands
+        if isinstance(band, dict)
+    )
+
+
 def _ai_model_row(model: Dict[str, Any]) -> str:
-    """One AI catalog listing row: name, per-token prices and the price-pin status.
+    """One AI catalog listing row: name, per-token prices, the price-pin status and any long-prompt prices.
 
     BACK-3084: a pinned price does not track the upstream rate card, so a cost
     figure built on it is only defensible if the pin is visible.
@@ -528,6 +574,7 @@ def _ai_model_row(model: Dict[str, Any]) -> str:
     return (
         f"- **{name}** (Input: {input_cost}, Output: {output_cost}, "
         f"Price pinned: {_format_price_pin(model)})\n"
+        f"{_context_price_bands(model, indent='  ')}"
     )
 
 
@@ -6852,6 +6899,7 @@ Use `validate()` before submission."""
                     text += f"- **ID**: {model_id}\n"
                     text += f"- **Input Cost**: {_format_price_per_token(input_cost)}\n"
                     text += f"- **Output Cost**: {_format_price_per_token(output_cost)}\n"
+                    text += _context_price_bands(model)
                     # BACK-3084: read-only price-pin status (see _format_price_pin).
                     text += f"- **Price Pinned**: {_format_price_pin(model)}\n"
 
@@ -7210,7 +7258,8 @@ Use `validate()` before submission."""
                 text += f"**Model ID**: {exact_match.get('id')}\n\n"
                 text += "**Cost Information**:\n"
                 text += f"- Input: {_format_price_per_token(exact_match.get('inputCostPerToken'))}\n"
-                text += f"- Output: {_format_price_per_token(exact_match.get('outputCostPerToken'))}\n\n"
+                text += f"- Output: {_format_price_per_token(exact_match.get('outputCostPerToken'))}\n"
+                text += _context_price_bands(exact_match) + "\n"
                 text += "**✅ Ready for metering transactions**"
 
                 return [TextContent(type="text", text=text)]

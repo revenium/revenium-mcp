@@ -63,7 +63,7 @@ class CostSummaryFormatter(AnalyticsResponseFormatter):
 - **Total Cost**: {total_text}
 - **Analysis Date**: {timestamp}
 
-{self._format_parts_not_read(data.get("not_read") or {}, data.get("not_read_in_time") or [], period)}{self._format_parts_incomplete(incomplete)}## **Top Contributors**
+{self._format_parts_not_read(data.get("not_read") or {}, data.get("not_read_in_time") or [], data.get("not_read_without_permission") or [], period)}{self._format_parts_incomplete(incomplete)}## **Top Contributors**
 
 """
 
@@ -143,14 +143,22 @@ class CostSummaryFormatter(AnalyticsResponseFormatter):
 
     @staticmethod
     def _format_parts_not_read(
-        not_read: Dict[str, str], not_read_in_time: List[str], period: str
+        not_read: Dict[str, str],
+        not_read_in_time: List[str],
+        not_read_without_permission: List[str],
+        period: str,
     ) -> str:
         """Name each part that could not be read, its reason and the action that reads it alone.
 
         A part that ran out of time would run out again over the same period,
-        so its retry names a shorter one.
+        so its retry names a shorter one; a part the credential may not read
+        would be refused again, so it gets no retry.
         """
-        from ..simple_cost_analyzer import COST_SUMMARY_PARTS, shorter_period_retry
+        from ..simple_cost_analyzer import (
+            COST_SUMMARY_PARTS,
+            not_permitted_note,
+            shorter_period_retry,
+        )
 
         if not not_read:
             return ""
@@ -158,7 +166,9 @@ class CostSummaryFormatter(AnalyticsResponseFormatter):
         for part in COST_SUMMARY_PARTS:
             if part.key not in not_read:
                 continue
-            if part.key in not_read_in_time:
+            if part.key in not_read_without_permission:
+                retry = not_permitted_note(part)
+            elif part.key in not_read_in_time:
                 retry = shorter_period_retry(part, period)
             else:
                 retry = f"Retry this part alone with `{part.action}`."

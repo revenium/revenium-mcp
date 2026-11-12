@@ -800,6 +800,9 @@ UNVERIFIED_UPDATE_FIELDS = frozenset(
         # The alert reads only count webhookConfigurations; whether the platform echoes
         # the ids it was sent or resolved webhook objects has not been established.
         "webhookConfigurations",
+        # Write-only on the platform's alert: never returned, so neither the update
+        # answer nor a fresh read can confirm it.
+        "changeReason",
         # Stamped by the platform on every write, so a caller that echoes a read alert
         # back sends values the platform replaces by design.
         "createdAt",

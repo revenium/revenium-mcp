@@ -27,7 +27,12 @@ from .envelope_reads import (
 )
 from .paging import PageInfo
 from .ranked_rows import bare_cost, metric_total, rank_with_shares
-from .report_reads import fails_whole_call, platform_ran_out_of_time, read_failure_reason
+from .report_reads import (
+    fails_whole_call,
+    platform_ran_out_of_time,
+    read_failure_reason,
+    refuses_permission,
+)
 from ..tool_analytics_reports import (
     COST_BY_TOOL_AGENT,
     COST_BY_TOOL_AGGREGATED,
@@ -36,6 +41,7 @@ from ..tool_analytics_reports import (
     ToolReport,
     ToolReportWindow,
 )
+from .tool_cost_and_calls import ToolCostAndCallsPage, parse_tool_cost_and_calls
 from .tool_reports import ToolReportRead, read_tool_report
 from .validation import DEFAULT_USER_COST_SOURCES, ValidationError
 
@@ -143,10 +149,12 @@ def summary_part_time_limit_text() -> str:
 
 @dataclass(frozen=True)
 class PartNotRead:
-    """Why a summary part was not read, and whether it ran out of time."""
+    """Why a summary part was not read, whether it ran out of time, and whether
+    the credential may not read it."""
 
     reason: str
     out_of_time: bool = False
+    not_permitted: bool = False
 
 
 class TeamIdUnavailableError(Exception):
@@ -162,6 +170,14 @@ def shorter_period_retry(part: SummaryPart, period: Any) -> str:
     )
 
 
+def not_permitted_note(part: SummaryPart) -> str:
+    """Why a part the credential may not read is not worth retrying alone."""
+    return (
+        "The platform does not permit this credential to read this part, so "
+        f"`{part.action}` is refused the same way."
+    )
+
+
 class CostSummaryUnreadError(Exception):
     """No part of the cost summary could be read."""
 
@@ -173,9 +189,15 @@ class CostSummaryUnreadError(Exception):
             + "\n".join(
                 f"- {parts[key].label} ({parts[key].action}): {part.reason}."
                 + (f" {shorter_period_retry(parts[key], period)}" if part.out_of_time else "")
+                + (f" {not_permitted_note(parts[key])}" if part.not_permitted else "")
                 for key, part in not_read.items()
             )
         )
+
+    @property
+    def no_part_permitted(self) -> bool:
+        """Whether the credential may not read any part of the summary."""
+        return all(part.not_permitted for part in self.not_read.values())
 
 
 @dataclass(frozen=True)
@@ -1040,16 +1062,21 @@ class SimpleCostAnalyzer:
             if fails_whole_call(error):
                 raise
             self.logger.error(f"Cost summary part {part.key} not read: {error}")
-            return PartNotRead(read_failure_reason(error), platform_ran_out_of_time(error))
+            return PartNotRead(
+                read_failure_reason(error),
+                out_of_time=platform_ran_out_of_time(error),
+                not_permitted=refuses_permission(error),
+            )
 
     async def get_cost_summary(self, period: AnalyticsWindow, aggregation: str) -> Dict[str, Any]:
         """
         Get enhanced cost summary combining all 5 data sources.
 
         The five parts are read at once. A part that fails is named in
-        ``not_read`` with its reason, and in ``not_read_in_time`` too when the
-        platform or the wait for it ran out of time; its breakdown entry is
-        None and its top list empty. A part whose read stopped at ``ENVELOPE_MAX_PAGES`` is
+        ``not_read`` with its reason, in ``not_read_in_time`` too when the
+        platform or the wait for it ran out of time, and in
+        ``not_read_without_permission`` when the credential may not read it;
+        its breakdown entry is None and its top list empty. A part whose read stopped at ``ENVELOPE_MAX_PAGES`` is
         named in ``incomplete`` with its ``UnreadPages``; its sum and top list
         cover only the pages read. The total is the provider sum, so it is
         None when the provider part was not read and partial when that part
@@ -1098,6 +1125,9 @@ class SimpleCostAnalyzer:
                 "not_read": {key: part.reason for key, part in not_read.items()},
                 "not_read_in_time": [
                     key for key, part in not_read.items() if part.out_of_time
+                ],
+                "not_read_without_permission": [
+                    key for key, part in not_read.items() if part.not_permitted
                 ],
                 "incomplete": {
                     key: part_rows.unread
@@ -1373,6 +1403,17 @@ class SimpleCostAnalyzer:
             self._process_grouped_metrics(read.items, entity_key="provider", metric_key="cost"),
             read,
         )
+
+    async def get_tool_cost_and_call_volume(
+        self, period: AnalyticsWindow, page: int, size: int
+    ) -> ToolCostAndCallsPage:
+        """One page of tools with total cost and call count on one row, ranked by cost then calls."""
+        window = ToolReportWindow.of(period)
+        self.logger.info("Reading tool cost and call volume for %s, page %d of size %d", window, page, size)
+        envelope = await self.client.get_tool_cost_and_call_volume(
+            **window.params(), page=page, size=size
+        )
+        return parse_tool_cost_and_calls(envelope, window)
 
     async def _read_tool_report(self, report: ToolReport, period: AnalyticsWindow) -> ToolReportRead:
         self.logger.info("Reading %s for %s", report.client_method, period)

@@ -104,6 +104,9 @@ pytest tests/unit/test_auth.py
 # Run with verbose output
 pytest -v
 
+# Run the unit suite across all cores (what CI does; needs the dev extra's pytest-xdist)
+pytest tests/unit -n logical --dist worksteal
+
 # Run specific test
 pytest tests/unit/test_auth.py::TestAuthConfig
 ```

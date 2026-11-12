@@ -41,7 +41,9 @@ class FakeAnomalyPlatform:
         kept_on_update: Iterable[str] = (),
         omitted_from_update_answer: Iterable[str] = (),
         failing_list_page: Optional[int] = None,
+        refused_deletes: Optional[Dict[str, Exception]] = None,
     ) -> None:
+        self.refused_deletes = refused_deletes or {}
         self.store: Dict[str, Dict[str, Any]] = {row["id"]: dict(row) for row in anomalies}
         self.kept_on_update = frozenset(kept_on_update)
         self.omitted_from_update_answer = frozenset(omitted_from_update_answer)
@@ -52,6 +54,7 @@ class FakeAnomalyPlatform:
         self.list_calls: List[Tuple[int, int]] = []
         self.list_filters: List[Dict[str, Any]] = []
         self.deleted_ids: List[str] = []
+        self.deleted_reasons: List[Optional[str]] = []
 
     @staticmethod
     def _stored(body: Dict[str, Any]) -> Dict[str, Any]:
@@ -104,8 +107,13 @@ class FakeAnomalyPlatform:
             if key not in self.omitted_from_update_answer
         }
 
-    async def delete_anomaly(self, anomaly_id: str) -> Dict[str, Any]:
+    async def delete_anomaly(
+        self, anomaly_id: str, change_reason: Optional[str] = None
+    ) -> Dict[str, Any]:
+        if anomaly_id in self.refused_deletes:
+            raise self.refused_deletes[anomaly_id]
         self.deleted_ids.append(anomaly_id)
+        self.deleted_reasons.append(change_reason)
         del self.store[anomaly_id]
         return {}
 

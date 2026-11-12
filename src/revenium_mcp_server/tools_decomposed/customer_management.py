@@ -5,7 +5,6 @@ tool with internal composition, following the proven alert/source management tem
 """
 
 import json
-import unicodedata
 from typing import TYPE_CHECKING, Any, Dict, List, NoReturn, Optional, Tuple, Union, cast
 
 if TYPE_CHECKING:
@@ -31,6 +30,7 @@ from ..common.error_handling import (
 from ..common.department_aliases import deprecated_aliases_note
 from ..common.formatting import format_page_count_heading
 from ..common.metadata_format import refuse_malformed_metadata
+from ..common.one_line import one_line
 from ..common.partial_update_handler import PartialUpdateHandler
 from ..common.sample_coverage import (
     describe_sample,
@@ -350,12 +350,6 @@ def _with_marketplace_example(
     return payload
 
 
-# Unicode categories dropped outright from a warning field: C0/C1 controls (Cc),
-# format characters including the zero-width and bidi-override family (Cf), and
-# lone surrogates (Cs). Unassigned code points (Cn) are deliberately NOT dropped
-# — that would silently eat characters a newer Unicode release assigns.
-_WARNING_DROPPED_CATEGORIES = frozenset({"Cc", "Cf", "Cs"})
-
 # A warning line is a status line, so it is bounded. The real TEAM_NAME_COLLISION
 # message is one short sentence; anything far longer is not something a reader
 # gains from and would push the success banner off the top of the output.
@@ -369,19 +363,10 @@ def _one_line(value: Any) -> str:
     collision message interpolates the new team's name), and the rendered result
     is plain text an agent reads as status, so an embedded newline must not be
     able to fabricate a second "Warning:" line — or any other line — above the
-    success banner. Every run of whitespace, newlines and carriage returns
-    included, collapses to a single space; other control and format characters
-    are dropped; the result is truncated to ``_WARNING_FIELD_MAX_LENGTH``.
+    success banner; ``one_line`` flattens it and truncates it to
+    ``_WARNING_FIELD_MAX_LENGTH``.
     """
-    text = "".join(
-        " " if char.isspace() else char
-        for char in str(value)
-        if char.isspace() or unicodedata.category(char) not in _WARNING_DROPPED_CATEGORIES
-    )
-    text = " ".join(text.split())
-    if len(text) > _WARNING_FIELD_MAX_LENGTH:
-        text = text[: _WARNING_FIELD_MAX_LENGTH - 3].rstrip() + "..."
-    return text
+    return one_line(value, _WARNING_FIELD_MAX_LENGTH)
 
 
 # Non-blocking warnings the platform attaches to a successful create response
@@ -4526,7 +4511,7 @@ class CustomerManagement(ToolBase):
 
         result_text += "## **Team Claude Organization Links (Cowork)**\n"
         result_text += "The Claude organizations whose Cowork activity routes to the team.\n\n"
-        result_text += "- `list_cowork_org_links()` - every organization the team knows, with its `state` and, when linked, its link id\n"
+        result_text += "- `list_cowork_org_links()` - every organization the team knows, with its `state` and, when linked, its link id and the name shown in Cowork in place of Revenium, if one is set\n"
         result_text += "- `link_cowork_org(claude_org_uuid='0f8e1a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b')` or `link_cowork_org(credential_id='cred_123')` - link ONE organization\n"
         result_text += "- `unlink_cowork_org(link_id='aB3dE5f')` - remove ONE link\n"
         result_text += "- **Preview**: with `dry_run=true` both writes only show what would change; no write is sent\n"

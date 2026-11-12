@@ -3165,6 +3165,108 @@ class TestJobTypeBaselines:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
+        ("snake_case", "wire_name", "value"),
+        [
+            ("throughput_value", "throughputValue", 3000),
+            ("throughput_period", "throughputPeriod", "WEEK"),
+            ("throughput_scope", "throughputScope", "PER_PERSON"),
+            ("headcount", "headcount", 12),
+        ],
+    )
+    async def test_a_throughput_field_in_snake_case_is_sent_under_its_wire_name(
+        self, job_manager, economics_client, snake_case, wire_name, value
+    ):
+        """BACK-5683: an undeclared key is forwarded verbatim, so before these
+        were declared throughput_value reached the platform under that name."""
+        economics_client.create_job_type_baseline.return_value = {}
+
+        await job_manager.create_job_type_baseline(
+            {
+                "job_type": "mcp-test-claims",
+                "baseline": {"effectiveFrom": "2026-10-01T00:00:00Z", snake_case: value},
+            }
+        )
+
+        sent = economics_client.create_job_type_baseline.await_args[0][1]
+        assert sent == {"effectiveFrom": "2026-10-01T00:00:00Z", wire_name: value}
+
+    @pytest.mark.asyncio
+    async def test_the_throughput_fields_in_camel_case_pass_through(
+        self, job_manager, economics_client
+    ):
+        economics_client.create_job_type_baseline.return_value = {}
+        baseline = {
+            "effectiveFrom": "2026-10-01T00:00:00Z",
+            "throughputValue": 3000,
+            "throughputPeriod": "WEEK",
+            "throughputScope": "TEAM",
+            "headcount": 12,
+        }
+
+        await job_manager.create_job_type_baseline(
+            {"job_type": "mcp-test-claims", "baseline": dict(baseline)}
+        )
+
+        sent = economics_client.create_job_type_baseline.await_args[0][1]
+        assert sent == baseline
+
+    @pytest.mark.asyncio
+    async def test_naming_a_throughput_field_in_both_spellings_is_refused(
+        self, job_manager, economics_client
+    ):
+        with pytest.raises(ToolError):
+            await job_manager.create_job_type_baseline(
+                {
+                    "job_type": "mcp-test-claims",
+                    "baseline": {
+                        "effectiveFrom": "2026-10-01T00:00:00Z",
+                        "throughputValue": 3000,
+                        "throughput_value": 2000,
+                    },
+                }
+            )
+
+        economics_client.create_job_type_baseline.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "broken_pairing",
+        [
+            pytest.param({"throughputValue": 3000, "headcount": 0}, id="value-without-period"),
+            pytest.param({"throughputScope": "TEAM"}, id="scope-without-value"),
+        ],
+    )
+    async def test_the_throughput_pairing_rules_are_left_to_the_platform(
+        self, job_manager, economics_client, broken_pairing
+    ):
+        """A body that breaks the platform's pairing rules is forwarded unchanged."""
+        economics_client.create_job_type_baseline.return_value = {}
+        baseline = {"effectiveFrom": "2026-10-01T00:00:00Z", **broken_pairing}
+
+        await job_manager.create_job_type_baseline(
+            {"job_type": "mcp-test-claims", "baseline": dict(baseline)}
+        )
+
+        sent = economics_client.create_job_type_baseline.await_args[0][1]
+        assert sent == baseline
+
+    @pytest.mark.asyncio
+    async def test_the_supported_fields_suggestion_names_the_throughput_fields(
+        self, job_manager, economics_client
+    ):
+        with pytest.raises(ToolError) as exc_info:
+            await job_manager.create_job_type_baseline(
+                {"job_type": "mcp-test-claims", "baseline": "not an object"}
+            )
+
+        supported = next(
+            s for s in exc_info.value.suggestions if s.startswith("Supported fields")
+        )
+        for wire_name in ("throughputValue", "throughputPeriod", "throughputScope", "headcount"):
+            assert wire_name in supported
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
         "baseline",
         [None, {}, {"costPerUnit": 4.5}, {"effectiveFrom": ""}, {"effectiveFrom": 2026}],
     )
@@ -3382,6 +3484,23 @@ class TestJobTypeEconomicsThroughHandleAction:
         for action in JOB_TYPE_ECONOMICS_ACTIONS:
             assert action in payload["business_actions"]
             assert action in payload["parameters"]
+
+    @pytest.mark.asyncio
+    async def test_the_baseline_capability_states_the_throughput_contract(
+        self, job_mgmt, mock_mgmt_client
+    ):
+        result = await job_mgmt.handle_action("get_capabilities", {})
+        payload = json.loads(result[0].text)
+        create_text = payload["parameters"]["create_job_type_baseline"]["baseline"]
+        list_text = payload["parameters"]["list_job_type_baselines"]["returns"]
+
+        for wire_name in ("throughputValue", "throughputPeriod", "throughputScope", "headcount"):
+            assert wire_name in create_text
+            assert wire_name in list_text
+        for value in ("HOUR", "DAY", "WEEK", "MONTH", "TEAM", "PER_PERSON"):
+            assert value in create_text
+        assert "throughputValue and throughputPeriod are sent together" in create_text
+        assert "throughputScope only with throughputValue" in create_text
 
     @pytest.mark.asyncio
     async def test_examples_cover_every_action(self, job_mgmt, mock_mgmt_client):

@@ -201,7 +201,8 @@ TOOL_DOMAINS: Tuple[ToolDomain, ...] = (
         title="Guardrails: Alerts",
         read_name="get_alerts",
         read_description=(
-            "Lists and reads spending alerts, alert history, budget progress and anomalies. "
+            "Lists and reads spending alerts, alert history, budget progress, anomalies, and "
+            "who changed an alert and why. "
             "Not for changing alerts; manage_alerts does that."
         ),
         write_name="manage_alerts",
@@ -476,7 +477,8 @@ TOOL_DOMAINS: Tuple[ToolDomain, ...] = (
         title="Guardrails: Cost Controls",
         read_name="get_cost_controls",
         read_description=(
-            "Lists and reads spend limits and the enforcement events and rules they produce. "
+            "Lists and reads spend limits, their change history, and the enforcement events and "
+            "rules they produce. "
             "Not for changing limits; manage_cost_controls does that."
         ),
         write_name="manage_cost_controls",

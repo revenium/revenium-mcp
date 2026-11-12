@@ -374,6 +374,172 @@ class TestTheUpdateAnswerIsCheckedForEverySentField:
         assert "Updated Successfully" in result[0].text
 
 
+REASON = "Threshold lowered after the October invoice"
+
+
+@pytest.mark.asyncio
+class TestAChangeReasonIsSentButNeverReadBack:
+    async def test_an_update_with_a_change_reason_the_answer_omits_is_reported_as_updated(
+        self, tools, platform
+    ):
+        result = await tools.handle_action(
+            "update",
+            {"anomaly_id": "a1", "anomaly_data": {"name": "Renamed", "changeReason": REASON}},
+        )
+
+        assert "Updated Successfully" in result[0].text
+        assert _sent_body(platform)["changeReason"] == REASON
+        assert "changeReason" not in platform.store["a1"]
+        assert platform.read_ids == ["a1"]
+
+    async def test_a_change_reason_alone_is_sent_without_a_read_back(self, tools, platform):
+        result = await tools.handle_action(
+            "update", {"anomaly_id": "a1", "anomaly_data": {"changeReason": REASON}}
+        )
+
+        assert "Updated Successfully" in result[0].text
+        assert _sent_body(platform)["changeReason"] == REASON
+        assert platform.read_ids == ["a1"]
+
+    async def test_an_update_without_a_change_reason_sends_none(self, tools, platform):
+        await tools.handle_action("update", {"anomaly_id": "a1", "name": "Renamed"})
+
+        assert "changeReason" not in _sent_body(platform)
+
+    async def test_an_update_sends_the_reason_trimmed(self, tools, platform):
+        await tools.handle_action(
+            "update",
+            {"anomaly_id": "a1", "anomaly_data": {"name": "Renamed", "changeReason": f"  {REASON}\n"}},
+        )
+
+        assert _sent_body(platform)["changeReason"] == REASON
+
+    @pytest.mark.parametrize("blank", ["", "   ", "\n\t"])
+    async def test_a_blank_reason_on_an_update_sends_none(self, tools, platform, blank):
+        await tools.handle_action(
+            "update",
+            {"anomaly_id": "a1", "anomaly_data": {"name": "Renamed", "changeReason": blank}},
+        )
+
+        assert _sent_body(platform)["name"] == "Renamed"
+        assert "changeReason" not in _sent_body(platform)
+
+    @pytest.mark.parametrize("not_text", [42, True, ["why"], {"why": "x"}])
+    @pytest.mark.parametrize("dry_run", [False, True])
+    async def test_a_reason_that_is_not_text_is_refused_before_the_alert_is_read(
+        self, tools, platform, not_text, dry_run
+    ):
+        with pytest.raises(ToolError) as refusal:
+            await tools.handle_action(
+                "update",
+                {
+                    "anomaly_id": "a1",
+                    "dry_run": dry_run,
+                    "anomaly_data": {"name": "Renamed", "changeReason": not_text},
+                },
+            )
+
+        assert "changeReason" in refusal.value.message
+        assert platform.read_ids == []
+        assert platform.updated_bodies == []
+
+    @pytest.mark.parametrize("dry_run", [False, True])
+    async def test_a_reason_over_the_limit_is_refused_before_the_alert_is_read(
+        self, tools, platform, dry_run
+    ):
+        with pytest.raises(ToolError) as refusal:
+            await tools.handle_action(
+                "update",
+                {
+                    "anomaly_id": "a1",
+                    "dry_run": dry_run,
+                    "anomaly_data": {"name": "Renamed", "changeReason": "a" * 501},
+                },
+            )
+
+        assert refusal.value.field == "changeReason"
+        assert platform.read_ids == []
+        assert platform.updated_bodies == []
+
+
+UNRECORDED_REASON_LINE = "may not have recorded the change reason"
+
+
+@pytest.mark.asyncio
+class TestAReasonOnAnUpdateThatChangesNothingElse:
+    """ChangeReason.DESCRIPTION: a reason sent with a save that changes nothing is dropped."""
+
+    async def test_a_reason_alone_is_reported_as_possibly_unrecorded(self, tools, platform):
+        result = await tools.handle_action(
+            "update", {"anomaly_id": "a1", "anomaly_data": {"changeReason": REASON}}
+        )
+
+        assert "Updated Successfully" in result[0].text
+        assert UNRECORDED_REASON_LINE in result[0].text
+        assert platform.read_ids == ["a1"]
+
+    async def test_a_reason_with_fields_that_equal_the_stored_ones_is_reported_too(
+        self, tools, platform
+    ):
+        stored = platform.store["a1"]
+
+        result = await tools.handle_action(
+            "update",
+            {
+                "anomaly_id": "a1",
+                "anomaly_data": {
+                    "name": stored["name"],
+                    "threshold": int(stored["threshold"]),
+                    "changeReason": REASON,
+                },
+            },
+        )
+
+        assert UNRECORDED_REASON_LINE in result[0].text
+        assert platform.read_ids == ["a1"]
+
+    async def test_a_reason_with_a_real_change_carries_no_such_line(self, tools, platform):
+        result = await tools.handle_action(
+            "update",
+            {"anomaly_id": "a1", "anomaly_data": {"name": "Renamed", "changeReason": REASON}},
+        )
+
+        assert "Updated Successfully" in result[0].text
+        assert UNRECORDED_REASON_LINE not in result[0].text
+
+    async def test_an_unchanged_update_without_a_reason_carries_no_such_line(self, tools, platform):
+        result = await tools.handle_action(
+            "update", {"anomaly_id": "a1", "name": platform.store["a1"]["name"]}
+        )
+
+        assert UNRECORDED_REASON_LINE not in result[0].text
+
+    async def test_the_dry_run_of_a_reason_alone_carries_the_same_line(self, tools, platform):
+        result = await tools.handle_action(
+            "update",
+            {"anomaly_id": "a1", "dry_run": True, "anomaly_data": {"changeReason": REASON}},
+        )
+
+        assert "Dry Run Successful" in result[0].text
+        assert UNRECORDED_REASON_LINE in result[0].text
+        assert platform.updated_bodies == []
+
+    async def test_the_dry_run_of_a_reason_with_a_real_change_carries_no_such_line(
+        self, tools, platform
+    ):
+        result = await tools.handle_action(
+            "update",
+            {
+                "anomaly_id": "a1",
+                "dry_run": True,
+                "anomaly_data": {"name": "Renamed", "changeReason": REASON},
+            },
+        )
+
+        assert "Dry Run Successful" in result[0].text
+        assert UNRECORDED_REASON_LINE not in result[0].text
+
+
 @pytest.mark.asyncio
 class TestFlatArgumentsTheSignatureDeclares:
     async def test_slack_config_id_beside_a_name_changes_the_slack_channel(self, tools, platform):

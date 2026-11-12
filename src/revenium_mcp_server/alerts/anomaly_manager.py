@@ -12,6 +12,19 @@ from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
 from ..client import ReveniumAPIError, ReveniumClient
+from ..common.change_history import (
+    read_change_history,
+    render_change_page,
+    render_change_summary,
+)
+from ..common.change_reason import (
+    CHANGE_REASON_FIELD,
+    CHANGE_REASON_MAX_LENGTH,
+    checked_change_reason,
+    delete_refusal_is_id_or_change_reason,
+    id_or_change_reason_cause,
+    id_or_change_reason_refused,
+)
 from ..common.slack_configuration_lookup import slack_configuration_absent
 from ..common.error_handling import (
     ToolError,
@@ -56,7 +69,7 @@ from .update_fidelity import (
     verify_update_applied,
 )
 
-_RESOLVED_AFTER_CONVERSION = frozenset(RECIPIENT_FIELDS) | {"period"}
+_RESOLVED_AFTER_CONVERSION = frozenset(RECIPIENT_FIELDS) | {"period", CHANGE_REASON_FIELD}
 
 # Fields every stored alert carries; an update may change them but never empty them.
 _REQUIRED_UPDATE_FIELDS = frozenset(
@@ -88,6 +101,13 @@ _DETECTION_RULE_FLAG_SPELLINGS = (
 )
 
 
+UNRECORDED_REASON_NOTE = (
+    "The platform may not have recorded the change reason: nothing else in this update "
+    "differs from the stored alert, and the platform drops a reason sent with a save that "
+    "changes nothing, unless a different person or API key made the save."
+)
+
+
 @dataclass(frozen=True)
 class UpdatePlan:
     """The body an update would send, after every check the live update runs."""
@@ -95,6 +115,16 @@ class UpdatePlan:
     anomaly_id: str
     body: Dict[str, Any]
     changes: Dict[str, Any]
+    stored: Dict[str, Any]
+
+    @property
+    def changes_only_the_reason(self) -> bool:
+        """Whether the update sends a change reason and every other field it sends is already stored."""
+        return CHANGE_REASON_FIELD in self.changes and all(
+            self.stored.get(field) == value
+            for field, value in self.changes.items()
+            if field != CHANGE_REASON_FIELD
+        )
 
 
 def _as_number(threshold: Any) -> Any:
@@ -577,6 +607,32 @@ class AnomalyManager:
 
         return [TextContent(type="text", text=result_text)]
 
+    @handle_alert_tool_errors("list_anomaly_changes")
+    async def list_anomaly_changes(
+        self, client: ReveniumClient, anomaly_id: str, page: int, size: int
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """One page of an alert's change history, newest first."""
+        anomaly_id = validate_anomaly_id(anomaly_id)
+        response = await read_change_history(
+            client.get_anomaly_changes(anomaly_id, page=page, size=size),
+            not_found=lambda: AnomalyNotFoundError(anomaly_id),
+        )
+        text = render_change_page(f"Change history of alert {anomaly_id}", response, page)
+        return [TextContent(type="text", text=text)]
+
+    @handle_alert_tool_errors("get_anomaly_change_summary")
+    async def get_anomaly_change_summary(
+        self, client: ReveniumClient, anomaly_id: str
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Who created an alert and who changed it last, from its change history."""
+        anomaly_id = validate_anomaly_id(anomaly_id)
+        summary = await read_change_history(
+            client.get_anomaly_change_summary(anomaly_id),
+            not_found=lambda: AnomalyNotFoundError(anomaly_id),
+        )
+        text = render_change_summary(f"Change summary of alert {anomaly_id}", summary)
+        return [TextContent(type="text", text=text)]
+
     def validate_anomaly_payload(self, anomaly_data: Dict[str, Any]) -> Dict[str, Any]:
         """Validate the shape of anomaly_data, without converting or creating.
 
@@ -726,6 +782,7 @@ class AnomalyManager:
         if isinstance(anomaly_data, dict) and "detection_rules" not in anomaly_data:
             refuse_platform_rule_breach(anomaly_data)
         validated_data = self.validate_anomaly_payload(anomaly_data)
+        change_reason = self._caller_change_reason(anomaly_data)
 
         # Convert to API format (only if we have detection_rules, otherwise use direct format)
         if "detection_rules" in validated_data:
@@ -775,7 +832,22 @@ class AnomalyManager:
         # The detection_rules conversion picks the period from time_window (15m when blank).
         refuse_platform_rule_breach(api_data)
         refuse_negative_threshold(api_data.get("threshold"))
+        if change_reason is not None:
+            api_data[CHANGE_REASON_FIELD] = change_reason
         return api_data
+
+    @staticmethod
+    def _caller_change_reason(anomaly_data: Dict[str, Any]) -> Optional[str]:
+        """The changeReason a create or update was given, trimmed; None when none or a blank one."""
+        reason = anomaly_data.get(CHANGE_REASON_FIELD)
+        if reason is not None and not isinstance(reason, str):
+            raise ValidationError(
+                message=f"Invalid {CHANGE_REASON_FIELD} value",
+                field=CHANGE_REASON_FIELD,
+                value=type(reason).__name__,
+                expected=f"Plain text, up to {CHANGE_REASON_MAX_LENGTH} characters",
+            )
+        return checked_change_reason(reason, field=CHANGE_REASON_FIELD)
 
     @handle_alert_tool_errors("create_anomaly")
     async def create_anomaly(
@@ -893,6 +965,7 @@ class AnomalyManager:
 
         refuse_unsupported_alert_fields(update_data, "updated")
         refuse_unknown_data_source(update_data)
+        change_reason = self._caller_change_reason(update_data)
 
         logger.info(f"Updating anomaly: {anomaly_id}")
 
@@ -1061,6 +1134,8 @@ class AnomalyManager:
 
         self._convert_recipients(update_data, converted_updates)
         self._convert_period(update_data, converted_updates, current_anomaly)
+        if change_reason is not None:
+            converted_updates[CHANGE_REASON_FIELD] = change_reason
 
         # Apply the converted updates to the current data
         merged_data.update(converted_updates)
@@ -1071,7 +1146,7 @@ class AnomalyManager:
         # The platform checks the whole merged alert on every update, stored values included.
         refuse_update_rule_breach(merged_data, current_anomaly, converted_updates)
 
-        return UpdatePlan(anomaly_id, merged_data, converted_updates)
+        return UpdatePlan(anomaly_id, merged_data, converted_updates, current_anomaly)
 
     @handle_alert_tool_errors("update_anomaly")
     async def update_anomaly(
@@ -1105,6 +1180,8 @@ class AnomalyManager:
         )
         if updated_anomaly.get("periodDuration"):
             result_text += f"\n**Check Frequency:** {updated_anomaly['periodDuration']}"
+        if plan.changes_only_the_reason:
+            result_text += f"\n**Note:** {UNRECORDED_REASON_NOTE}"
 
         # An update is the one call that can change the filters, so it confirms
         # them the way get and create do — through format_filter_row, or an IN row
@@ -1134,6 +1211,8 @@ class AnomalyManager:
             "message": "**Dry Run Successful**: Update data is valid and ready for application",
             "would_update": {"anomaly_id": plan.anomaly_id, "changes": plan.changes},
         }
+        if plan.changes_only_the_reason:
+            validation_result["note"] = UNRECORDED_REASON_NOTE
         result_text = f"**DRY RUN MODE**\n\n{json.dumps(validation_result, indent=2)}"
         return [TextContent(type="text", text=result_text)]
 
@@ -1170,24 +1249,31 @@ class AnomalyManager:
 
     @handle_alert_tool_errors("delete_anomaly")
     async def delete_anomaly(
-        self, client: ReveniumClient, anomaly_id: str
+        self, client: ReveniumClient, anomaly_id: str, change_reason: Optional[str] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Delete an AI anomaly.
 
         Args:
             client: Revenium API client
             anomaly_id: ID of the anomaly to delete
+            change_reason: Why it is deleted, recorded on the alert's change history
 
         Returns:
             Formatted response confirming deletion
         """
-        # Validate anomaly ID
         anomaly_id = validate_anomaly_id(anomaly_id)
+        change_reason = checked_change_reason(change_reason)
 
         logger.info(f"Deleting anomaly: {anomaly_id}")
 
-        # Call the API client method
-        await client.delete_anomaly(anomaly_id)
+        try:
+            await client.delete_anomaly(anomaly_id, change_reason=change_reason)
+        except ReveniumAPIError as e:
+            if delete_refusal_is_id_or_change_reason(e, change_reason):
+                raise id_or_change_reason_refused(
+                    "alert", "anomaly_id", anomaly_id, list_call="list()"
+                ) from e
+            raise
 
         result_text = (
             f"**AI Anomaly Deleted Successfully**\n\n"
@@ -1199,16 +1285,18 @@ class AnomalyManager:
 
     @handle_alert_tool_errors("clear_all_anomalies")
     async def clear_all_anomalies(
-        self, client: ReveniumClient
+        self, client: ReveniumClient, change_reason: Optional[str] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Clear all AI anomalies.
 
         Args:
             client: Revenium API client
+            change_reason: Why they are deleted, recorded on each deleted alert's change history
 
         Returns:
             Formatted response confirming clearing
         """
+        change_reason = checked_change_reason(change_reason)
         logger.info("Clearing all anomalies")
 
         # Read every page before deleting anything: deleting while paging shifts
@@ -1224,7 +1312,6 @@ class AnomalyManager:
                 )
             ]
 
-        # Delete each anomaly, keeping the platform's reason for every refusal
         deleted_count = 0
         refusals: List[str] = []
         for anomaly in anomalies:
@@ -1233,12 +1320,17 @@ class AnomalyManager:
                 refusals.append("Alert with no id: no id returned by the platform")
                 continue
             try:
-                await client.delete_anomaly(anomaly_id)
+                await client.delete_anomaly(anomaly_id, change_reason=change_reason)
                 deleted_count += 1
             except Exception as e:
                 logger.warning(f"Failed to delete anomaly {anomaly_id}: {e}")
                 label = alert_label(anomaly.get("name"), anomaly_id)
-                refusals.append(f"{label}: {_refusal_reason(e)}")
+                cause = (
+                    id_or_change_reason_cause("alert")
+                    if delete_refusal_is_id_or_change_reason(e, change_reason)
+                    else _refusal_reason(e)
+                )
+                refusals.append(f"{label}: {cause}")
 
         cleared_everything = inventory.complete and deleted_count == len(anomalies)
         if deleted_count == 0:

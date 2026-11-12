@@ -14,10 +14,18 @@ from ..auth import AuthenticationError
 from ..common.error_handling import ErrorCodes, ToolError, raise_refusal
 from ..endpoint_registry import CalendarRangeNeedsNewApiError, NewApiRequiredError
 from .formatters.base_formatter import BaseFormattingUtilities
+from .formatters.tool_cost_and_calls_formatter import ToolCostAndCallsFormatter
 from .response_formatter import ResponseFormatter
 from .envelope_reads import with_unread_pages_notice
 from .paging import page_of_rows
-from .report_reads import fails_whole_call, is_server_configuration_error, read_failure_reason
+from .report_reads import (
+    blames_unpaired_analytics_host,
+    fails_whole_call,
+    is_server_configuration_error,
+    rejects_credential,
+    read_failure_reason,
+    refuses_permission,
+)
 from .simple_cost_analyzer import (
     COST_SUMMARY_PARTS,
     CostSummaryUnreadError,
@@ -28,6 +36,7 @@ from .simple_cost_analyzer import (
     UserCostsPage,
     agent_costs_endpoint_key,
 )
+from .tool_cost_and_calls import TOOL_COST_AND_CALL_VOLUME_ACTION, ToolCostAndCallsPage
 from .validation import AnalyticsValidator, ValidationError
 
 logger = logging.getLogger(__name__)
@@ -38,22 +47,40 @@ COST_SUMMARY_RETRY_ADVICE = [
     "Read the parts one at a time with "
     + ", ".join(part.action for part in COST_SUMMARY_PARTS),
 ]
-_COST_SUMMARY_CREDENTIAL_ADVICE = [
-    "The platform refused the credential, so no cost report was read",
+_READ_CREDENTIAL_ADVICE = [
+    "The platform refused the credential, so no report was read",
     "Check that the API key or signed-in session is current and can read this team",
 ]
-_COST_SUMMARY_CONFIGURATION_ADVICE = [
-    "The server's configuration stopped the read before any cost report was sent",
+_READ_PERMISSION_ADVICE = [
+    "The platform does not permit this credential to read what was asked, so trying "
+    "again or over another period is refused the same way",
+    "Use an API key or signed-in session that is permitted to read it",
+]
+_READ_CONFIGURATION_ADVICE = [
+    "The server's configuration stopped the read before any request was sent",
     "Ask the server's administrator to correct the setting the error names",
 ]
+_UNPAIRED_ANALYTICS_HOST_ADVICE = [
+    "Every read this server sends to the analytics host is refused the same way until "
+    "REVENIUM_APP_BASE_URL names the analytics host of its platform",
+]
+
+
+def _read_failure_advice(error: Exception, retry_advice: List[str]) -> List[str]:
+    """Configuration, credential or permission advice when the failure is one, else the read's own retry advice."""
+    if blames_unpaired_analytics_host(error):
+        return _UNPAIRED_ANALYTICS_HOST_ADVICE
+    if isinstance(error, TeamIdUnavailableError) or is_server_configuration_error(error):
+        return _READ_CONFIGURATION_ADVICE
+    if rejects_credential(error):
+        return _READ_CREDENTIAL_ADVICE
+    if refuses_permission(error):
+        return _READ_PERMISSION_ADVICE
+    return retry_advice
 
 
 def _cost_summary_advice(error: Exception) -> List[str]:
-    if isinstance(error, TeamIdUnavailableError) or is_server_configuration_error(error):
-        return _COST_SUMMARY_CONFIGURATION_ADVICE
-    if fails_whole_call(error):
-        return _COST_SUMMARY_CREDENTIAL_ADVICE
-    return COST_SUMMARY_RETRY_ADVICE
+    return _read_failure_advice(error, COST_SUMMARY_RETRY_ADVICE)
 
 
 @dataclass
@@ -480,7 +507,8 @@ class CostSummaryProcessor(AnalyticsProcessor):
         the caller's period.
         """
         if isinstance(error, CostSummaryUnreadError):
-            return self.formatter.format_error_response(str(error), COST_SUMMARY_RETRY_ADVICE)
+            advice = _READ_PERMISSION_ADVICE if error.no_part_permitted else COST_SUMMARY_RETRY_ADVICE
+            return self.formatter.format_error_response(str(error), advice)
         return self.formatter.format_error_response(
             f"Cost summary analysis failed: {read_failure_reason(error)}",
             _cost_summary_advice(error),
@@ -588,6 +616,48 @@ class ToolCostsByProviderProcessor(ToolReportProcessor):
         )
 
 
+TOOL_COST_AND_CALL_VOLUME_NOT_OFFERED = (
+    "This deployment's analytics service does not offer the combined tool cost and "
+    "call volume report yet (HTTP 404). Nothing was read."
+)
+_TOOL_COST_AND_CALL_VOLUME_SIBLINGS = (
+    "Read get_tool_costs for cost per tool and get_top_tools for calls per tool; "
+    "each ranks its own figure only"
+)
+
+
+def _platform_lacks_the_report(error: Exception) -> bool:
+    """A 404 the platform answered for the route, not one the server's configuration explains."""
+    return getattr(error, "status_code", None) == 404 and not fails_whole_call(error)
+
+
+class ToolCostAndCallVolumeProcessor(AnalyticsProcessor):
+    """One page of tools with cost and calls side by side, in the platform's ranking."""
+
+    def validate_params(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        return self.validator.validate_tool_cost_and_call_volume_params(kwargs)
+
+    async def fetch_data(self, params: Dict[str, Any]) -> ToolCostAndCallsPage:
+        return await self.analyzer.get_tool_cost_and_call_volume(
+            period=params["period"], page=params["page"], size=params["size"]
+        )
+
+    def format_response(self, data: ToolCostAndCallsPage, params: Dict[str, Any]) -> str:
+        return ToolCostAndCallsFormatter().format(data, params["period"])
+
+    def _handle_general_error(self, error: Exception, operation_type: str) -> str:
+        if _platform_lacks_the_report(error):
+            return self.formatter.format_error_response(
+                TOOL_COST_AND_CALL_VOLUME_NOT_OFFERED, [_TOOL_COST_AND_CALL_VOLUME_SIBLINGS]
+            )
+        return self.formatter.format_error_response(
+            f"Tool cost and call volume read failed: {read_failure_reason(error)}",
+            _read_failure_advice(
+                error, ["Try again, or read a shorter period", _TOOL_COST_AND_CALL_VOLUME_SIBLINGS]
+            ),
+        )
+
+
 class SimpleAnalyticsEngine:
     """
     Simple, reliable analytics engine that coordinates validation, analysis, and formatting.
@@ -635,6 +705,9 @@ class SimpleAnalyticsEngine:
         self.top_tools_processor = TopToolsProcessor(self.dependencies, self.logger)
         self.tool_costs_by_agent_processor = ToolCostsByAgentProcessor(self.dependencies, self.logger)
         self.tool_costs_by_provider_processor = ToolCostsByProviderProcessor(self.dependencies, self.logger)
+        self.tool_cost_and_call_volume_processor = ToolCostAndCallVolumeProcessor(
+            self.dependencies, self.logger
+        )
 
     async def get_provider_costs(self, **kwargs: Any) -> str:
         """
@@ -917,6 +990,11 @@ Page {page} is beyond the end — this dimension has {total} value(s). Pass page
         params = AnalyticsParams(operation_type="tool costs by provider", kwargs=kwargs)
         return await self.tool_costs_by_provider_processor.process_analytics_request(params)
 
+    async def get_tool_cost_and_call_volume(self, **kwargs: Any) -> str:
+        """Get one page of tools with total cost and call count on one row."""
+        params = AnalyticsParams(operation_type="tool cost and call volume", kwargs=kwargs)
+        return await self.tool_cost_and_call_volume_processor.process_analytics_request(params)
+
     def get_supported_actions(self) -> List[str]:
         """
         Get list of supported actions.
@@ -937,6 +1015,7 @@ Page {page} is beyond the end — this dimension has {total} value(s). Pass page
             "get_top_tools",
             "get_tool_costs_by_agent",
             "get_tool_costs_by_provider",
+            TOOL_COST_AND_CALL_VOLUME_ACTION,
         ]
 
     def get_capabilities_summary(self) -> Dict[str, Any]:

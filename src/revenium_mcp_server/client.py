@@ -24,6 +24,7 @@ from loguru import logger
 
 from .api_field_mapper import APIFieldMapper
 from .auth import AuthConfig, AuthenticationError, get_auth_config, get_bearer_auth_headers
+from .change_reason_contract import CHANGE_REASON_FIELD, normalized_change_reason
 from .config_store import get_config_store, get_config_value
 from .endpoint_registry import (
     DEFAULT_APP_BASE_URL,
@@ -251,8 +252,44 @@ async def close_shared_http_client() -> None:
         logger.info("Shared HTTP client closed and cache cleared")
 
 
+UNPAIRED_ANALYTICS_HOST = "UNPAIRED_ANALYTICS_HOST"
+
+# specs/openapi/isotope.json declares UNAUTHORIZED as every analytics route's 401 code
+# (the key or token is missing or invalid) and FORBIDDEN as its generic 403 code (the
+# credential may not make this request). Every other code it declares names a handler's
+# own cause. Only from the unpaired production analytics host is a generic code read as
+# that host turning away another platform's key; elsewhere FORBIDDEN refuses one request.
+GENERIC_REFUSAL_CODES = frozenset({"UNAUTHORIZED", "FORBIDDEN"})
+GENERIC_REFUSAL_STATUSES = (401, 403)
+REJECTED_CREDENTIAL_STATUS = 401
+PERMISSION_REFUSAL_STATUS = 403
+PERMISSION_REFUSAL_CODE = "FORBIDDEN"
+
+
+def _json_body_of(response: httpx.Response) -> Any:
+    try:
+        return response.json()
+    except ValueError:
+        return None
+
+
+def _code_named_by(body: Any) -> Any:
+    """The ``code`` a refusal body names, or None when the body is not a JSON object."""
+    return body.get("code") if isinstance(body, dict) else None
+
+
+def _names_a_generic_refusal(status_code: Optional[int], code: Any) -> bool:
+    return (
+        isinstance(code, str)
+        and code in GENERIC_REFUSAL_CODES
+        and status_code in GENERIC_REFUSAL_STATUSES
+    )
+
+
 class ReveniumAPIError(Exception):
     """Exception raised for Revenium API errors."""
+
+    _platform_text: Optional[str] = None
 
     def __init__(
         self,
@@ -260,11 +297,13 @@ class ReveniumAPIError(Exception):
         status_code: Optional[int] = None,
         response_data: Optional[Dict] = None,
         code: Optional[str] = None,
+        platform_text: Optional[str] = None,
     ) -> None:
         self.message = message
         self.status_code = status_code
         self.response_data = response_data
         self.code = code
+        self._platform_text = platform_text
         super().__init__(self.message)
 
     @property
@@ -278,12 +317,47 @@ class ReveniumAPIError(Exception):
         )
 
     @property
+    def blames_unpaired_analytics_host(self) -> bool:
+        """The analytics read went to the production analytics host for a non-production
+        platform, so the message carries the configuration fix, not a platform answer."""
+        return self.code == UNPAIRED_ANALYTICS_HOST
+
+    @property
+    def rejects_the_credential(self) -> bool:
+        """The platform rejected the API key or token itself (HTTP 401), so every
+        request sent with it is refused the same way."""
+        return self.status_code == REJECTED_CREDENTIAL_STATUS
+
+    @property
+    def refuses_permission(self) -> bool:
+        """The credential may not make this request: a 403 whose body, JSON or
+        problem, names ``FORBIDDEN``. It says nothing about any other request, and
+        an unpaired analytics host answering the same way is that host's refusal instead."""
+        return (
+            self.status_code == PERMISSION_REFUSAL_STATUS
+            and self._body_code == PERMISSION_REFUSAL_CODE
+            and not self.blames_unpaired_analytics_host
+        )
+
+    @property
+    def _body_code(self) -> Any:
+        if not isinstance(self.response_data, dict):
+            return None
+        return _code_named_by(self.response_data.get("error_data", self.response_data))
+
+    @property
     def platform_message(self) -> str:
         """The platform's own error text, before ``_request`` rewrites it into guidance."""
+        if self._platform_text is not None:
+            return self._platform_text
         body = self.response_data.get("error_data") if isinstance(self.response_data, dict) else None
         if body is not None:
             return _sanitize_error_text(ReveniumClient._format_error_response(body))
         return self.message.removeprefix(f"HTTP {self.status_code}: ")
+
+
+class AnalyticsHostMisconfiguredError(ValueError):
+    """The analytics host this server is configured with cannot be sent a request."""
 
 
 class OrganizationNameUnresolvedError(ValueError):
@@ -972,6 +1046,14 @@ class ReveniumClient:
         params.update(self.auth_config.get_team_and_tenant_query_params())
         return params
 
+    @staticmethod
+    def _with_change_reason(params: Dict[str, Any], change_reason: Optional[str]) -> Dict[str, Any]:
+        """Add the caller's delete reason to query parameters, only when one was given."""
+        reason = normalized_change_reason(change_reason)
+        if reason is not None:
+            params[CHANGE_REASON_FIELD] = reason
+        return params
+
     def _resolved_team_param(self) -> Dict[str, str]:
         """``{"teamId": <resolved team>}`` when the session resolved a team, else ``{}``.
 
@@ -1011,10 +1093,7 @@ class ReveniumClient:
             return None
         from .common.team_scope_error import TEAM_NOT_IN_MEMBERSHIP, TeamScopeForbiddenError
 
-        try:
-            body = response.json()
-        except ValueError:
-            body = None
+        body = _json_body_of(response)
         payload = body if isinstance(body, dict) else {}
         if payload.get("code") not in (None, TEAM_NOT_IN_MEMBERSHIP):
             return None
@@ -1104,18 +1183,81 @@ class ReveniumClient:
             operation_id=operation_id,
         )
 
-    def _unpaired_analytics_host_message(self, status_code: int, error_text: str) -> str:
+    @staticmethod
+    def _sent_to_unpaired_analytics_host(
+        status_code: int, base_url: Optional[str], use_bearer: bool
+    ) -> bool:
+        """Whether a 401, 403 or 404 came from the production analytics host while a
+        non-production platform has no known analytics pairing."""
+        return (
+            use_bearer
+            and status_code in (401, 403, 404)
+            and base_url == DEFAULT_APP_BASE_URL
+            and not get_config_value("REVENIUM_APP_BASE_URL", None)
+            and not is_production_platform(get_config_value("REVENIUM_BASE_URL", None))
+        )
+
+    @classmethod
+    def _blames_unpaired_analytics_host(
+        cls, response: httpx.Response, base_url: Optional[str], use_bearer: bool
+    ) -> bool:
+        """Whether a refusal is the unpaired production analytics host turning away
+        another platform's credential, whatever the body's format.
+
+        A body naming a code a handler answered with (a disabled feature, a missing
+        run, the team sent) keeps its meaning even from that host.
+        """
+        status_code = response.status_code
+        return cls._sent_to_unpaired_analytics_host(
+            status_code, base_url, use_bearer
+        ) and cls._names_no_handler_cause(status_code, _code_named_by(_json_body_of(response)))
+
+    def _unpaired_analytics_host_error(
+        self, status_code: int, platform_text: str, response_data: Dict[str, Any]
+    ) -> ReveniumAPIError:
         """A non-production platform with no known analytics pairing sent analytics
         reads to the production analytics host, which refuses that platform's keys."""
         example = pairing_example(self._KNOWN_APP_BASE_URLS)
-        return (
-            f"HTTP {status_code}: {error_text}\n\n"
-            "**Likely cause:** REVENIUM_BASE_URL points at a non-production Revenium "
-            "platform with no known analytics pairing, so analytics requests went to "
-            f"the production analytics host {DEFAULT_APP_BASE_URL}.\n\n"
-            "**To fix:** set REVENIUM_APP_BASE_URL to the analytics host of that "
-            "platform" + (f" (for example, {example})" if example else "") + ".\n"
-            "See README.md for the full env var reference."
+        return ReveniumAPIError(
+            message=(
+                f"HTTP {status_code}: {platform_text}\n\n"
+                "**Likely cause:** REVENIUM_BASE_URL points at a non-production Revenium "
+                "platform with no known analytics pairing, so analytics requests went to "
+                f"the production analytics host {DEFAULT_APP_BASE_URL}.\n\n"
+                "**To fix:** set REVENIUM_APP_BASE_URL to the analytics host of that "
+                "platform" + (f" (for example, {example})" if example else "") + ".\n"
+                "See README.md for the full env var reference."
+            ),
+            status_code=status_code,
+            response_data=response_data,
+            code=UNPAIRED_ANALYTICS_HOST,
+            platform_text=platform_text,
+        )
+
+    @staticmethod
+    def _names_no_handler_cause(status_code: int, code: Any) -> bool:
+        """Whether a refusal body's ``code`` is missing or only a generic refusal, so
+        nothing on the analytics host answered for a feature or a resource.
+
+        A ``code`` that is not text names no handler either.
+        """
+        if not isinstance(code, str) or not code:
+            return True
+        return _names_a_generic_refusal(status_code, code)
+
+    def _problem_details_error(
+        self, status_code: int, problem: Dict[str, Any], blames_unpaired_host: bool
+    ) -> ReveniumAPIError:
+        """The error for an RFC 7807 refusal, keeping the problem's own ``code`` unless
+        the refusal blames the unpaired analytics host."""
+        problem_text = _problem_details_message(problem, status_code)
+        if blames_unpaired_host:
+            return self._unpaired_analytics_host_error(status_code, problem_text, problem)
+        return ReveniumAPIError(
+            message=problem_text,
+            status_code=status_code,
+            response_data=problem,
+            code=problem.get("code"),
         )
 
     @staticmethod
@@ -1266,7 +1408,10 @@ class ReveniumClient:
 
                 # Check for HTTP errors
                 if response.status_code >= 400:
-                    team_scope_refusal = self._team_scope_refusal(
+                    blames_unpaired_host = self._blames_unpaired_analytics_host(
+                        response, base_url, use_bearer
+                    )
+                    team_scope_refusal = None if blames_unpaired_host else self._team_scope_refusal(
                         response, params, use_bearer, self._own_credentials()
                     )
                     if team_scope_refusal is not None:
@@ -1302,16 +1447,15 @@ class ReveniumClient:
                     # everything else.
                     content_type = response.headers.get("content-type", "").lower()
                     if "application/problem+json" in content_type:
-                        problem = error_data if isinstance(error_data, dict) else {}
-                        raise ReveniumAPIError(
-                            message=(
-                                _problem_details_message(problem, response.status_code)
-                            ),
-                            status_code=response.status_code,
-                            response_data=problem,
-                            code=(
-                                problem.get("code") if isinstance(problem, dict) else None
-                            ),
+                        raise self._problem_details_error(
+                            response.status_code,
+                            error_data if isinstance(error_data, dict) else {},
+                            blames_unpaired_host,
+                        )
+
+                    if blames_unpaired_host:
+                        raise self._unpaired_analytics_host_error(
+                            response.status_code, error_text, {"error_data": error_data}
                         )
 
                     # Enhanced error handling for specific error types
@@ -1354,23 +1498,6 @@ class ReveniumClient:
                             f"• Using old IDs from deleted {resource_label_plural_lower}"
                         )
 
-                        comprehensive_error = ReveniumAPIError(
-                            message=enhanced_message,
-                            status_code=response.status_code,
-                            response_data={"error_data": error_data},
-                        )
-                    elif (
-                        use_bearer
-                        and response.status_code in (401, 403, 404)
-                        and base_url == DEFAULT_APP_BASE_URL
-                        and not get_config_value("REVENIUM_APP_BASE_URL", None)
-                        and not is_production_platform(
-                            get_config_value("REVENIUM_BASE_URL", None)
-                        )
-                    ):
-                        enhanced_message = self._unpaired_analytics_host_message(
-                            response.status_code, error_text
-                        )
                         comprehensive_error = ReveniumAPIError(
                             message=enhanced_message,
                             status_code=response.status_code,
@@ -2042,6 +2169,63 @@ class ReveniumClient:
         params = self._add_team_id_to_params()
         return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/ai/cost-controls/{control_id}", params=params))
 
+    async def get_cost_control_changes(
+        self, control_id: str, page: int = 0, size: int = 20
+    ) -> Dict[str, Any]:
+        """One page of a cost control's change history, newest first.
+
+        Lists the control's own saves and those of every alert linked to it now
+        or at any recorded revision (``relation`` LINKED_ALERT). The platform
+        serves at most 100 entries a page.
+
+        Args:
+            control_id: The cost control ID
+            page: Page number (0-based)
+            size: Entries per page
+
+        Returns:
+            HAL page with the entries under ``_embedded.changes`` and a ``page`` block
+        """
+        params = self._add_team_id_to_params({"page": page, "size": size})
+        return cast(Dict[str, Any], await self.get(
+            f"/profitstream/v2/api/ai/cost-controls/{self._quote_path_segment(control_id)}/changes",
+            params=params,
+        ))
+
+    async def get_cost_control_change_summary(self, control_id: str) -> Dict[str, Any]:
+        """Who created a cost control and who changed it last, from its own history.
+
+        Args:
+            control_id: The cost control ID
+
+        Returns:
+            ``{"createdAt", "createdBy", "lastChangedAt", "lastChangedBy", "historyStartsAt"}``
+        """
+        params = self._add_team_id_to_params()
+        return cast(Dict[str, Any], await self.get(
+            f"/profitstream/v2/api/ai/cost-controls/{self._quote_path_segment(control_id)}/changes/summary",
+            params=params,
+        ))
+
+    async def get_control_changes(
+        self, since: str, until: str, page: int = 0, size: int = 20, **filters: Any
+    ) -> Dict[str, Any]:
+        """One page of every change to the team's budgets and alerts in a window.
+
+        Args:
+            since: Start of the window, inclusive, ISO-8601 with an offset
+            until: End of the window, exclusive, at most 366 days after since
+            page: Page number (0-based)
+            size: Entries per page
+            **filters: subjectType, subjectId, changeType, changedBy, apiKeyId
+
+        Returns:
+            HAL page with the entries under ``_embedded.changes`` and a ``page`` block
+        """
+        params = {"since": since, "until": until, "page": page, "size": size, **filters}
+        params = self._add_team_id_to_params(params)
+        return cast(Dict[str, Any], await self.get("/profitstream/v2/api/ai/control-changes", params=params))
+
     async def create_cost_control(self, control_data: Dict[str, Any]) -> Dict[str, Any]:
         """Create a new cost control.
 
@@ -2123,16 +2307,19 @@ class ReveniumClient:
             f"/profitstream/v2/api/ai/cost-controls/{control_id}", data=control_data, params=params
         ))
 
-    async def delete_cost_control(self, control_id: str) -> Dict[str, Any]:
+    async def delete_cost_control(
+        self, control_id: str, change_reason: Optional[str] = None
+    ) -> Dict[str, Any]:
         """Delete a cost control.
 
         Args:
             control_id: The cost control ID
+            change_reason: Why it is deleted, recorded on the change history; sent only when given
 
         Returns:
             Deletion response
         """
-        params = self._add_team_id_to_params()
+        params = self._with_change_reason(self._add_team_id_to_params(), change_reason)
         return cast(Dict[str, Any], await self.delete(f"/profitstream/v2/api/ai/cost-controls/{control_id}", params=params))
 
     async def get_enforcement_events(self, page: int = 0, size: int = 20, **filters: Any) -> Dict[str, Any]:
@@ -4045,8 +4232,9 @@ class ReveniumClient:
     async def list_team_cowork_org_links(self, team_id: str) -> List[Dict[str, Any]]:
         """List every Claude organization the team knows, each with its link state.
 
-        Answers a bare JSON array of ``{claudeOrgUuid, id, source, state}``, where
-        ``id`` is the link id and is null for an organization that is not linked.
+        Answers a bare JSON array of ``{claudeOrgUuid, id, source, state, toolName}``,
+        where ``id`` is the link id and is null for an organization that is not linked,
+        and ``toolName`` is the name shown in Cowork in place of Revenium, or null.
         """
         return cast(
             List[Dict[str, Any]],
@@ -4242,6 +4430,40 @@ class ReveniumClient:
             f"/profitstream/v2/api/sources/ai/anomaly/{anomaly_id}", params=params
         ))
 
+    async def get_anomaly_changes(
+        self, anomaly_id: str, page: int = 0, size: int = 20
+    ) -> Dict[str, Any]:
+        """One page of an AI anomaly's change history, newest first.
+
+        Args:
+            anomaly_id: The anomaly ID
+            page: Page number (0-based)
+            size: Entries per page
+
+        Returns:
+            HAL page with the entries under ``_embedded.changes`` and a ``page`` block
+        """
+        params = self._add_team_id_to_params({"page": page, "size": size})
+        return cast(Dict[str, Any], await self.get(
+            f"/profitstream/v2/api/sources/ai/anomaly/{self._quote_path_segment(anomaly_id)}/changes",
+            params=params,
+        ))
+
+    async def get_anomaly_change_summary(self, anomaly_id: str) -> Dict[str, Any]:
+        """Who created an AI anomaly and who changed it last, from its history.
+
+        Args:
+            anomaly_id: The anomaly ID
+
+        Returns:
+            ``{"createdAt", "createdBy", "lastChangedAt", "lastChangedBy", "historyStartsAt"}``
+        """
+        params = self._add_team_id_to_params()
+        return cast(Dict[str, Any], await self.get(
+            f"/profitstream/v2/api/sources/ai/anomaly/{self._quote_path_segment(anomaly_id)}/changes/summary",
+            params=params,
+        ))
+
     async def create_anomaly(self, anomaly_data: Dict[str, Any]) -> Dict[str, Any]:
         """Create a new AI anomaly.
 
@@ -4274,16 +4496,19 @@ class ReveniumClient:
             params=params,
         ))
 
-    async def delete_anomaly(self, anomaly_id: str) -> Dict[str, Any]:
+    async def delete_anomaly(
+        self, anomaly_id: str, change_reason: Optional[str] = None
+    ) -> Dict[str, Any]:
         """Delete an AI anomaly.
 
         Args:
             anomaly_id: The anomaly ID
+            change_reason: Why it is deleted, recorded on the change history; sent only when given
 
         Returns:
             Deletion response
         """
-        params = self._add_team_id_to_params()
+        params = self._with_change_reason(self._add_team_id_to_params(), change_reason)
         return cast(Dict[str, Any], await self.delete(
             f"/profitstream/v2/api/sources/ai/anomaly/{anomaly_id}", params=params
         ))
@@ -5368,7 +5593,7 @@ class ReveniumClient:
             )
             source = "the analytics base URL derived from the known-host map"
         if not url.startswith("https://"):
-            raise ValueError(
+            raise AnalyticsHostMisconfiguredError(
                 f"{source} must use HTTPS to prevent Bearer token leakage, got: {url!r}"
             )
         return url
@@ -5464,6 +5689,17 @@ class ReveniumClient:
             Top tools ranked by call count
         """
         return cast(Dict[str, Any], await self.get("/api/v2/analytics/top-tools-by-call-count", **self._tool_analytics_request(filters)))
+
+    async def get_tool_cost_and_call_volume(self, **filters: Any) -> Dict[str, Any]:
+        """Total cost and call count per tool on one row, ranked by cost then calls, one page at a time.
+
+        Args:
+            **filters: startDate, endDate, page and size, under the platform's names
+
+        Returns:
+            The whole envelope, with the ``page`` block that says how many pages remain
+        """
+        return cast(Dict[str, Any], await self.get("/api/v2/analytics/tool-cost-and-call-volume", **self._tool_analytics_request(filters)))
 
     TEAM_MEDIANS_ASSISTANTS = "claude-code"
 

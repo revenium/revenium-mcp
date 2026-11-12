@@ -367,13 +367,13 @@ class TestCostControlsManagerDelete:
     async def test_delete_calls_client(self, cc_manager, mock_client):
         mock_client.delete_cost_control.return_value = {}
         await cc_manager.delete_cost_control({"control_id": "cc_9"})
-        mock_client.delete_cost_control.assert_called_once_with("cc_9")
+        mock_client.delete_cost_control.assert_called_once_with("cc_9", change_reason=None)
 
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("status", [400, 403, 404])
     async def test_delete_not_found_is_structured(self, cc_manager, mock_client, status):
-        """DELETE has no input other than the id, so 400/403/404 all fold."""
+        """A delete without a reason has no input other than the id, so 400/403/404 all fold."""
         mock_client.delete_cost_control.side_effect = ReveniumAPIError(
             "boom", status_code=status
         )

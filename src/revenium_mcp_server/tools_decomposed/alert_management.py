@@ -59,6 +59,15 @@ from ..alerts.update_fidelity import (
     unsupported_alert_fields_note,
 )
 from ..client import ReveniumAPIError, ReveniumClient
+from ..common.change_history import CHANGE_AUTHOR_NOTE, CHANGE_ENTRY_FIELDS_NOTE
+from ..common.change_reason import (
+    ALERT_CHANGE_REASON,
+    CHANGE_REASON_ARGUMENT,
+    CHANGE_REASON_FIELD,
+    CHANGE_REASON_FIELD_NOTE,
+    change_reason_field_schema,
+)
+from ..common.platform_paging import PLATFORM_MAX_PAGE_SIZE
 from ..common.default_slack_configuration import get_default_slack_config_id
 from ..common.error_handling import (
     ErrorCodes,
@@ -71,7 +80,12 @@ from ..common.error_handling import (
 )
 from ..common.money import render_plain_amount
 from ..common.pagination_performance import validate_pagination_with_performance
-from ..common.validation import apply_filter_allowlist, validate_pagination_params
+from ..common.thin_tool_defaults import arguments_filled_on_every_call
+from ..common.validation import (
+    apply_filter_allowlist,
+    refuse_every_argument_the_read_ignores,
+    validate_pagination_params,
+)
 from ..common.ucm_config import log_ucm_status
 from ..config_store import default_notification_email
 from ..exceptions import ValidationError
@@ -145,12 +159,57 @@ API_KEY_FILTER_GUIDANCE = (
     "filters; the platform refuses anything else."
 )
 
+ANOMALY_DATA_CHANGE_REASON_NOTE = (
+    f"anomaly_data also takes {CHANGE_REASON_FIELD} on create and update. "
+    f"{CHANGE_REASON_FIELD_NOTE} The quick create actions take none."
+)
+
 API_KEY_FILTER_EXAMPLE = (
     'create(anomaly_data={"name": "Production key budget", "dataSource": "PROVIDER", '
     '"alertType": "CUMULATIVE_USAGE", "metricType": "TOTAL_COST", '
     '"operatorType": "GREATER_THAN", "threshold": 500, "periodDuration": "MONTHLY", '
     '"filters": [{"dimension": "API_KEY", "operator": "IS", "value": "<id>"}]})'
 )
+
+TEAM_LOG_TOOL_PROFILE_NOTE = (
+    "get_cost_controls is published by the business profile, not the starter one"
+)
+
+TEAM_CHANGE_LOG_POINTER = (
+    "Every budget and alert change of the team within a window is "
+    "get_cost_controls list_control_changes, which requires since and until; "
+    + TEAM_LOG_TOOL_PROFILE_NOTE
+)
+
+ONE_ALERT_IN_A_WINDOW = (
+    "For one alert's changes in a window, call get_cost_controls list_control_changes with "
+    "since, until, subject_type='ALERT' and subject_id set to the alert id; "
+    + TEAM_LOG_TOOL_PROFILE_NOTE
+)
+
+HISTORY_READ_ARGUMENTS: Dict[str, Tuple[str, ...]] = {
+    "list_changes": ("anomaly_id", "alert_id", "page", "size"),
+    "get_changes_summary": ("anomaly_id", "alert_id"),
+}
+
+
+def refuse_history_arguments_the_read_ignores(action: str, arguments: Dict[str, Any]) -> None:
+    """Refuse every argument a history read does not take, by the rule both guardrail tools share."""
+    reads = HISTORY_READ_ARGUMENTS.get(action)
+    if reads is not None:
+        refuse_every_argument_the_read_ignores(
+            action,
+            arguments,
+            reads=reads,
+            sent_on_every_call=arguments_filled_on_every_call("manage_alerts", action),
+            alternative=ONE_ALERT_IN_A_WINDOW,
+        )
+
+
+ALERT_HISTORY_EXAMPLES = """```bash
+list_changes(anomaly_id="anom_123")             # Who changed an alert rule, when, why, and each setting before and after (paged)
+get_changes_summary(anomaly_id="anom_123")      # Who created the alert rule and who changed it last
+```"""
 
 # Module-level — must stay in sync with AlertType enum members.
 _ALERT_TYPE_DESCRIPTIONS = {
@@ -337,6 +396,7 @@ class AlertManagement(ToolBase, SlackPromptingMixin):
             Formatted response
         """
         try:
+            refuse_history_arguments_the_read_ignores(action, arguments)
             # Get client
             client = await self.get_client(ctx=ctx)
 
@@ -414,6 +474,10 @@ class AlertManagement(ToolBase, SlackPromptingMixin):
                 return await self._handle_get_budget_progress(client, arguments)
             elif action == "search_provider_api_keys":
                 return await self._handle_search_provider_api_keys(client, arguments)
+            elif action == "list_changes":
+                return await self._handle_list_changes(client, arguments)
+            elif action == "get_changes_summary":
+                return await self._handle_get_changes_summary(client, arguments)
             elif action in _UNAVAILABLE_ACTIONS:
                 raise ToolError(
                     message=_UNAVAILABLE_ACTIONS[action],
@@ -465,6 +529,7 @@ class AlertManagement(ToolBase, SlackPromptingMixin):
                             "get_budget_progress",
                         ],
                         "filter_lookups": ["search_provider_api_keys"],
+                        "change_history": ["list_changes", "get_changes_summary"],
                     },
                 )
 
@@ -512,13 +577,26 @@ class AlertManagement(ToolBase, SlackPromptingMixin):
                 description="Create and manage AI-powered anomaly detection rules",
                 parameters={
                     "resource_type": "str (anomalies, alerts)",
-                    "create": {"anomaly_data": "dict"},
-                    "update": {"anomaly_id": "str", "anomaly_data": "dict"},
-                    "delete": {"anomaly_id": "str"},
+                    "create": {"anomaly_data": f"dict. {ANOMALY_DATA_CHANGE_REASON_NOTE}"},
+                    "update": {
+                        "anomaly_id": "str",
+                        "anomaly_data": f"dict. {ANOMALY_DATA_CHANGE_REASON_NOTE}",
+                    },
+                    "delete": {
+                        "anomaly_id": "str",
+                        CHANGE_REASON_ARGUMENT: ALERT_CHANGE_REASON.capability_text(),
+                    },
+                    "clear_all": {
+                        CHANGE_REASON_ARGUMENT: ALERT_CHANGE_REASON.capability_text(),
+                    },
                 },
                 examples=[
                     "create(resource_type='anomalies', anomaly_data={'metric': 'TOTAL_COST', 'threshold': 100})",
                     "update(anomaly_id='anom_123', anomaly_data={'threshold': 150})",
+                    "update(anomaly_id='anom_123', anomaly_data={'threshold': 150, "
+                    "'changeReason': 'Threshold lowered after the October invoice'})",
+                    "delete(anomaly_id='anom_123', change_reason='Retired and replaced by a budget')",
+                    "clear_all(change_reason='Clean slate before the audit')",
                     "create(resource_type='anomalies', anomaly_data={'name': 'Frontier model spend', "
                     "'alertType': 'THRESHOLD', 'metricType': 'TOTAL_COST', 'operatorType': "
                     "'GREATER_THAN', 'threshold': 500, 'filters': [{'dimension': 'MODEL', "
@@ -553,6 +631,33 @@ class AlertManagement(ToolBase, SlackPromptingMixin):
                     "Complex queries may need manual filters",
                     "Severity is not a filter the alerts endpoint declares - "
                     "narrow by type or date instead",
+                ],
+            ),
+            ToolCapability(
+                name="Change History",
+                description=(
+                    "Read who changed an alert rule, when and why. "
+                    + CHANGE_ENTRY_FIELDS_NOTE
+                    + " "
+                    + CHANGE_AUTHOR_NOTE
+                ),
+                parameters={
+                    "list_changes": {
+                        "anomaly_id": "str (required, the alert rule id; alert_id is read as the same)",
+                        "page": "int (optional, 0-based)",
+                        "size": f"int (optional, 1-{PLATFORM_MAX_PAGE_SIZE}, default 20)",
+                    },
+                    "get_changes_summary": {"anomaly_id": "str (required)"},
+                },
+                examples=[
+                    'list_changes(anomaly_id="anom_123")',
+                    'list_changes(anomaly_id="anom_123", page=1, size=50)',
+                    'get_changes_summary(anomaly_id="anom_123")',
+                ],
+                limitations=[
+                    "Both actions are read-only",
+                    "get_changes_summary is unpaged: one object, so page and size are ignored",
+                    TEAM_CHANGE_LOG_POINTER,
                 ],
             ),
             ToolCapability(
@@ -637,6 +742,8 @@ class AlertManagement(ToolBase, SlackPromptingMixin):
             "get_budget_portfolio",
             "get_budget_progress",
             "search_provider_api_keys",
+            "list_changes",
+            "get_changes_summary",
         ]
 
     async def _get_tool_dependencies(self) -> List[ToolDependency]:
@@ -1383,10 +1490,14 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
                     },
                 )
                 raise_structured_error(error)
-            return await self.anomaly_manager.delete_anomaly(client, anomaly_id)
+            return await self.anomaly_manager.delete_anomaly(
+                client, anomaly_id, change_reason=arguments.get(CHANGE_REASON_ARGUMENT)
+            )
 
         elif action == "clear_all":
-            return await self.anomaly_manager.clear_all_anomalies(client)
+            return await self.anomaly_manager.clear_all_anomalies(
+                client, change_reason=arguments.get(CHANGE_REASON_ARGUMENT)
+            )
 
         elif action == "query":
             arguments = validate_pagination_params(arguments, action="query_anomalies")
@@ -1587,6 +1698,10 @@ get_budget_portfolio()                          # Budget-progress snapshot for e
 get_budget_progress(anomaly_id="anom_123")      # Current period spend vs. threshold for one budget alert (or anomaly_ids=[...] for several)
 search_provider_api_keys(query="prod")          # Find a provider API key's id for an API_KEY filter (ids and masked hints only)
 ```
+
+### **Read Who Changed an Alert Rule**
+{ALERT_HISTORY_EXAMPLES}
+{TEAM_CHANGE_LOG_POINTER}.
 
 ## **Alert Type Decision Tree**
 
@@ -2690,6 +2805,11 @@ All alert types support the `triggerAfterPersistsDuration` parameter for sophist
 ### **Valid Duration Values**
 ONE_MINUTE, FIVE_MINUTES, FIFTEEN_MINUTES, THIRTY_MINUTES, ONE_HOUR, TWELVE_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, DAILY, WEEKLY, MONTHLY, QUARTERLY
 
+## **Change History (read-only)**
+"""
+                        + ALERT_HISTORY_EXAMPLES
+                        + f"\n{TEAM_CHANGE_LOG_POINTER}.\n"
+                        + """
 ## **Metric Filtering Capabilities**
 Both alert types support advanced filtering to target specific entities:
 - **Provider filtering**: Monitor specific AI providers (OpenAI, Anthropic, Google, etc.)
@@ -4618,6 +4738,46 @@ create(resource_type="anomalies", anomaly_data={
             parts.append("live" if active else "inactive")
         return " · ".join(parts)
 
+    async def _handle_list_changes(
+        self, client: ReveniumClient, arguments: Dict[str, Any]
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """One page of an alert rule's change history."""
+        anomaly_id = self._history_anomaly_id(arguments, "list_changes")
+        arguments = validate_pagination_params(arguments, action="list alert changes")
+        history: List[Union[TextContent, ImageContent, EmbeddedResource]] = (
+            await self.anomaly_manager.list_anomaly_changes(
+                client, anomaly_id, arguments.get("page", 0), arguments.get("size", 20)
+            )
+        )
+        return history
+
+    async def _handle_get_changes_summary(
+        self, client: ReveniumClient, arguments: Dict[str, Any]
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """Who created an alert rule and who changed it last."""
+        anomaly_id = self._history_anomaly_id(arguments, "get_changes_summary")
+        summary: List[Union[TextContent, ImageContent, EmbeddedResource]] = (
+            await self.anomaly_manager.get_anomaly_change_summary(client, anomaly_id)
+        )
+        return summary
+
+    @staticmethod
+    def _history_anomaly_id(arguments: Dict[str, Any], action: str) -> str:
+        """The alert id a history read names."""
+        anomaly_id = arguments.get("anomaly_id")
+        if not anomaly_id:
+            raise_structured_error(
+                create_structured_missing_parameter_error(
+                    parameter_name="anomaly_id",
+                    action=action,
+                    examples={
+                        "usage": f'{action}(anomaly_id="anom_123")',
+                        "valid_format": 'The alert rule id, from list(resource_type="anomalies")',
+                    },
+                )
+            )
+        return str(anomaly_id)
+
     async def _get_input_schema(self) -> Dict[str, Any]:
         """Context7 single source of truth for manage_alerts schema."""
         return {
@@ -4709,8 +4869,9 @@ create(resource_type="anomalies", anomaly_data={
                 },
                 "anomaly_id": {
                     "type": "string",
-                    "description": "Alert rule ID for get/update/delete operations",
+                    "description": "Alert rule ID for get/update/delete operations and the list_changes and get_changes_summary history reads",
                 },
+                CHANGE_REASON_ARGUMENT: ALERT_CHANGE_REASON.schema(),
                 "anomaly_ids": {
                     "type": "array",
                     "items": {"type": "string"},
@@ -4753,8 +4914,10 @@ create(resource_type="anomalies", anomaly_data={
                     "description": (
                         "Detailed alert configuration object (advanced usage). Its "
                         "'filters' entries are {dimension, operator, value} rows, one "
-                        "dimension each. " + FILTER_IN_OPERATOR_NOTE
+                        "dimension each. " + FILTER_IN_OPERATOR_NOTE + " "
+                        + ANOMALY_DATA_CHANGE_REASON_NOTE
                     ),
+                    "properties": {CHANGE_REASON_FIELD: change_reason_field_schema()},
                 },
                 "metric": {
                     "type": "string",

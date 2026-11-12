@@ -60,6 +60,7 @@ from ..analytics.formatters.base_formatter import COST_SOURCE_RULE
 from ..analytics.formatters.department_costs_formatter import DepartmentCostsFormatter
 from ..analytics.formatters.savings_findings_formatter import PERSON_ROWS_SHOWN, SavingsFindingsFormatter
 from ..analytics.savings_findings import SAVINGS_ASSISTANTS, SAVINGS_LEVELS, parse_savings_findings
+from ..analytics.tool_cost_and_calls import TOOL_COST_AND_CALLS_DEFAULT_PAGE_SIZE
 from ..analytics.formatters.user_costs_formatter import UserCostsFormatter
 from ..analytics.formatters.base_formatter import BaseFormattingUtilities
 from ..analytics.simple_analytics_engine import COST_SUMMARY_RETRY_ADVICE, SimpleAnalyticsEngine
@@ -182,6 +183,7 @@ CALENDAR_RANGE_ACTIONS = (
     "get_top_tools",
     "get_tool_costs_by_agent",
     "get_tool_costs_by_provider",
+    "get_tool_cost_and_call_volume",
 )
 #: The calendar-month read every start_date/end_date explanation shows.
 _CALENDAR_MONTH_EXAMPLE: Dict[str, str] = {
@@ -242,7 +244,7 @@ class BusinessAnalyticsManagement(ToolBase):
 
     tool_name: ClassVar[str] = "get_business_analytics"
     tool_description: ClassVar[str] = (
-        "Business analytics and cost analysis with enhanced statistical anomaly detection and new entity detection. Key actions: get_provider_costs, get_model_costs, get_customer_costs, get_api_key_costs, get_agent_costs, get_user_costs, get_department_costs, get_tool_costs, get_top_tools, get_tool_costs_by_agent, get_tool_costs_by_provider, get_ai_assistant_team_medians, get_ai_assistant_savings, get_transaction_count, get_filter_options, get_unpaid_invoice_totals, get_seat_utilization, list_invoices, list_refunds, list_period_charges, list_skills, get_skill, get_pr_health, get_pr_health_engineers, get_pr_health_prs, get_pr_health_pull_requests, get_pr_health_repositories, get_pr_health_breakdown, get_pr_health_queue, get_pr_health_trend, get_pr_health_follow_through, get_merged_prs, get_coverage_ratio, get_task_costs, get_task_completion, get_task_performance, get_profit_margins, get_top_movers, get_token_breakdown, get_team_costs, get_vendor_costs, get_token_vs_tool_cost, get_trace_cost_distribution, get_cost_summary, analyze_cost_anomalies. For anomaly detection use: min_impact_threshold, include_dimensions. For new entity detection use: detect_new_entities, min_new_entity_threshold. Use get_filter_options(dimension=...) to discover valid filter values. Use get_examples() for parameter guidance and get_capabilities() for status."
+        "Business analytics and cost analysis with enhanced statistical anomaly detection and new entity detection. Key actions: get_provider_costs, get_model_costs, get_customer_costs, get_api_key_costs, get_agent_costs, get_user_costs, get_department_costs, get_tool_costs, get_top_tools, get_tool_costs_by_agent, get_tool_costs_by_provider, get_tool_cost_and_call_volume, get_ai_assistant_team_medians, get_ai_assistant_savings, get_transaction_count, get_filter_options, get_unpaid_invoice_totals, get_seat_utilization, list_invoices, list_refunds, list_period_charges, list_skills, get_skill, get_pr_health, get_pr_health_engineers, get_pr_health_prs, get_pr_health_pull_requests, get_pr_health_repositories, get_pr_health_breakdown, get_pr_health_queue, get_pr_health_trend, get_pr_health_follow_through, get_merged_prs, get_coverage_ratio, get_task_costs, get_task_completion, get_task_performance, get_profit_margins, get_top_movers, get_token_breakdown, get_team_costs, get_vendor_costs, get_token_vs_tool_cost, get_trace_cost_distribution, get_cost_summary, analyze_cost_anomalies. For anomaly detection use: min_impact_threshold, include_dimensions. For new entity detection use: detect_new_entities, min_new_entity_threshold. Use get_filter_options(dimension=...) to discover valid filter values. Use get_examples() for parameter guidance and get_capabilities() for status."
     )
     business_category: ClassVar[str] = "Metering and Analytics Tools"
     tool_type: ClassVar[ToolType] = ToolType.ANALYTICS
@@ -392,6 +394,8 @@ class BusinessAnalyticsManagement(ToolBase):
                 return await self._handle_get_tool_costs_by_agent(arguments, ctx=ctx)
             elif action == "get_tool_costs_by_provider":
                 return await self._handle_get_tool_costs_by_provider(arguments, ctx=ctx)
+            elif action == "get_tool_cost_and_call_volume":
+                return await self._handle_get_tool_cost_and_call_volume(arguments, ctx=ctx)
             elif action == "get_ai_assistant_team_medians":
                 return await self._handle_get_ai_assistant_team_medians(arguments, ctx=ctx)
             elif action == "get_ai_assistant_savings":
@@ -736,17 +740,22 @@ If you're seeing this error, please report it as it indicates a reliability issu
    The four tool cost actions take period, or start_date and end_date in its place, read every
    page of the report, and name in the answer the exact startDate and endDate the platform was asked for.
 
-7e. **get_agent_summary**
+7e. **get_tool_cost_and_call_volume**
+   - Total cost and call count for each tool on one row per tool, ranked by cost and then by call count; get_tool_costs and get_top_tools each rank one figure with its own pages, so their rows for the same tool cannot be joined reliably
+   - A tool with only a cost or only calls is listed, with the missing figure marked not reported, never zero
+   - Takes period, or start_date and end_date in its place; one page at a time with page (zero-based) and size (1 to """ + str(ANALYTICS_MAX_PAGE_SIZE) + """, default """ + str(TOOL_COST_AND_CALLS_DEFAULT_PAGE_SIZE) + """), and the answer names the page to read next
+
+7f. **get_agent_summary**
    - Agent-friendly overview of this tool's surface
 
-7f. **get_ai_assistant_team_medians**
+7g. **get_ai_assistant_team_medians**
    - Anonymous team medians of Claude Code habits: context tokens per call, cache rebuild ratio and the share of requests sent above the model's default effort
    - Covers the team your credentials resolve to; nothing about any person is returned, and every figure is coarsened by the platform
    - Optional window: 14d (default, the last 14 days) or completed-weeks:N for the last N completed weeks, N from 1 to 4
    - Fewer than five people who made a call in the window means 'not enough people to compare': the medians are withheld, never zero
    - A rate limit or server error means no figures right now, not a zero
 
-7g. **get_ai_assistant_savings**
+7h. **get_ai_assistant_savings**
    - What the team can save on its coding assistants, ranked, with the platform's own totals (copied, never summed from rows), spend to inspect and the latest AI Insights savings
    - level: department (default, one row per top-level department, paged with page and size, size at most """ + str(ANALYTICS_MAX_PAGE_SIZE) + """, names nobody) or person (each saving with the people it comes from; not paged, so the answer shows the first """ + str(PERSON_ROWS_SHOWN) + """ rows and says how many it left out)
    - Optional assistant (""" + ", ".join(SAVINGS_ASSISTANTS) + """) and start_date/end_date (default: the 30 days before now, at most """ + str(CALENDAR_RANGE_MAX_DAYS) + """ days)
@@ -1022,6 +1031,26 @@ metricType (sum, avg, max, min).
 - `page` (optional, zero-based) and `size` (optional, 1 to 100, default 20)
 **Reading the answer**: department ids are hashids, not the numeric ids get_customers list_departments
 returns. A departmentSetup of NO_DEPARTMENTS, NO_ASSIGNMENTS or DATA_NOT_LOADED means no grouping, not $0.
+
+### get_tool_cost_and_call_volume
+```json
+{
+  "action": "get_tool_cost_and_call_volume",
+  "period": "THIRTY_DAYS",
+  "size": 20
+}
+```
+**Purpose**: Total cost and call count per tool on one row, ranked by cost and then by call count, so the two
+figures for one tool are read together instead of joined from get_tool_costs and get_top_tools
+**Parameters**:
+- `period` (required unless `start_date`/`end_date` replace it): HOUR, EIGHT_HOURS, TWENTY_FOUR_HOURS, SEVEN_DAYS, THIRTY_DAYS, TWELVE_MONTHS
+- `page` (optional, zero-based) and `size` (optional, 1 to """ + str(ANALYTICS_MAX_PAGE_SIZE) + """, default """ + str(TOOL_COST_AND_CALLS_DEFAULT_PAGE_SIZE) + """)
+- No filters, and no roll-up other than TOTAL: each figure is the tool's total over the window
+**Reading the answer**: each tool shows its display name, tool id, total cost and calls. A tool with only one
+of the two figures shows the other as not reported, never zero. When more pages exist the answer names the
+page and size to pass next, with the same period or start_date/end_date. A period window ends at the time of
+each read, so tools can move between pages; a start_date/end_date range that ends before today reads the same
+window on every page.
 
 ### get_transaction_count
 ```json
@@ -6988,6 +7017,14 @@ If you're seeing this error, please report it as it indicates a reliability issu
 """
             raise_refusal(error_response, error_code=ErrorCodes.API_ERROR)
 
+    async def _handle_get_tool_cost_and_call_volume(
+        self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
+    ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        """One page of tools with total cost and call count on one row; the engine words every refusal."""
+        client = await self.get_client(ctx=ctx)
+        text = await SimpleAnalyticsEngine(client).get_tool_cost_and_call_volume(**arguments)
+        return [TextContent(type="text", text=text)]
+
     async def _handle_get_tool_costs_by_provider(
         self, arguments: Dict[str, Any], ctx: Optional["TenantContext"] = None
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
@@ -7530,6 +7567,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
             "get_top_tools",
             "get_tool_costs_by_agent",
             "get_tool_costs_by_provider",
+            "get_tool_cost_and_call_volume",
             "get_ai_assistant_team_medians",
             "get_ai_assistant_savings",
             "get_transaction_count",
@@ -7910,18 +7948,32 @@ If you're seeing this error, please report it as it indicates a reliability issu
             ),
             ToolCapability(
                 name="Tool Cost Analysis",
-                description="Tool invocation cost analysis by tool, agent, and provider",
+                description=(
+                    "Tool invocation cost analysis by tool, agent, and provider, and each "
+                    "tool's total cost beside its call count on one ranked, paged row"
+                ),
                 parameters={
                     "get_tool_costs": {"period": "str", "aggregation": "str"},
                     "get_top_tools": {"period": "str", "aggregation": "str"},
                     "get_tool_costs_by_agent": {"period": "str", "aggregation": "str"},
                     "get_tool_costs_by_provider": {"period": "str", "aggregation": "str"},
+                    "get_tool_cost_and_call_volume": {
+                        "period": "str (required unless start_date/end_date replace it)",
+                        "start_date": "str (optional, yyyy-MM-dd)",
+                        "end_date": "str (optional, yyyy-MM-dd)",
+                        "page": "int (optional, zero-based)",
+                        "size": (
+                            f"int (optional, 1 to {ANALYTICS_MAX_PAGE_SIZE}, "
+                            f"default {TOOL_COST_AND_CALLS_DEFAULT_PAGE_SIZE})"
+                        ),
+                    },
                 },
                 examples=[
                     "get_tool_costs(period='HOUR')",
                     "get_top_tools(period='TWENTY_FOUR_HOURS')",
                     "get_tool_costs_by_agent(period='SEVEN_DAYS')",
                     "get_tool_costs_by_provider(period='THIRTY_DAYS')",
+                    "get_tool_cost_and_call_volume(period='THIRTY_DAYS', page=0, size=20)",
                 ],
             ),
             ToolCapability(

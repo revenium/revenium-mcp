@@ -10,6 +10,8 @@ from src.revenium_mcp_server.common.validation import (
     preprocess_array_parameters,
     validate_pagination_params,
     validate_string_params,
+    refuse_arguments_the_action_ignores,
+    refuse_every_argument_the_read_ignores,
 )
 from src.revenium_mcp_server.common.error_handling import ToolError
 from src.revenium_mcp_server.exceptions import ValidationError
@@ -391,3 +393,73 @@ class TestValidateStringParams:
         """Semantic validity (empty not allowed) is enforced downstream, not here."""
         result = validate_string_params({"tool_id": ""}, ["tool_id"], action="get")
         assert result["tool_id"] == ""
+
+
+class TestTheTwoArgumentRefusals:
+    @pytest.mark.parametrize("blank", [None, "", "   ", {}, []], ids=["none", "empty", "spaces", "dict", "list"])
+    def test_a_blank_narrowing_narrows_nothing(self, blank):
+        refuse_every_argument_the_read_ignores(
+            "list_changes",
+            {"filters": blank},
+            reads=(),
+            sent_on_every_call=(),
+            alternative="Use the team log",
+        )
+
+    def test_a_narrowing_is_refused_by_name_never_by_value(self):
+        with pytest.raises(ToolError) as refusal:
+            refuse_every_argument_the_read_ignores(
+                "list_changes",
+                {"query": "jane@acme.com", "filters": {}},
+                reads=(),
+                sent_on_every_call=(),
+                alternative="Use the team log",
+            )
+
+        assert refusal.value.message == "list_changes does not read query. Use the team log."
+        assert refusal.value.field == "query"
+        assert refusal.value.suggestions == ["Drop query from this list_changes call."]
+        assert "jane@acme.com" not in str(refusal.value)
+
+    def test_an_explicit_blank_argument_an_action_never_reads_is_still_refused(self):
+        with pytest.raises(ToolError) as refusal:
+            refuse_arguments_the_action_ignores(
+                "get", {"overrides": ""}, ("overrides",), honoured_by=("create",), known_actions=("get", "create")
+            )
+
+        assert refusal.value.message == "get does not read overrides; it is read only by create."
+
+
+class TestARefusalDerivedFromWhatTheReadTakes:
+    READS = ("item_id", "page", "size")
+    SENT_ON_EVERY_CALL = ("action", "page", "size")
+
+    def _refuse(self, arguments):
+        refuse_every_argument_the_read_ignores(
+            "list_changes",
+            {"action": "list_changes", "page": 0, "size": 20, **arguments},
+            reads=self.READS,
+            sent_on_every_call=self.SENT_ON_EVERY_CALL,
+            alternative="Use the team log",
+        )
+
+    def test_what_the_read_takes_and_the_registry_always_sends_is_not_refused(self):
+        self._refuse({"item_id": "x_1"})
+
+    def test_an_argument_no_list_names_is_refused_by_name_never_by_value(self):
+        with pytest.raises(ToolError) as refusal:
+            self._refuse({"item_id": "x_1", "declared_later": "jane@acme.com"})
+
+        assert refusal.value.message == "list_changes does not read declared_later. Use the team log."
+        assert refusal.value.field == "declared_later"
+        assert "jane@acme.com" not in str(refusal.value)
+
+    @pytest.mark.parametrize("blank", ["", "   ", {}, []], ids=["empty", "spaces", "dict", "list"])
+    def test_a_blank_argument_the_read_does_not_take_narrows_nothing(self, blank):
+        self._refuse({"item_id": "x_1", "since": blank})
+
+    def test_a_false_flag_is_a_value_the_caller_sent(self):
+        with pytest.raises(ToolError) as refusal:
+            self._refuse({"item_id": "x_1", "enabled": False})
+
+        assert refusal.value.field == "enabled"

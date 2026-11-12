@@ -1650,6 +1650,80 @@ class TestTeamScopeRefusal:
         assert exc_info.value.code == "AI_RECOMMENDATIONS_DISABLED"
         assert not isinstance(exc_info.value, ToolError)
 
+    def test_the_fixture_is_an_unpaired_analytics_configuration(self, mock_env_vars, monkeypatch):
+        from src.revenium_mcp_server.endpoint_registry import DEFAULT_APP_BASE_URL
+
+        client = self._client_answering(monkeypatch, 403, self.TEAM_REFUSAL)
+
+        assert client._get_app_base_url() == DEFAULT_APP_BASE_URL
+        assert ReveniumClient._sent_to_unpaired_analytics_host(403, DEFAULT_APP_BASE_URL, True)
+
+    CODELESS_FORBIDDEN = [
+        ("application/problem+json", {"type": "about:blank", "title": "Forbidden", "detail": "Forbidden"}),
+        ("application/json", {"message": "Forbidden"}),
+    ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("content_type", ["application/problem+json", "application/json"])
+    async def test_the_team_membership_code_from_an_unpaired_host_stays_a_team_scope_error(
+        self, mock_env_vars, monkeypatch, content_type
+    ):
+        from src.revenium_mcp_server.common.team_scope_error import (
+            TEAM_NOT_IN_MEMBERSHIP,
+            TeamScopeForbiddenError,
+        )
+
+        client = self._client_answering(
+            monkeypatch, 403, self.TEAM_REFUSAL, content_type=content_type
+        )
+        with pytest.raises(ReveniumAPIError) as exc_info:
+            await client.list_recommendation_runs()
+
+        assert isinstance(exc_info.value, TeamScopeForbiddenError)
+        assert exc_info.value.code == TEAM_NOT_IN_MEMBERSHIP
+        assert not exc_info.value.blames_unpaired_analytics_host
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("content_type, body", CODELESS_FORBIDDEN, ids=["problem+json", "json"])
+    async def test_a_codeless_403_from_an_unpaired_host_is_the_unpaired_host_not_the_team(
+        self, mock_env_vars, monkeypatch, content_type, body
+    ):
+        from src.revenium_mcp_server.common.error_handling import ToolError
+
+        client = self._client_answering(
+            monkeypatch, 403, body, content_type=content_type
+        )
+        with pytest.raises(ReveniumAPIError) as exc_info:
+            await client.list_recommendation_runs()
+
+        assert not isinstance(exc_info.value, ToolError)
+        assert exc_info.value.blames_unpaired_analytics_host
+        assert exc_info.value.status_code == 403
+        assert "set REVENIUM_APP_BASE_URL" in exc_info.value.message
+        assert "cannot read team" not in exc_info.value.message
+        assert exc_info.value.platform_message == "Forbidden"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("content_type, body", CODELESS_FORBIDDEN, ids=["problem+json", "json"])
+    async def test_a_codeless_403_on_a_paired_host_is_still_read_as_the_team_sent(
+        self, mock_env_vars, monkeypatch, content_type, body
+    ):
+        from src.revenium_mcp_server.common.team_scope_error import TeamScopeForbiddenError
+        from src.revenium_mcp_server.constants import DEFAULT_BASE_URL
+        from src.revenium_mcp_server.endpoint_registry import DEFAULT_APP_BASE_URL
+
+        client = self._client_answering(
+            monkeypatch, 403, body, content_type=content_type
+        )
+        monkeypatch.setenv("REVENIUM_BASE_URL", DEFAULT_BASE_URL)
+        assert not ReveniumClient._sent_to_unpaired_analytics_host(403, DEFAULT_APP_BASE_URL, True)
+
+        with pytest.raises(ReveniumAPIError) as exc_info:
+            await client.list_recommendation_runs()
+
+        assert isinstance(exc_info.value, TeamScopeForbiddenError)
+        assert not exc_info.value.blames_unpaired_analytics_host
+
     @pytest.mark.asyncio
     async def test_a_403_on_a_read_that_sent_no_team_is_not_translated(
         self, mock_env_vars, monkeypatch
