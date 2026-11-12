@@ -1517,3 +1517,104 @@ async def test_trigger_run_refuses_single_digit_days_more_than_ninety_days_apart
 
     trigger.assert_not_awaited()
     assert "91 days" in exc.value.message
+
+
+UNPAIRED_PLATFORM = "https://api.staging.example.invalid"
+
+
+def _unpaired_client_answering(monkeypatch, status, problem):
+    """A real client whose analytics reads go to the production analytics host
+    because its non-production platform has no known pairing."""
+    import httpx
+
+    from src.revenium_mcp_server.auth import AuthConfig
+    from src.revenium_mcp_server.client import ReveniumClient
+    from src.revenium_mcp_server.endpoint_registry import DEFAULT_APP_BASE_URL
+
+    monkeypatch.delenv("REVENIUM_API_KEY", raising=False)
+    monkeypatch.delenv("REVENIUM_APP_BASE_URL", raising=False)
+    monkeypatch.setenv("REVENIUM_BASE_URL", UNPAIRED_PLATFORM)
+    client = ReveniumClient(auth_config=AuthConfig(
+        api_key="hak_test_abcd1234", team_id="team_1", base_url=UNPAIRED_PLATFORM,
+    ))
+    assert client._get_app_base_url() == DEFAULT_APP_BASE_URL
+    response = httpx.Response(
+        status,
+        json={"type": "about:blank", "title": "Refused", "status": status, **problem},
+        headers={"content-type": "application/problem+json"},
+        request=httpx.Request("GET", DEFAULT_APP_BASE_URL),
+    )
+    monkeypatch.setattr(client.client, "request", AsyncMock(return_value=response))
+    return client
+
+
+async def _unpaired_failure(monkeypatch, status, problem, action, arguments):
+    from src.revenium_mcp_server.tools_decomposed.ai_insights_management import (
+        AIInsightsManagement,
+    )
+
+    client = _unpaired_client_answering(monkeypatch, status, problem)
+    tool = AIInsightsManagement()
+    with patch.object(tool, "get_client", new=AsyncMock(return_value=client)):
+        with pytest.raises(Exception) as exc:
+            await tool.handle_action(action, arguments)
+    return exc.value
+
+
+class TestProblemCodesFromAnUnpairedAnalyticsHost:
+    """A problem naming its own code reached a handler on the analytics host, so the
+    tool's code mapping still applies when the platform has no known analytics pairing."""
+
+    @pytest.mark.asyncio
+    async def test_a_disabled_feature_is_still_an_authorization_failure(self, monkeypatch):
+        from src.revenium_mcp_server.common.error_handling import ErrorCodes
+
+        error = await _unpaired_failure(
+            monkeypatch, 403,
+            {"detail": "AI recommendations is disabled.", "code": "AI_RECOMMENDATIONS_DISABLED"},
+            "list_investigators", {},
+        )
+
+        assert isinstance(error, ToolError)
+        assert error.message == "AI recommendations is not enabled for this team."
+        assert error.error_code == ErrorCodes.API_AUTHORIZATION
+        assert "REVENIUM_APP_BASE_URL" not in error.message
+
+    @pytest.mark.asyncio
+    async def test_a_missing_run_is_still_not_found(self, monkeypatch):
+        from src.revenium_mcp_server.common.error_handling import ErrorCodes
+
+        error = await _unpaired_failure(
+            monkeypatch, 404, {"detail": "Run missing not found", "code": "NOT_FOUND"},
+            "get_run", {"run_id": "missing"},
+        )
+
+        assert isinstance(error, ToolError)
+        assert error.error_code == ErrorCodes.RESOURCE_NOT_FOUND
+        assert error.message == "Run missing not found"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "status, problem",
+        [
+            (404, {"detail": "Not Found"}),
+            (403, {"detail": "Not Found"}),
+            (401, {"detail": "Not Found", "code": "UNAUTHORIZED"}),
+            (403, {"detail": "Not Found", "code": "FORBIDDEN"}),
+        ],
+        ids=["404 no code", "403 no code", "401 UNAUTHORIZED", "403 FORBIDDEN"],
+    )
+    async def test_a_codeless_or_credential_refusal_carries_the_configuration_fix(
+        self, monkeypatch, status, problem
+    ):
+        from src.revenium_mcp_server.client import ReveniumAPIError
+
+        error = await _unpaired_failure(
+            monkeypatch, status, problem, "get_run", {"run_id": "missing"},
+        )
+
+        assert isinstance(error, ReveniumAPIError)
+        assert not isinstance(error, ToolError)
+        assert error.blames_unpaired_analytics_host
+        assert "set REVENIUM_APP_BASE_URL" in error.message
+        assert error.platform_message == "Not Found"

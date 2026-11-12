@@ -4287,6 +4287,78 @@ class TestAiAssistantTeamMedians:
         assert "No figures right now" in text
         assert "not a zero and not a small team" in text
 
+    @staticmethod
+    def _unpaired_client_answering(monkeypatch, status, problem):
+        """A real client whose analytics reads go to the production analytics host
+        because its non-production platform has no known pairing."""
+        import httpx
+
+        from src.revenium_mcp_server.auth import AuthConfig
+        from src.revenium_mcp_server.client import ReveniumClient
+        from src.revenium_mcp_server.endpoint_registry import DEFAULT_APP_BASE_URL
+
+        platform = "https://api.staging.example.invalid"
+        monkeypatch.delenv("REVENIUM_API_KEY", raising=False)
+        monkeypatch.delenv("REVENIUM_APP_BASE_URL", raising=False)
+        monkeypatch.setenv("REVENIUM_BASE_URL", platform)
+        client = ReveniumClient(auth_config=AuthConfig(
+            api_key="hak_test_abcd1234", team_id="team_1", base_url=platform,
+        ))
+        assert client._get_app_base_url() == DEFAULT_APP_BASE_URL
+        response = httpx.Response(
+            status,
+            json={"type": "about:blank", "title": "Refused", "status": status, **problem},
+            headers={"content-type": "application/problem+json"},
+            request=httpx.Request("GET", DEFAULT_APP_BASE_URL),
+        )
+        monkeypatch.setattr(client.client, "request", AsyncMock(return_value=response))
+        return client
+
+    @pytest.mark.asyncio
+    async def test_a_coded_refusal_from_an_unpaired_host_shows_the_platform_answer(
+        self, analytics_tool, monkeypatch
+    ):
+        client = self._unpaired_client_answering(
+            monkeypatch, 404, {"detail": "The platform's own refusal", "code": "NOT_FOUND"}
+        )
+        text = await _refusal(analytics_tool, "get_ai_assistant_team_medians", {}, client)
+        assert "**API Error**: The platform's own refusal" in text
+        assert "**HTTP Status**: 404" in text
+        assert "REVENIUM_APP_BASE_URL" not in text
+
+    @pytest.mark.asyncio
+    async def test_a_400_from_an_unpaired_host_still_lists_the_refused_fields(
+        self, analytics_tool, monkeypatch
+    ):
+        client = self._unpaired_client_answering(monkeypatch, 400, {
+            "detail": "Invalid input",
+            "code": "VALIDATION_ERROR",
+            "errors": [{"path": ["assistants", 0], "message": "Invalid enum value. Expected 'claude-code'"}],
+        })
+        text = await _refusal(analytics_tool, "get_ai_assistant_team_medians", {}, client)
+        assert "- Invalid enum value. Expected 'claude-code'" in text
+        assert "REVENIUM_APP_BASE_URL" not in text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "status, problem",
+        [
+            (404, {"detail": "Not Found"}),
+            (403, {"detail": "Forbidden"}),
+            (401, {"detail": "Invalid or inactive API key", "code": "UNAUTHORIZED"}),
+            (403, {"detail": "The credential may not make this request.", "code": "FORBIDDEN"}),
+        ],
+        ids=["404 no code", "403 no code", "401 UNAUTHORIZED", "403 FORBIDDEN"],
+    )
+    async def test_a_codeless_or_credential_refusal_from_an_unpaired_host_carries_the_configuration_fix(
+        self, analytics_tool, monkeypatch, status, problem
+    ):
+        client = self._unpaired_client_answering(monkeypatch, status, problem)
+        text = await _refusal(analytics_tool, "get_ai_assistant_team_medians", {}, client)
+        assert "set REVENIUM_APP_BASE_URL" in text
+        assert f"**HTTP Status**: {status}" in text
+        assert "cannot read team" not in text
+
     @pytest.mark.asyncio
     async def test_supported_described_and_documented(self, analytics_tool):
         action = "get_ai_assistant_team_medians"

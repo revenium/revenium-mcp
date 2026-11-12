@@ -5,8 +5,10 @@ Cost Controls API (/v2/api/ai/cost-controls), covering 5 CRUD actions (list,
 get, create, update, delete), 6 read-only enforcement-visibility actions
 (list_enforcement_events and its unpaged summary/history/affected sub-reads,
 get_enforcement_rules and one rule's get_enforcement_rule_roster), the
-list_filter_values lookup of the provider values a filter accepts, plus the
-standard introspection actions.
+list_filter_values lookup of the provider values a filter accepts, 3 read-only
+change-history actions (one budget's list_changes and get_changes_summary, and
+the team-wide list_control_changes over a required window), plus the standard
+introspection actions.
 
 Cost controls are spend guardrails: each pairs a warn threshold and a hard
 limit over a spend window (windowType) for a metric (metricType) with an
@@ -24,7 +26,7 @@ control is written. DEPARTMENT is cost-control-only (see
 """
 
 import json
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple, Union
 
 if TYPE_CHECKING:
     from ..auth.tenant_context import TenantContext
@@ -33,6 +35,23 @@ from loguru import logger
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
 from ..client import ReveniumAPIError, ReveniumClient
+from ..common.change_history import (
+    CHANGE_AUTHOR_NOTE,
+    CHANGE_ENTRY_FIELDS_NOTE,
+    read_change_history,
+    render_change_page,
+    render_change_summary,
+)
+from ..common.change_reason import (
+    COST_CONTROL_CHANGE_REASON,
+    CHANGE_REASON_ARGUMENT,
+    CHANGE_REASON_FIELD,
+    CHANGE_REASON_MAX_LENGTH,
+    change_reason_field_schema,
+    checked_change_reason,
+    delete_refusal_is_id_or_change_reason,
+    id_or_change_reason_refused,
+)
 from ..common.department_aliases import (
     deprecated_aliases_note,
     deprecated_argument_properties,
@@ -45,9 +64,13 @@ from ..common.error_handling import (
     raise_unknown_action_error,
 )
 from ..common.formatting import format_page_count_heading
+from ..common.platform_paging import PLATFORM_MAX_PAGE_SIZE
 from ..common.sample_coverage import platform_total
 from ..common.validation import (
     apply_filter_allowlist,
+    is_blank,
+    refuse_arguments_the_action_ignores,
+    refuse_every_argument_the_read_ignores,
     refuse_ignored_filter,
     validate_pagination_params,
 )
@@ -64,6 +87,19 @@ from .unified_tool_base import ToolBase
 _CREATE_REQUIRED_FIELDS = ("name", "metricType", "hardLimit", "windowType", "action")
 
 NOTIFICATION_EMAILS_MAX = 10
+
+AI_ANOMALY_LINK_NOTE = (
+    "Optional: the id of one active alert of this team to link to the guardrail, so the "
+    "alert's changes join the guardrail's change history. The link does not change when the "
+    "guardrail or the alert fires. On update, omitted keeps the current link and null clears "
+    "it. Write-only: reads show the linked alert as aiAnomaly."
+)
+
+HISTORY_FIELDS_NOTE = (
+    "Both writes also take changeReason (why, up to "
+    f"{CHANGE_REASON_MAX_LENGTH} characters, kept on the change history and never returned) "
+    "and aiAnomalyId (links one active alert of the team; null clears the link)."
+)
 
 # An agent told only "a list of emails" may send [] to mean "no change" and
 # wipe the recipients, so the PATCH rule is spelled the way the platform spec
@@ -245,6 +281,124 @@ ENFORCEMENT_ADVISORY_ROWS_NOTE = (
     "platform ignores it when rule_id is sent, so the two are refused together. "
     "Notify-only budgets are created and edited with manage_alerts."
 )
+
+BUDGET_HISTORY_ACTIONS = ("list_changes", "get_changes_summary")
+
+TEAM_LOG_READERS = ("list_control_changes",)
+
+# Every other action is refused since and until, so an action whose handler reads them
+# (list_control_changes and each caller of _build_enforcement_event_filters) must be listed.
+_WINDOW_READERS = (
+    "list_control_changes",
+    "list_enforcement_events",
+    "get_enforcement_events_summary",
+    "get_enforcement_events_history",
+    "get_enforcement_events_affected",
+)
+
+# snake_case tool argument -> query parameter of GET /v2/api/ai/control-changes,
+# as ChangeHistoryController.listControlChanges declares them (hypercurrent
+# release/v2.27.0); teamId, since, until, page and size are sent by name.
+CONTROL_CHANGE_FILTER_MAP: Dict[str, str] = {
+    "subject_type": "subjectType",
+    "subject_id": "subjectId",
+    "change_type": "changeType",
+    "changed_by": "changedBy",
+    "api_key_id": "apiKeyId",
+}
+
+CONTROL_CHANGES_MAX_WINDOW_DAYS = 366
+
+CONTROL_CHANGES_WINDOW_NOTE = (
+    "list_control_changes needs both since and until, and this tool does not choose a "
+    "window for you: send full ISO-8601 date-times with Z or an offset, since inclusive and "
+    f"until exclusive, at most {CONTROL_CHANGES_MAX_WINDOW_DAYS} days apart."
+)
+
+ONE_BUDGET_IN_A_WINDOW = (
+    "For one budget's changes in a window, call list_control_changes with "
+    "subject_type='COST_CONTROL' and subject_id set to the budget id"
+)
+
+NARROW_THE_TEAM_LOG_TO_ONE_BUDGET = (
+    "list_control_changes is narrowed only by "
+    + ", ".join(CONTROL_CHANGE_FILTER_MAP)
+    + "; for one budget, send subject_type='COST_CONTROL' with subject_id set to the budget id"
+)
+
+HISTORY_READ_ARGUMENTS: Dict[str, Tuple[str, ...]] = {
+    "list_changes": ("control_id", "page", "size"),
+    "get_changes_summary": ("control_id",),
+    "list_control_changes": ("since", "until", "page", "size", *CONTROL_CHANGE_FILTER_MAP),
+}
+
+# manage_cost_controls is not a thin tool: page and size are defaulted in the signature of
+# _register_manage_cost_controls, so every call carries them whatever the caller asked for.
+SENT_ON_EVERY_CALL = ("action", "page", "size")
+
+_HISTORY_READ_ALTERNATIVES = {
+    **dict.fromkeys(BUDGET_HISTORY_ACTIONS, ONE_BUDGET_IN_A_WINDOW),
+    "list_control_changes": NARROW_THE_TEAM_LOG_TO_ONE_BUDGET,
+}
+
+LINKED_ALERT_CHANGES_NOTE = (
+    "A budget's list_changes also lists the changes of every alert linked to it now or at any "
+    "recorded revision, marked as linked to this budget; get_changes_summary counts the "
+    "budget's own changes only."
+)
+
+COST_CONTROLS_GATE_NOTE = (
+    "On a tenant without cost controls, list_changes and get_changes_summary answer 403 and "
+    "list_control_changes leaves budget entries out (and answers 403 when asked for "
+    "budgets alone)."
+)
+
+CONTROL_CHANGES_EXPORT_NOTE = (
+    "The platform's CSV export of the team log is not offered: it returns the whole window "
+    "in one file. Page through list_control_changes instead."
+)
+
+CHANGE_HISTORY_NOTES = (
+    CHANGE_ENTRY_FIELDS_NOTE,
+    CHANGE_AUTHOR_NOTE,
+    CONTROL_CHANGES_WINDOW_NOTE,
+    LINKED_ALERT_CHANGES_NOTE,
+    COST_CONTROLS_GATE_NOTE,
+    CONTROL_CHANGES_EXPORT_NOTE,
+)
+
+
+def refuse_history_arguments_the_action_ignores(
+    action: str, arguments: Dict[str, Any], known_actions: Sequence[str]
+) -> None:
+    """Refuse the window or the team-log filters on an action that would drop them.
+
+    A history read refuses every argument it does not read, the window and the team-log filters
+    included, by the rule both guardrail tools' history reads share.
+    """
+    reads = HISTORY_READ_ARGUMENTS.get(action)
+    if reads is not None:
+        refuse_every_argument_the_read_ignores(
+            action,
+            arguments,
+            reads=reads,
+            sent_on_every_call=SENT_ON_EVERY_CALL,
+            alternative=_HISTORY_READ_ALTERNATIVES[action],
+        )
+        return
+    for names, readers in (
+        (("since", "until"), _WINDOW_READERS),
+        (tuple(CONTROL_CHANGE_FILTER_MAP), TEAM_LOG_READERS),
+    ):
+        refuse_arguments_the_action_ignores(
+            action, arguments, names, honoured_by=readers, known_actions=known_actions
+        )
+
+
+def _text_argument(arguments: Dict[str, Any], name: str) -> str:
+    """The argument as stripped text, or "" when blank, which a read treats as not sent."""
+    value = arguments.get(name)
+    return "" if is_blank(value) else str(value).strip()
 
 
 def _build_enforcement_event_filters(
@@ -691,15 +845,19 @@ class CostControlsManager:
             "page": page,
         }
 
-    @staticmethod
-    def _raise_control_not_found(control_id: str) -> None:
+    @classmethod
+    def _raise_control_not_found(cls, control_id: str) -> None:
         """Raise a structured RESOURCE_NOT_FOUND ToolError for a missing control.
 
         Mirrors the manage_agents pattern so the caller sees "Cost control not
         found" instead of a passthrough upstream error, and no cross-tenant
         existence can be inferred.
         """
-        raise ToolError(
+        raise cls._control_not_found(control_id)
+
+    @staticmethod
+    def _control_not_found(control_id: str) -> ToolError:
+        return ToolError(
             message=f"Cost control not found for id: {control_id!r}",
             error_code=ErrorCodes.RESOURCE_NOT_FOUND,
             field="control_id",
@@ -815,11 +973,14 @@ class CostControlsManager:
                 action="delete cost control",
                 examples={"usage": "delete(control_id='cc_123')"},
             )
+        change_reason = checked_change_reason(arguments.get(CHANGE_REASON_ARGUMENT))
         try:
-            return await self.client.delete_cost_control(control_id)
+            return await self.client.delete_cost_control(control_id, change_reason=change_reason)
         except ReveniumAPIError as e:
-            # DELETE has no input other than the id, so 400/403/404 all mean
-            # "no accessible control for this id". 5xx propagates.
+            if delete_refusal_is_id_or_change_reason(e, change_reason):
+                raise id_or_change_reason_refused(
+                    "cost control", "control_id", control_id, list_call="list(action='list')"
+                ) from e
             if e.status_code in (400, 403, 404):
                 self._raise_control_not_found(control_id)
             raise
@@ -846,6 +1007,79 @@ class CostControlsManager:
             "total_records": platform_total(page_info),
             "page": page,
         }
+
+    async def list_changes(self, arguments: Dict[str, Any]) -> str:
+        """One page of a budget's change history, its linked alerts' changes included."""
+        control_id = self._budget_history_id(arguments, "list_changes")
+        arguments = validate_pagination_params(arguments, action="list budget changes")
+        page = arguments.get("page", 0)
+        response = await read_change_history(
+            self.client.get_cost_control_changes(
+                control_id, page=page, size=arguments.get("size", 20)
+            ),
+            not_found=lambda: self._control_not_found(control_id),
+        )
+        return render_change_page(f"Change history of budget {control_id}", response, page)
+
+    async def get_changes_summary(self, arguments: Dict[str, Any]) -> str:
+        """Who created a budget and who changed it last, from its own history."""
+        control_id = self._budget_history_id(arguments, "get_changes_summary")
+        summary = await read_change_history(
+            self.client.get_cost_control_change_summary(control_id),
+            not_found=lambda: self._control_not_found(control_id),
+        )
+        return render_change_summary(f"Change summary of budget {control_id}", summary)
+
+    @staticmethod
+    def _budget_history_id(arguments: Dict[str, Any], action: str) -> str:
+        """The budget id a history read names."""
+        control_id = arguments.get("control_id")
+        if not control_id:
+            raise create_structured_missing_parameter_error(
+                parameter_name="control_id",
+                action=action,
+                examples={"usage": f"{action}(control_id='cc_123')"},
+            )
+        return str(control_id)
+
+    # Decision (BACK-5680): GET /v2/api/ai/control-changes/export is not wrapped.
+    #
+    # list_control_changes below reads the same entries a page at a time. The export
+    # answers text/csv, one row per setting changed, for the whole window in one body
+    # that only the platform's row and byte ceilings bound, so it is neither pageable
+    # nor a bounded MCP result, and the paged list already carries every field it has.
+    #
+    # What reopens it: a caller needs the file itself, to hand to someone outside the
+    # conversation, and the MCP gains a way to deliver a file rather than inline text.
+    # Then wrap it as its own read that names the row ceiling it can refuse at.
+    async def list_control_changes(self, arguments: Dict[str, Any]) -> str:
+        """One page of every change to the team's budgets and alerts in a required window."""
+        window = {name: _text_argument(arguments, name) for name in ("since", "until")}
+        missing = [name for name, value in window.items() if not value]
+        if missing:
+            raise_refusal(
+                f"{CONTROL_CHANGES_WINDOW_NOTE} Missing: {' and '.join(missing)}. Example: "
+                "list_control_changes(since='2026-10-01T00:00:00Z', until='2026-11-01T00:00:00Z').",
+                error_code=ErrorCodes.MISSING_PARAMETER,
+                field=missing[0],
+            )
+        arguments = validate_pagination_params(arguments, action="list control changes")
+        page = arguments.get("page", 0)
+        filters = {
+            query_name: text
+            for name, query_name in CONTROL_CHANGE_FILTER_MAP.items()
+            if (text := _text_argument(arguments, name))
+        }
+        response = await read_change_history(
+            self.client.get_control_changes(
+                window["since"], window["until"], page=page, size=arguments.get("size", 20), **filters
+            )
+        )
+        title = (
+            f"Changes to the team's budgets and alerts from {window['since']} "
+            f"until {window['until']}"
+        )
+        return render_change_page(title, response, page)
 
     async def get_enforcement_events_summary(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Count the matching enforcement events by outcome, over one window.
@@ -1100,12 +1334,14 @@ class CostControlsManager:
 class CostControlsManagement(ToolBase):
     """Consolidated AI cost-controls management MCP tool.
 
-    Exposes the Revenium AI Cost Controls API with 16 actions:
+    Exposes the Revenium AI Cost Controls API with 19 actions:
     - 5 CRUD: list, get, create, update, delete
     - 6 enforcement visibility: list_enforcement_events,
       get_enforcement_events_summary, get_enforcement_events_history,
       get_enforcement_events_affected, get_enforcement_rules,
       get_enforcement_rule_roster
+    - 3 change history: list_changes, get_changes_summary,
+      list_control_changes
     - 1 department scoping: preview_department_group
     - 1 filter lookup: list_filter_values
     - 3 introspection: get_capabilities, get_examples, get_tool_metadata
@@ -1128,10 +1364,14 @@ class CostControlsManagement(ToolBase):
         "they name with get_enforcement_events_affected; get_enforcement_rule_roster "
         "pages one grouped rule's people or departments against its cap. "
         "list_filter_values lists the PROVIDER values a provider filter accepts. "
+        "list_changes and get_changes_summary read who changed a budget, when and why; "
+        "list_control_changes reads every budget and alert change of the team within a "
+        "since/until window the caller must give. "
         "Key actions: list, get, create, update, delete, list_enforcement_events, "
         "get_enforcement_events_summary, get_enforcement_events_history, "
         "get_enforcement_events_affected, get_enforcement_rules, "
-        "get_enforcement_rule_roster, preview_department_group, list_filter_values. "
+        "get_enforcement_rule_roster, list_changes, get_changes_summary, "
+        "list_control_changes, preview_department_group, list_filter_values. "
         "Use get_capabilities for full action list."
     )
     business_category = "Core Business Management Tools"
@@ -1154,14 +1394,18 @@ class CostControlsManagement(ToolBase):
                 },
                 "control_id": {
                     "type": "string",
-                    "description": "Cost control identifier for get, update, and delete operations",
+                    "description": (
+                        "Cost control identifier for get, update, delete, list_changes and "
+                        "get_changes_summary"
+                    ),
                 },
                 "control_data": {
                     "type": "object",
                     "description": (
                         "Cost control data for create or update operations. "
                         "Required for create: name, metricType, hardLimit, windowType, action. "
-                        "windowType values observed on dev: DAILY, WEEKLY, MONTHLY, QUARTERLY (server-validated; not enforced client-side)."
+                        "windowType values observed on dev: DAILY, WEEKLY, MONTHLY, QUARTERLY (server-validated; not enforced client-side). "
+                        + HISTORY_FIELDS_NOTE
                     ),
                     "properties": {
                         "name": {
@@ -1307,8 +1551,14 @@ class CostControlsManagement(ToolBase):
                                 + NOTIFICATION_EMAILS_PATCH_NOTE
                             ),
                         },
+                        CHANGE_REASON_FIELD: change_reason_field_schema(),
+                        "aiAnomalyId": {
+                            "type": ["string", "null"],
+                            "description": AI_ANOMALY_LINK_NOTE,
+                        },
                     },
                 },
+                CHANGE_REASON_ARGUMENT: COST_CONTROL_CHANGE_REASON.schema(),
                 "parent_department_id": {
                     "type": ["string", "integer"],
                     "description": (
@@ -1334,7 +1584,9 @@ class CostControlsManagement(ToolBase):
                 "since": {
                     "type": "string",
                     "description": (
-                        "Optional lower time bound for the enforcement-event actions "
+                        "REQUIRED for list_control_changes: the window's start, inclusive. "
+                        + CONTROL_CHANGES_WINDOW_NOTE
+                        + " Optional lower time bound for the enforcement-event actions "
                         "(a full ISO-8601 timestamp, inclusive, measured on when the event was "
                         "written). A date alone is refused with a 422 naming the format - "
                         "verified on dev 2026-09-23. Omitted, the range starts 30 days "
@@ -1344,11 +1596,47 @@ class CostControlsManagement(ToolBase):
                 "until": {
                     "type": "string",
                     "description": (
+                        "REQUIRED for list_control_changes: the window's end, exclusive. "
                         "Optional upper time bound for the enforcement-event actions "
                         "(a full ISO-8601 timestamp, inclusive, not a bare date). Omitted, the "
                         "range ends now. A range "
                         "longer than 30 days that ends in the past is refused with 422 "
                         "rather than trimmed."
+                    ),
+                },
+                "subject_type": {
+                    "type": "string",
+                    "description": (
+                        "list_control_changes only: COST_CONTROL for budgets, ALERT for "
+                        "alerts, or ALL (the default)."
+                    ),
+                },
+                "subject_id": {
+                    "type": "string",
+                    "description": (
+                        "list_control_changes only: one budget or alert id; needs "
+                        "subject_type COST_CONTROL or ALERT. An unknown id matches nothing."
+                    ),
+                },
+                "change_type": {
+                    "type": "string",
+                    "description": (
+                        "list_control_changes only: CREATED, EDITED, DELETED or "
+                        "STARTING_STATE; several separated by commas."
+                    ),
+                },
+                "changed_by": {
+                    "type": "string",
+                    "description": (
+                        "list_control_changes only: a person's email, case-insensitive; "
+                        "also matches the changes made through that person's API keys."
+                    ),
+                },
+                "api_key_id": {
+                    "type": "string",
+                    "description": (
+                        "list_control_changes only: an API key id; matches the changes "
+                        "made through that key."
                     ),
                 },
                 "level": {
@@ -1460,6 +1748,7 @@ class CostControlsManagement(ToolBase):
                     "description": (
                         "Page number for pagination (0-based). "
                         + ENFORCEMENT_SUBREADS_UNPAGED_NOTE
+                        + " get_changes_summary is unpaged too."
                     ),
                 },
                 "size": {
@@ -1491,6 +1780,10 @@ class CostControlsManagement(ToolBase):
             "get_enforcement_events_affected",
             "get_enforcement_rules",
             "get_enforcement_rule_roster",
+            # Change history
+            "list_changes",
+            "get_changes_summary",
+            "list_control_changes",
             # Department scoping
             "preview_department_group",
             # Filter lookup
@@ -1517,8 +1810,10 @@ class CostControlsManagement(ToolBase):
                         "control_data": (
                             "dict (required: name, metricType, hardLimit, windowType, action; "
                             "optional: description, warnThreshold, shadowMode, enabled, groupBy, "
-                            "filters, notificationChannelIds, notificationEmails). "
-                            "Read accepted PROVIDER filter values with list_filter_values first"
+                            "filters, notificationChannelIds, notificationEmails, changeReason, "
+                            "aiAnomalyId). "
+                            "Read accepted PROVIDER filter values with list_filter_values first. "
+                            + HISTORY_FIELDS_NOTE
                         )
                     },
                     "update": {
@@ -1526,10 +1821,14 @@ class CostControlsManagement(ToolBase):
                         "control_data": (
                             "dict (partial — PATCH sends the given fields as-is). "
                             "notificationEmails: " + NOTIFICATION_EMAILS_PATCH_NOTE
-                            + " Read accepted PROVIDER filter values with list_filter_values first."
+                            + " Read accepted PROVIDER filter values with list_filter_values first. "
+                            + HISTORY_FIELDS_NOTE
                         ),
                     },
-                    "delete": {"control_id": "str"},
+                    "delete": {
+                        "control_id": "str",
+                        CHANGE_REASON_ARGUMENT: COST_CONTROL_CHANGE_REASON.capability_text(),
+                    },
                 },
                 examples=[
                     "list(page=0, size=20)",
@@ -1537,7 +1836,9 @@ class CostControlsManagement(ToolBase):
                     "create(control_data={'name': 'Monthly Guardrail', 'metricType': 'TOTAL_COST', 'hardLimit': 1000, 'windowType': 'MONTHLY', 'action': 'BLOCK'})",
                     "create(control_data={'name': 'Frontier models cap', 'metricType': 'TOTAL_COST', 'hardLimit': 1000, 'windowType': 'MONTHLY', 'action': 'BLOCK', 'filters': [{'dimension': 'MODEL', 'operator': 'IN', 'values': ['gpt-4', 'claude-sonnet-4-5']}]})",
                     "update(control_id='cc_123', control_data={'hardLimit': 2000})",
+                    "update(control_id='cc_123', control_data={'hardLimit': 2000, 'changeReason': 'Raised for the Q4 launch'})",
                     "delete(control_id='cc_123')",
+                    "delete(control_id='cc_123', change_reason='Replaced by the department budget')",
                 ],
                 limitations=[
                     "Requires valid API authentication",
@@ -1665,6 +1966,53 @@ class CostControlsManagement(ToolBase):
                 ],
             ),
             ToolCapability(
+                name="Change History",
+                description=(
+                    "Read-only view of who changed a budget or alert, when and why. "
+                    + CHANGE_ENTRY_FIELDS_NOTE
+                    + " "
+                    + CHANGE_AUTHOR_NOTE
+                ),
+                parameters={
+                    "list_changes": {
+                        "control_id": "str (required)",
+                        "page": "int (optional, 0-based)",
+                        "size": f"int (optional, 1-{PLATFORM_MAX_PAGE_SIZE}, default 20)",
+                    },
+                    "get_changes_summary": {"control_id": "str (required)"},
+                    "list_control_changes": {
+                        "since": "str (required, ISO-8601 with Z or an offset, inclusive)",
+                        "until": (
+                            "str (required, ISO-8601 with Z or an offset, exclusive, at most "
+                            f"{CONTROL_CHANGES_MAX_WINDOW_DAYS} days after since)"
+                        ),
+                        "subject_type": "str (optional, COST_CONTROL|ALERT|ALL, default ALL)",
+                        "subject_id": "str (optional, one budget or alert id; needs subject_type)",
+                        "change_type": "str (optional, CREATED|EDITED|DELETED|STARTING_STATE, comma-separated)",
+                        "changed_by": "str (optional, a person's email; also matches their API keys)",
+                        "api_key_id": "str (optional, changes made through that API key)",
+                        "page": "int (optional, 0-based)",
+                        "size": f"int (optional, 1-{PLATFORM_MAX_PAGE_SIZE}, default 20)",
+                    },
+                },
+                examples=[
+                    "list_changes(control_id='cc_123')",
+                    "list_changes(control_id='cc_123', page=1, size=50)",
+                    "get_changes_summary(control_id='cc_123')",
+                    "list_control_changes(since='2026-10-01T00:00:00Z', until='2026-11-01T00:00:00Z')",
+                    "list_control_changes(since='2026-10-01T00:00:00Z', until='2026-11-01T00:00:00Z', "
+                    "subject_type='ALERT', changed_by='jane@acme.com')",
+                ],
+                limitations=[
+                    "Every action here is read-only",
+                    "get_changes_summary is unpaged: one object, so page and size are ignored",
+                    CONTROL_CHANGES_WINDOW_NOTE,
+                    LINKED_ALERT_CHANGES_NOTE,
+                    COST_CONTROLS_GATE_NOTE,
+                    CONTROL_CHANGES_EXPORT_NOTE,
+                ],
+            ),
+            ToolCapability(
                 name="Department Scoping",
                 description=(
                     "Scope a guardrail per department: control_data.groupBy='DEPARTMENT' "
@@ -1712,6 +2060,9 @@ class CostControlsManagement(ToolBase):
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
         """Handle cost controls management actions."""
         try:
+            refuse_history_arguments_the_action_ignores(
+                action, arguments, await self._get_supported_actions()
+            )
             if action == "get_tool_metadata":
                 metadata = await self.get_tool_metadata()
                 return [TextContent(type="text", text=json.dumps(metadata.to_dict(), indent=2))]
@@ -1742,6 +2093,11 @@ class CostControlsManagement(ToolBase):
                             "control_data": {"hardLimit": 2000},
                         },
                         "delete": {"action": "delete", "control_id": "cc_123"},
+                        "delete_with_reason": {
+                            "action": "delete",
+                            "control_id": "cc_123",
+                            CHANGE_REASON_ARGUMENT: "Replaced by the department budget",
+                        },
                         "list_enforcement_events": {
                             "action": "list_enforcement_events",
                             "since": "2026-01-01T00:00:00Z",
@@ -1789,6 +2145,23 @@ class CostControlsManagement(ToolBase):
                             "rule_id": "cc_123",
                             "band": "BLOCKED",
                             "sort": "PERCENT",
+                        },
+                        "list_changes": {"action": "list_changes", "control_id": "cc_123"},
+                        "get_changes_summary": {
+                            "action": "get_changes_summary",
+                            "control_id": "cc_123",
+                        },
+                        "list_control_changes": {
+                            "action": "list_control_changes",
+                            "since": "2026-10-01T00:00:00Z",
+                            "until": "2026-11-01T00:00:00Z",
+                        },
+                        "one_persons_alert_changes": {
+                            "action": "list_control_changes",
+                            "since": "2026-10-01T00:00:00Z",
+                            "until": "2026-11-01T00:00:00Z",
+                            "subject_type": "ALERT",
+                            "changed_by": "jane@acme.com",
                         },
                         "create_per_department_guardrail": {
                             "action": "create",
@@ -1863,6 +2236,7 @@ class CostControlsManagement(ToolBase):
                         ENFORCEMENT_SUBREADS_UNPAGED_NOTE,
                         ENFORCEMENT_ROSTER_NOTE,
                     ],
+                    "change_history_notes": list(CHANGE_HISTORY_NOTES),
                     "department_notes": [
                         DEPARTMENT_ID_SOURCE_NOTE,
                         DEPARTMENT_DIMENSION_SCOPE_NOTE,
@@ -1878,7 +2252,7 @@ class CostControlsManagement(ToolBase):
                     return [
                         TextContent(
                             type="text",
-                            text=f"Cost Controls Management Examples:\n{json.dumps({'action': 'get_examples', 'examples': capabilities['examples'], 'filter_notes': capabilities['filter_notes'], 'enforcement_notes': capabilities['enforcement_notes'], 'department_notes': capabilities['department_notes']}, indent=2)}",
+                            text=f"Cost Controls Management Examples:\n{json.dumps({'action': 'get_examples', 'examples': capabilities['examples'], 'filter_notes': capabilities['filter_notes'], 'enforcement_notes': capabilities['enforcement_notes'], 'change_history_notes': capabilities['change_history_notes'], 'department_notes': capabilities['department_notes']}, indent=2)}",
                         )
                     ]
                 return [
@@ -2040,6 +2414,17 @@ class CostControlsManagement(ToolBase):
                         type="text",
                         text=header + "\n\n" + json.dumps(result, indent=2),
                     )
+                ]
+
+            elif action == "list_changes":
+                return [TextContent(type="text", text=await manager.list_changes(arguments))]
+
+            elif action == "get_changes_summary":
+                return [TextContent(type="text", text=await manager.get_changes_summary(arguments))]
+
+            elif action == "list_control_changes":
+                return [
+                    TextContent(type="text", text=await manager.list_control_changes(arguments))
                 ]
 
             elif action == "preview_department_group":

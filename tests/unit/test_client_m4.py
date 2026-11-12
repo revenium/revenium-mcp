@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 
 from src.revenium_mcp_server.client import (
+    AnalyticsHostMisconfiguredError,
     ConnectionPoolConfig,
     DEFAULT_APP_BASE_URL,
     ReveniumAPIError,
@@ -2401,6 +2402,11 @@ class TestGetAppBaseUrl:
         with pytest.raises(ValueError, match="must use HTTPS"):
             self.client._get_app_base_url()
 
+    def test_a_non_https_host_is_its_own_configuration_error(self, monkeypatch):
+        monkeypatch.setenv("REVENIUM_APP_BASE_URL", "http://app.dev.revenium.ai")
+        with pytest.raises(AnalyticsHostMisconfiguredError, match="must use HTTPS"):
+            self.client._get_app_base_url()
+
     def test_derives_dev_analytics_host_from_base_url(self, monkeypatch):
         """A dev platform URL must pair with the dev analytics host — the
         prod default with a dev key 401s on every insights/tool-analytics
@@ -2462,20 +2468,231 @@ class TestAnalyticsHostHint:
 
     REFUSAL = {"code": "UNAUTHORIZED", "message": "Invalid or inactive API key"}
 
-    async def _refusal_message(self, monkeypatch, platform_base_url, status=401):
+    PROBLEM = {
+        "type": "about:blank",
+        "title": "Unauthorized",
+        "detail": "Invalid or inactive API key",
+        "code": "UNAUTHORIZED",
+    }
+
+    async def _refusal(self, monkeypatch, platform_base_url, response):
         monkeypatch.delenv("REVENIUM_APP_BASE_URL", raising=False)
         if platform_base_url is None:
             monkeypatch.delenv("REVENIUM_BASE_URL", raising=False)
         else:
             monkeypatch.setenv("REVENIUM_BASE_URL", platform_base_url)
         client = _client()
-        refusal = _http_response(status, json_body=self.REFUSAL)
-        with patch.object(client.client, "request", new_callable=AsyncMock, return_value=refusal):
+        with patch.object(client.client, "request", new_callable=AsyncMock, return_value=response):
             with pytest.raises(ReveniumAPIError) as exc:
                 await client.get(
                     "/api/v2/analytics/x", base_url=DEFAULT_APP_BASE_URL, use_bearer=True
                 )
-        return exc.value.message
+        return exc.value
+
+    async def _refusal_message(self, monkeypatch, platform_base_url, status=401):
+        refusal = await self._refusal(
+            monkeypatch, platform_base_url, _http_response(status, json_body=self.REFUSAL)
+        )
+        return refusal.message
+
+    UNPAIRED_PLATFORM = "https://api.staging.example.invalid"
+
+    @staticmethod
+    def _problem_response(status, body):
+        return _http_response(
+            status,
+            json_body={**body, "status": status},
+            headers={"Content-Type": "application/problem+json"},
+        )
+
+    def _problem(self, status):
+        return self._problem_response(status, self.PROBLEM)
+
+    def _codeless_problem(self, status):
+        body = {key: value for key, value in self.PROBLEM.items() if key != "code"}
+        return self._problem_response(status, body)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [401, 403, 404])
+    async def test_a_codeless_problem_json_refusal_from_an_unpaired_host_is_marked_and_keeps_the_fix(
+        self, monkeypatch, status
+    ):
+        refusal = await self._refusal(
+            monkeypatch, self.UNPAIRED_PLATFORM, self._codeless_problem(status)
+        )
+        assert refusal.blames_unpaired_analytics_host
+        assert refusal.status_code == status
+        assert UNPAIRED_PLATFORM_HINT in refusal.message
+        assert refusal.message.startswith(f"HTTP {status}: Invalid or inactive API key")
+        assert refusal.response_data["detail"] == "Invalid or inactive API key"
+        assert refusal.platform_message == "Invalid or inactive API key"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "status, code, detail",
+        [
+            (401, "UNAUTHORIZED", "Invalid or inactive API key"),
+            (403, "FORBIDDEN", "The credential may not make this request."),
+            (401, "FORBIDDEN", "The credential may not make this request."),
+            (403, "UNAUTHORIZED", "Invalid or inactive API key"),
+        ],
+    )
+    async def test_a_generic_credential_refusal_from_an_unpaired_host_is_marked_and_keeps_the_fix(
+        self, monkeypatch, status, code, detail
+    ):
+        body = {"type": "about:blank", "title": "Refused", "detail": detail, "code": code}
+        refusal = await self._refusal(
+            monkeypatch, self.UNPAIRED_PLATFORM, self._problem_response(status, body)
+        )
+        assert refusal.blames_unpaired_analytics_host
+        assert not refusal.refuses_permission
+        assert refusal.status_code == status
+        assert UNPAIRED_PLATFORM_HINT in refusal.message
+        assert refusal.message.startswith(f"HTTP {status}: {detail}")
+        assert refusal.platform_message == detail
+        assert refusal.response_data == {**body, "status": status}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "status, code, detail",
+        [
+            (403, "AI_RECOMMENDATIONS_DISABLED", "AI recommendations is disabled."),
+            (403, "TEAM_NOT_IN_MEMBERSHIP", "The requested team is not one this credential can read"),
+            (404, "NOT_FOUND", "Run abc not found"),
+            (404, "UNAUTHORIZED", "Invalid or inactive API key"),
+        ],
+    )
+    async def test_a_problem_naming_its_own_code_from_an_unpaired_host_is_raised_as_the_platform_sent_it(
+        self, monkeypatch, status, code, detail
+    ):
+        body = {"type": "about:blank", "title": "Refused", "detail": detail, "code": code}
+        refusal = await self._refusal(
+            monkeypatch, self.UNPAIRED_PLATFORM, self._problem_response(status, body)
+        )
+        assert refusal.code == code
+        assert not refusal.blames_unpaired_analytics_host
+        assert refusal.status_code == status
+        assert refusal.message == detail
+        assert refusal.platform_message == detail
+        assert refusal.response_data == {**body, "status": status}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("content_type", ["application/json", "application/problem+json"])
+    @pytest.mark.parametrize(
+        "status, code, blames_the_host",
+        [
+            (401, None, True),
+            (403, None, True),
+            (404, None, True),
+            (401, "UNAUTHORIZED", True),
+            (403, "FORBIDDEN", True),
+            (401, "FORBIDDEN", True),
+            (403, "UNAUTHORIZED", True),
+            (403, "AI_RECOMMENDATIONS_DISABLED", False),
+            (404, "NOT_FOUND", False),
+            (404, "UNAUTHORIZED", False),
+        ],
+    )
+    async def test_both_body_formats_follow_one_rule_for_an_unpaired_host(
+        self, monkeypatch, content_type, status, code, blames_the_host
+    ):
+        body = {"message": "Refused", "detail": "Refused"}
+        if code is not None:
+            body["code"] = code
+        response = _http_response(status, json_body=body, headers={"Content-Type": content_type})
+
+        refusal = await self._refusal(monkeypatch, self.UNPAIRED_PLATFORM, response)
+
+        assert refusal.blames_unpaired_analytics_host is blames_the_host
+        assert (UNPAIRED_PLATFORM_HINT in refusal.message) is blames_the_host
+        assert refusal.status_code == status
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("content_type", ["application/json", "application/problem+json"])
+    async def test_a_handler_code_from_an_unpaired_host_survives_in_either_body_format(
+        self, monkeypatch, content_type
+    ):
+        detail = "AI recommendations is disabled."
+        body = {"message": detail, "detail": detail, "code": "AI_RECOMMENDATIONS_DISABLED"}
+        response = _http_response(403, json_body=body, headers={"Content-Type": content_type})
+
+        refusal = await self._refusal(monkeypatch, self.UNPAIRED_PLATFORM, response)
+
+        assert refusal.code != "UNPAIRED_ANALYTICS_HOST"
+        assert not refusal.blames_unpaired_analytics_host
+        assert UNPAIRED_PLATFORM_HINT not in refusal.message
+        body_seen = refusal.response_data.get("error_data", refusal.response_data)
+        assert body_seen["code"] == "AI_RECOMMENDATIONS_DISABLED"
+        assert not refusal.refuses_permission
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("content_type", ["application/json", "application/problem+json"])
+    @pytest.mark.parametrize(
+        "status, code, rejects_the_credential, refuses_permission",
+        [
+            (401, "UNAUTHORIZED", True, False),
+            (403, "FORBIDDEN", False, True),
+            (403, "UNAUTHORIZED", False, False),
+            (403, "AI_RECOMMENDATIONS_DISABLED", False, False),
+            (403, None, False, False),
+        ],
+    )
+    async def test_only_a_401_rejects_the_credential_and_a_403_forbidden_refuses_one_request(
+        self, monkeypatch, content_type, status, code, rejects_the_credential, refuses_permission
+    ):
+        body = {"message": "Refused", "detail": "Refused"}
+        if code is not None:
+            body["code"] = code
+        response = _http_response(status, json_body=body, headers={"Content-Type": content_type})
+
+        refusal = await self._refusal(monkeypatch, DEFAULT_BASE_URL, response)
+
+        assert refusal.rejects_the_credential is rejects_the_credential
+        assert refusal.refuses_permission is refuses_permission
+
+    @pytest.mark.asyncio
+    async def test_a_json_refusal_from_an_unpaired_host_keeps_the_platform_text_apart_from_the_fix(
+        self, monkeypatch
+    ):
+        refusal = await self._refusal(
+            monkeypatch, self.UNPAIRED_PLATFORM, _http_response(401, json_body=self.REFUSAL)
+        )
+        assert refusal.blames_unpaired_analytics_host
+        assert refusal.platform_message == "Invalid or inactive API key"
+
+    @pytest.mark.asyncio
+    async def test_a_plain_text_refusal_from_an_unpaired_host_keeps_the_platform_text_apart_from_the_fix(
+        self, monkeypatch
+    ):
+        refusal = await self._refusal(
+            monkeypatch, self.UNPAIRED_PLATFORM, _http_response(404, text="no such route")
+        )
+        assert refusal.blames_unpaired_analytics_host
+        assert UNPAIRED_PLATFORM_HINT in refusal.message
+        assert refusal.platform_message == "no such route"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [401, 403])
+    async def test_a_problem_json_refusal_from_a_production_platform_keeps_its_own_code(
+        self, monkeypatch, status
+    ):
+        refusal = await self._refusal(monkeypatch, DEFAULT_BASE_URL, self._problem(status))
+        assert not refusal.blames_unpaired_analytics_host
+        assert refusal.code == "UNAUTHORIZED"
+        assert refusal.message == "Invalid or inactive API key"
+        assert refusal.platform_message == "Invalid or inactive API key"
+        assert refusal.response_data["code"] == "UNAUTHORIZED"
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_naming_json_from_an_unpaired_host_is_marked(self, monkeypatch):
+        refusal = await self._refusal(
+            monkeypatch,
+            "https://api.staging.example.invalid",
+            _http_response(401, json_body={"message": "Invalid JSON Web Token"}),
+        )
+        assert refusal.blames_unpaired_analytics_host
+        assert UNPAIRED_PLATFORM_HINT in refusal.message
+        assert "Request Data Refused" not in refusal.message
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -2559,6 +2776,8 @@ class TestAppBaseUrlDriftError:
         message = exc_info.value.message
         assert UNPAIRED_PLATFORM_HINT in message
         assert message.startswith(f"HTTP {status_code}: Invalid or inactive API key")
+        assert exc_info.value.blames_unpaired_analytics_host
+        assert exc_info.value.status_code == status_code
 
     @pytest.mark.asyncio
     async def test_no_enhancement_when_app_base_url_explicitly_set(self, monkeypatch):
@@ -2587,6 +2806,7 @@ class TestAppBaseUrlDriftError:
                         use_bearer=True,
                     )
         assert UNPAIRED_PLATFORM_HINT not in exc_info.value.message
+        assert not exc_info.value.blames_unpaired_analytics_host
 
     @pytest.mark.asyncio
     async def test_no_enhancement_when_use_bearer_false(self, monkeypatch):
@@ -2618,6 +2838,7 @@ class TestAppBaseUrlDriftError:
                         use_bearer=False,
                     )
         assert UNPAIRED_PLATFORM_HINT not in exc_info.value.message
+        assert not exc_info.value.blames_unpaired_analytics_host
 
     @pytest.mark.asyncio
     async def test_no_enhancement_on_500(self, monkeypatch):
@@ -2649,6 +2870,7 @@ class TestAppBaseUrlDriftError:
                         use_bearer=True,
                     )
         assert UNPAIRED_PLATFORM_HINT not in exc_info.value.message
+        assert not exc_info.value.blames_unpaired_analytics_host
 
 class TestRequestSanitizesDictReprLeak:
     """BACK-1313: HTTP error sanitizers strip dict-repr suffix and Error ID
@@ -3152,3 +3374,11 @@ class TestJobTypeEconomicsAppendsAreNotRetried:
 
         assert self.client._request_with_retry.call_count == 3
         self.client._request.assert_not_called()
+
+
+class TestAProblemCodeThatIsNotText:
+    @pytest.mark.parametrize("code", [["UNAUTHORIZED"], {"value": "X"}, 42, True], ids=["list", "object", "number", "bool"])
+    def test_it_names_no_handler_and_does_not_raise(self, code):
+        from src.revenium_mcp_server.client import ReveniumClient
+
+        assert ReveniumClient._names_no_handler_cause(401, code) is True

@@ -17,6 +17,7 @@ from ..common.error_handling import (
     create_structured_missing_parameter_error,
     create_structured_validation_error,
 )
+from ..common.one_line import one_line
 
 LIST_ACTION = "list_cowork_org_links"
 LINK_ACTION = "link_cowork_org"
@@ -112,8 +113,25 @@ def resolve_cowork_team_id(
     )
 
 
+# The platform already holds a Cowork name to 40 code points with no quote,
+# control or format character (CoworkOrgLinkStore); this bound only stops a value
+# that bypassed that rule from flooding the listing.
+_TOOL_NAME_MAX_LENGTH = 100
+
+
 def _non_empty_string(value: Any) -> Optional[str]:
     return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _display_name(value: Any) -> Optional[str]:
+    """A team-set name flattened to one bounded line, or None when nothing readable is left."""
+    if not isinstance(value, str):
+        return None
+    return one_line(value, _TOOL_NAME_MAX_LENGTH) or None
+
+
+def _quoted(text: str) -> str:
+    return '"' + text.replace('"', "'") + '"'
 
 
 def build_link_request(arguments: Dict[str, Any]) -> Dict[str, str]:
@@ -182,7 +200,7 @@ def require_link_id(arguments: Dict[str, Any]) -> str:
 
 
 def normalize_cowork_org_link(entry: Any) -> Optional[Dict[str, Any]]:
-    """Project one upstream link onto its four fields, or None for an unusable entry."""
+    """Project one upstream link onto its five fields, or None for an unusable entry."""
     if not isinstance(entry, dict):
         return None
     claude_org_uuid = _non_empty_string(entry.get("claudeOrgUuid"))
@@ -194,6 +212,7 @@ def normalize_cowork_org_link(entry: Any) -> Optional[Dict[str, Any]]:
         "state": state if isinstance(state, str) else "unknown",
         "linkId": _non_empty_string(entry.get("id")),
         "source": _non_empty_string(entry.get("source")),
+        "toolName": _display_name(entry.get("toolName")),
     }
 
 
@@ -207,6 +226,9 @@ def _format_link_line(link: Dict[str, Any]) -> str:
         details.append(f"link id `{link['linkId']}`")
     if link.get("source"):
         details.append(f"source {link['source']}")
+    tool_name = link.get("toolName")
+    if tool_name:
+        details.append(f"shown in Cowork as {_quoted(tool_name)}")
     return f"- `{link['claudeOrgUuid']}` - " + ", ".join(details)
 
 
@@ -271,15 +293,20 @@ def format_link_result_text(result: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _unlink_target(link: Optional[Dict[str, Any]], link_id: str) -> str:
+    if not link:
+        return f"link id `{link_id}`"
+    target = f"organization `{link['claudeOrgUuid']}` (link id `{link_id}`"
+    if link.get("toolName"):
+        target += f", shown in Cowork as {_quoted(link['toolName'])}"
+    return target + ")"
+
+
 def format_unlink_result_text(result: Dict[str, Any]) -> str:
     team_id = result["team_id"]
     link_id = result["link_id"]
     link = result.get("link")
-    target = (
-        f"organization `{link['claudeOrgUuid']}` (link id `{link_id}`)"
-        if link
-        else f"link id `{link_id}`"
-    )
+    target = _unlink_target(link, link_id)
     if result.get("dry_run"):
         lines = [f"## Dry run - unlink {target} from team {team_id}", ""]
         if result.get("warning"):

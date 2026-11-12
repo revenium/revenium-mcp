@@ -35,6 +35,7 @@ from .savings_findings import (
     SAVINGS_LEVELS,
     SavingsFindingsQuery,
 )
+from .tool_cost_and_calls import TOOL_COST_AND_CALLS_DEFAULT_PAGE_SIZE, TOOL_COST_AND_CALL_VOLUME_ACTION
 
 logger = logging.getLogger(__name__)
 
@@ -346,6 +347,13 @@ def tool_costs_report(action: str) -> FilterlessReport:
     return FilterlessReport(
         action, "it lists every row the report has" + _PAGE_CAP, _TOOL_REPORT_FILTERS
     )
+
+
+TOOL_COST_AND_CALL_VOLUME_REPORT = FilterlessReport(
+    TOOL_COST_AND_CALL_VOLUME_ACTION,
+    "it lists every tool, a page at a time, and names the page to read next",
+    _TOOL_REPORT_FILTERS,
+)
 
 
 def top_level_narrowing(params: Dict[str, Any]) -> Optional[str]:
@@ -880,6 +888,30 @@ class AnalyticsValidator:
 
         logger.info(f"Validated tool costs params: {validated}")
         return validated
+
+    def validate_tool_cost_and_call_volume_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate parameters for get_tool_cost_and_call_volume: the window, then one page of tools.
+
+        Raises:
+            ValidationError: If parameters are invalid, or ask for a roll-up
+                other than TOTAL, which the report does not have
+        """
+        analytics_params = self.validate_analytics_params(params, TOOL_COST_AND_CALL_VOLUME_REPORT)
+        if analytics_params.aggregation != SupportedAggregation.TOTAL.value:
+            raise ValidationError(
+                f"{TOOL_COST_AND_CALL_VOLUME_ACTION} reports each tool's total cost and call "
+                f"count only, not {analytics_params.aggregation}. Nothing was read.",
+                field="aggregation",
+                suggestions=["Drop group/aggregation, or pass TOTAL"],
+            )
+        return {
+            "period": analytics_params.period,
+            "aggregation": analytics_params.aggregation,
+            "page": self._validate_whole_number(params.get("page"), "page", 0, None, 0),
+            "size": self._validate_whole_number(
+                params.get("size"), "size", 1, ANALYTICS_MAX_PAGE_SIZE, TOOL_COST_AND_CALLS_DEFAULT_PAGE_SIZE
+            ),
+        }
 
     def validate_period(self, period: Optional[str]) -> str:
         """Validate time period parameter.

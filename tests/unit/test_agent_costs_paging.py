@@ -12,7 +12,7 @@ import pytest
 
 from src.revenium_mcp_server.analytics.paging import page_of_rows
 from src.revenium_mcp_server.analytics.validation import AnalyticsValidator, ValidationError
-from src.revenium_mcp_server.tool_configuration.schema_slimming import apply_thin_tool_defaults
+from src.revenium_mcp_server.common.thin_tool_defaults import apply_thin_tool_defaults
 from src.revenium_mcp_server.tools_decomposed.business_analytics_management import (
     BusinessAnalyticsManagement,
 )

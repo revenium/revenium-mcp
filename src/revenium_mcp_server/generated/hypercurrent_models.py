@@ -303,6 +303,18 @@ class Provider(StrEnum):
     CUSTOM = 'CUSTOM'
 
 
+class AddDepartmentAdminRequestRead(BaseModel):
+    """
+    Request to name a person in your directory as an admin of a department
+    """
+
+    email: constr(min_length=1) = Field(
+        ...,
+        description='Email of a person in your directory',
+        examples=['ash@weyland-yutani.io'],
+    )
+
+
 class Source(Enum):
     """
     How the agent record was created
@@ -429,11 +441,9 @@ class AssignPrimaryByEmailRequestRead(BaseModel):
     Request to assign the person with this subscriber email to a department as a manual assignment. If no person exists for the email, one is created.
     """
 
-    departmentId: Optional[int] = Field(
-        None, description='Target department id', examples=[173]
-    )
-    email: Optional[str] = Field(
-        None, description='Subscriber email address', examples=['ash@weyland-yutani.io']
+    departmentId: int = Field(..., description='Target department id', examples=[173])
+    email: constr(min_length=1) = Field(
+        ..., description='Subscriber email address', examples=['ash@weyland-yutani.io']
     )
 
 
@@ -459,6 +469,26 @@ class Provenance(Enum):
     SIGNED_OFF = 'SIGNED_OFF'
 
 
+class ThroughputPeriod(Enum):
+    """
+    Optional. The time window throughputValue is counted over: HOUR, DAY, WEEK or MONTH. Required when throughputValue is set, and rejected without it.
+    """
+
+    HOUR = 'HOUR'
+    DAY = 'DAY'
+    WEEK = 'WEEK'
+    MONTH = 'MONTH'
+
+
+class ThroughputScope(Enum):
+    """
+    Optional. Whether throughputValue is the whole team's output (TEAM) or one person's (PER_PERSON). Defaults to TEAM when throughputValue is set, and rejected without it.
+    """
+
+    TEAM = 'TEAM'
+    PER_PERSON = 'PER_PERSON'
+
+
 class BaselineRequest(BaseModel):
     """
     A new version of the pre-AI baseline for a job type
@@ -469,25 +499,30 @@ class BaselineRequest(BaseModel):
         description='Optional. Cost of one unit of work before AI, in USD. Zero or more, at most 1,000,000,000.',
         examples=[6.0],
     )
-    currency: Optional[str] = Field(
+    currency: Optional[constr(min_length=0, max_length=3)] = Field(
         None,
         description='Optional. Currency of the amounts in this baseline. Must be USD today.',
         examples=['USD'],
     )
-    declaredBy: Optional[str] = Field(
+    declaredBy: Optional[constr(min_length=0, max_length=256)] = Field(
         None,
         description='Optional. Who declared the baseline, at most 256 characters. Defaults to the name of the API key or user making the call when omitted.',
         examples=['jane@example.com'],
     )
-    effectiveFrom: Optional[AwareDatetime] = Field(
-        None,
+    effectiveFrom: AwareDatetime = Field(
+        ...,
         description='When the baseline starts to apply (ISO 8601, UTC). The baseline in effect is the latest one whose effectiveFrom is not in the future.',
         examples=['2026-01-01T00:00:00Z'],
     )
-    evidenceUrl: Optional[str] = Field(
+    evidenceUrl: Optional[constr(min_length=0, max_length=2048)] = Field(
         None,
         description='Optional. Link to the evidence behind the baseline, at most 2048 characters.',
         examples=['https://example.com/baseline-study'],
+    )
+    headcount: Optional[int] = Field(
+        None,
+        description='Optional. Number of people who did the work before AI. From 1 to 100,000. Accepted with or without a throughput.',
+        examples=[12],
     )
     hourlyRate: Optional[float] = Field(
         None,
@@ -509,6 +544,21 @@ class BaselineRequest(BaseModel):
         description='Optional. Share of units done correctly before AI, from 0 to 1.',
         examples=[0.92],
     )
+    throughputPeriod: Optional[ThroughputPeriod] = Field(
+        None,
+        description='Optional. The time window throughputValue is counted over: HOUR, DAY, WEEK or MONTH. Required when throughputValue is set, and rejected without it.',
+        examples=['WEEK'],
+    )
+    throughputScope: Optional[ThroughputScope] = Field(
+        None,
+        description="Optional. Whether throughputValue is the whole team's output (TEAM) or one person's (PER_PERSON). Defaults to TEAM when throughputValue is set, and rejected without it.",
+        examples=['TEAM'],
+    )
+    throughputValue: Optional[float] = Field(
+        None,
+        description='Optional. Units of work the process produced in each throughputPeriod before AI, as you count it, such as 3000 tickets a week. More than zero, at most 1,000,000,000,000. At most 4 decimal places, stored as sent. Send it together with throughputPeriod. Never worked out from minutesPerUnit.',
+        examples=[3000],
+    )
 
 
 class Provenance1(StrEnum):
@@ -519,6 +569,26 @@ class Provenance1(StrEnum):
     CUSTOMER_DECLARED = 'CUSTOMER_DECLARED'
     MEASURED = 'MEASURED'
     SIGNED_OFF = 'SIGNED_OFF'
+
+
+class ThroughputPeriod1(Enum):
+    """
+    The time window throughputValue is counted over: HOUR, DAY, WEEK or MONTH. Set whenever throughputValue is set.
+    """
+
+    HOUR = 'HOUR'
+    DAY = 'DAY'
+    WEEK = 'WEEK'
+    MONTH = 'MONTH'
+
+
+class ThroughputScope1(Enum):
+    """
+    Whether throughputValue is the whole team's output (TEAM) or one person's (PER_PERSON). Set whenever throughputValue is set, TEAM by default.
+    """
+
+    TEAM = 'TEAM'
+    PER_PERSON = 'PER_PERSON'
 
 
 class BaselineResource(BaseModel):
@@ -554,6 +624,11 @@ class BaselineResource(BaseModel):
         description='Link to the evidence behind the baseline. Null when none was given.',
         examples=['https://example.com/baseline-study'],
     )
+    headcount: Optional[int] = Field(
+        None,
+        description='Number of people who did the work before AI, when declared.',
+        examples=[12],
+    )
     hourlyRate: Optional[float] = Field(
         None,
         description='Cost of one hour of the people doing the work before AI, in the baseline currency (USD).',
@@ -573,6 +648,21 @@ class BaselineResource(BaseModel):
         None,
         description='Share of units done correctly before AI, from 0 to 1.',
         examples=[0.92],
+    )
+    throughputPeriod: Optional[ThroughputPeriod1] = Field(
+        None,
+        description='The time window throughputValue is counted over: HOUR, DAY, WEEK or MONTH. Set whenever throughputValue is set.',
+        examples=['WEEK'],
+    )
+    throughputScope: Optional[ThroughputScope1] = Field(
+        None,
+        description="Whether throughputValue is the whole team's output (TEAM) or one person's (PER_PERSON). Set whenever throughputValue is set, TEAM by default.",
+        examples=['TEAM'],
+    )
+    throughputValue: Optional[float] = Field(
+        None,
+        description='Units of work the process produced in each throughputPeriod before AI, as you declared it. Null when no throughput was declared. Never worked out from minutesPerUnit.',
+        examples=[3000],
     )
     version: Optional[int] = Field(
         None, description='1-based position in declaration order; derived, not stored.'
@@ -659,18 +749,6 @@ class BudgetGroupResult(BaseModel):
         None,
         description='Remaining budget for this group, null if threshold is zero',
         examples=[549.75],
-    )
-
-
-class BudgetPortfolioSpendRequest(BaseModel):
-    """
-    Spend already read for some budgets, keyed by budget (alert) ID
-    """
-
-    spend: Optional[dict[str, float]] = Field(
-        None,
-        description="Spend per budget over the window returned by spend-windows for the same 'now'. A budget missing here, or one that does not accept supplied spend, is computed by the server as usual.",
-        examples=[{'jR2kmLs': 340131.8}],
     )
 
 
@@ -904,6 +982,90 @@ class PeriodType(StrEnum):
     QUARTERLY = 'QUARTERLY'
 
 
+class ContextPriceBandResource(BaseModel):
+    """
+    The prices for prompts whose size falls inside this band
+    """
+
+    abovePromptTokens: Optional[int] = Field(
+        ...,
+        description="The band applies to a prompt larger than this many tokens. Must be 0 or more: a prompt below the first band is billed at the model's own prices.",
+        examples=[272000],
+    )
+    cacheCreation1hrCostPerInputToken: Optional[float] = Field(
+        None,
+        description="Cost per input token for 1-hour-TTL cache creation in USD for a prompt in this band. Omit it to use the model's ordinary 1-hour cache-creation price.",
+        examples=[1e-05],
+    )
+    cacheCreationCostPerInputToken: Optional[float] = Field(
+        None,
+        description="Cost per input token for cache creation in USD for a prompt in this band. Omit it to use the model's ordinary cache-creation price.",
+        examples=[6.25e-06],
+    )
+    cacheReadCostPerInputToken: Optional[float] = Field(
+        None,
+        description="Cost per input token for cache reads in USD for a prompt in this band. Omit it to use the model's ordinary cache-read price.",
+        examples=[5e-07],
+    )
+    inputCostPerToken: Optional[float] = Field(
+        ...,
+        description='Cost per input token in USD for a prompt in this band. Must be non-negative with at most 10 decimal places.',
+        examples=[5e-06],
+    )
+    outputCostPerToken: Optional[float] = Field(
+        ...,
+        description='Cost per output token in USD for a prompt in this band. Must be non-negative with at most 10 decimal places.',
+        examples=[2.25e-05],
+    )
+    throughPromptTokens: Optional[int] = Field(
+        None,
+        description='The band applies to a prompt of at most this many tokens. Omit it for no upper limit.',
+        examples=[1000000],
+    )
+
+
+class ContextPriceBandResourceRead(BaseModel):
+    """
+    The prices for prompts whose size falls inside this band
+    """
+
+    abovePromptTokens: Optional[int] = Field(
+        ...,
+        description="The band applies to a prompt larger than this many tokens. Must be 0 or more: a prompt below the first band is billed at the model's own prices.",
+        examples=[272000],
+    )
+    cacheCreation1hrCostPerInputToken: Optional[float] = Field(
+        None,
+        description="Cost per input token for 1-hour-TTL cache creation in USD for a prompt in this band. Omit it to use the model's ordinary 1-hour cache-creation price.",
+        examples=[1e-05],
+    )
+    cacheCreationCostPerInputToken: Optional[float] = Field(
+        None,
+        description="Cost per input token for cache creation in USD for a prompt in this band. Omit it to use the model's ordinary cache-creation price.",
+        examples=[6.25e-06],
+    )
+    cacheReadCostPerInputToken: Optional[float] = Field(
+        None,
+        description="Cost per input token for cache reads in USD for a prompt in this band. Omit it to use the model's ordinary cache-read price.",
+        examples=[5e-07],
+    )
+    inputCostPerToken: Optional[float] = Field(
+        ...,
+        description='Cost per input token in USD for a prompt in this band. Must be non-negative with at most 10 decimal places.',
+        examples=[5e-06],
+    )
+    outputCostPerToken: Optional[float] = Field(
+        ...,
+        description='Cost per output token in USD for a prompt in this band. Must be non-negative with at most 10 decimal places.',
+        examples=[2.25e-05],
+    )
+    throughPromptTokens: Optional[int] = Field(
+        None,
+        description='The band applies to a prompt of at most this many tokens. Omit it for no upper limit.',
+        examples=[1000000],
+    )
+
+
 class ConversionFunnelResourceRead(BaseModel):
     """
     Conversion funnel data for the ROI Dashboard Overview tab
@@ -1119,7 +1281,9 @@ class CoverageMeteredDaysRead(BaseModel):
         description='First UTC day the rows cover. Must be on or before the first day of the prior comparison period.',
         examples=['2026-08-07'],
     )
-    rows: Optional[list[CoverageMeteredDayRowRead]] = Field(None, max_length=100000)
+    rows: Optional[list[CoverageMeteredDayRowRead]] = Field(
+        None, max_length=100000, min_length=0
+    )
     toDay: Optional[date_aliased] = Field(
         None,
         description='Last UTC day the rows cover. Must be on or after the last day of the requested period.',
@@ -1168,17 +1332,45 @@ class State(StrEnum):
     DATA_UNAVAILABLE = 'DATA_UNAVAILABLE'
 
 
+class CoworkOrgLinkRequestRead(BaseModel):
+    claudeOrgUuid: Optional[str] = Field(
+        None,
+        description='A Claude organization uuid in 8-4-4-4-12 form, for an organization with no connected key.',
+    )
+    credentialId: Optional[str] = Field(
+        None,
+        description="Id of one of this team's Claude Enterprise credentials; its own key is asked for the organization uuid.",
+    )
+
+
+class State1(StrEnum):
+    LINKED = 'LINKED'
+    LINKED_BY_ANOTHER_ACCOUNT = 'LINKED_BY_ANOTHER_ACCOUNT'
+    NOT_LINKED = 'NOT_LINKED'
+
+
+class CoworkOrgLinkResponseRead(BaseModel):
+    claudeOrgUuid: Optional[str] = None
+    id: Optional[str] = None
+    source: Optional[str] = None
+    state: Optional[State1] = None
+    toolName: Optional[str] = Field(
+        None,
+        description='The name shown in Cowork in place of Revenium, or null when none is set.',
+    )
+
+
 class CreateDepartmentRequestRead(BaseModel):
     """
     Request to create a department. Departments created here are marked as manually created; CSV import and directory sync add departments through other paths.
     """
 
-    externalRef: Optional[str] = Field(
+    externalRef: Optional[constr(min_length=0, max_length=512)] = Field(
         None,
         description='Optional external reference id for cross-referencing with a synced source',
     )
-    name: Optional[str] = Field(
-        None,
+    name: constr(pattern=r'.*\S.*', min_length=0, max_length=256) = Field(
+        ...,
         description='Department name, unique among siblings under the same parent',
         examples=['Payments'],
     )
@@ -1333,6 +1525,71 @@ class EnforcementEventHistoryResourceRead(BaseModel):
     )
 
 
+class Action3(Enum):
+    """
+    The enforcement action declared by the rule at the time of evaluation. An older rule can report an action that is no longer accepted on create or update; it has no effect.
+    """
+
+    BLOCK = 'BLOCK'
+    WARN_ONLY = 'WARN_ONLY'
+
+
+class GroupBy7(Enum):
+    """
+    Which dimension `groupValue` names. Null for a pooled rule, and for events written before this field existed.
+    """
+
+    SUBSCRIBER = 'SUBSCRIBER'
+    DEPARTMENT = 'DEPARTMENT'
+
+
+class Level(Enum):
+    """
+    Which tier of the rule this event records. `HARD` when it records a cap breach, or a would-be breach in shadow mode. `WARN` when it records a warning-line crossing, where nothing was blocked. Warn events are excluded from the endpoint's default listing.
+    """
+
+    HARD = 'HARD'
+    WARN = 'WARN'
+
+
+class MetricType9(Enum):
+    """
+    The metric the rule was evaluating
+    """
+
+    TOTAL_COST = 'TOTAL_COST'
+    TOKEN_COUNT = 'TOKEN_COUNT'
+    INPUT_TOKEN_COUNT = 'INPUT_TOKEN_COUNT'
+    OUTPUT_TOKEN_COUNT = 'OUTPUT_TOKEN_COUNT'
+    CACHED_TOKEN_COUNT = 'CACHED_TOKEN_COUNT'
+    ERROR_COUNT = 'ERROR_COUNT'
+    IMAGE_COUNT = 'IMAGE_COUNT'
+    VIDEO_COUNT = 'VIDEO_COUNT'
+    AUDIO_COUNT = 'AUDIO_COUNT'
+    CHARACTER_COUNT = 'CHARACTER_COUNT'
+    CREDITS_CONSUMED = 'CREDITS_CONSUMED'
+
+
+class Outcome(Enum):
+    """
+    What this event records having happened, as opposed to `action`, which is the action the rule was configured with. `BLOCKED` when the request was refused, `WARNED` when a warning line was crossed and nothing was refused, and `WOULD_BLOCK` or `WOULD_WARN` when a shadow-mode rule did neither. Null on older events. Use `operation` for those.
+    """
+
+    BLOCKED = 'BLOCKED'
+    WARNED = 'WARNED'
+    WOULD_BLOCK = 'WOULD_BLOCK'
+    WOULD_WARN = 'WOULD_WARN'
+
+
+class Tier(Enum):
+    """
+    Which line this event crossed: `HARD` for the cap, `WARN` for the warning line. Differs from `level` only when a non-blocking rule crosses its cap: nothing was blocked, so `level` is `WARN`.
+    """
+
+    HARD = 'HARD'
+    WARN = 'WARN'
+
+
 class EnforcementEventSummaryResourceRead(BaseModel):
     """
     Counts for the enforcement events matching the current filter. `level` and `mode` are ignored here: the four per-outcome counts always cover every tier and every mode. Every other filter on the list is applied over the same window. This object is returned on its own and never inside the paged envelope the enforcement events list returns, so a client reads these fields directly rather than unwrapping an `_embedded` collection.
@@ -1373,6 +1630,18 @@ class EnforcementEventSummaryResourceRead(BaseModel):
         description='Warning lines a cost control evaluating in shadow mode would have crossed, over the window (`ENFORCEMENT_SHADOW_WARN`). On a rule running in shadow mode this is the only warn count that can be non zero, because such a rule never writes a real warning.',
         examples=[3],
     )
+
+
+class EnforcementEventUncountedPageRead(BaseModel):
+    hasNext: Optional[bool] = Field(
+        None,
+        description='True when at least one more event matches after this page.',
+        examples=[True],
+    )
+    number: Optional[int] = Field(
+        None, description='Zero-based page number.', examples=[0]
+    )
+    size: Optional[int] = Field(None, description='Requested page size.', examples=[20])
 
 
 class EnforcementFilterEntry(BaseModel):
@@ -1450,7 +1719,7 @@ class EnforcementRuleRosterRowResource(BaseModel):
     )
 
 
-class GroupBy7(Enum):
+class GroupBy8(Enum):
     """
     The dimension by which to group monitoring. When specified, the alert rule is evaluated separately for each unique value of this dimension (e.g., per ORGANIZATION, per MODEL, per PRODUCT)
     """
@@ -1468,7 +1737,7 @@ class GroupBy7(Enum):
     DEPARTMENT = 'DEPARTMENT'
 
 
-class MetricType9(StrEnum):
+class MetricType10(StrEnum):
     """
     The AI metric to monitor. Cost metrics track spending, token metrics track usage, performance metrics track latency and duration, error metrics track failures
     """
@@ -1598,7 +1867,7 @@ class CumulativePeriod1(StrEnum):
     QUARTERLY = 'QUARTERLY'
 
 
-class MetricType10(StrEnum):
+class MetricType11(StrEnum):
     """
     Metric type being tracked
     """
@@ -1639,7 +1908,16 @@ class Risk(StrEnum):
     CRITICAL = 'CRITICAL'
 
 
-class GroupBy8(Enum):
+class Action4(Enum):
+    """
+    Enforcement action taken when `hardLimit` is crossed (and rule is not in shadow mode). Only `BLOCK` and `WARN_ONLY` are accepted on create and update.
+    """
+
+    BLOCK = 'BLOCK'
+    WARN_ONLY = 'WARN_ONLY'
+
+
+class GroupBy9(Enum):
     """
     Optional dimension to partition the rule evaluation (per-model, per-provider, etc.). Omit a field to keep its current value. Send null to clear it.
     """
@@ -1658,7 +1936,7 @@ class GroupBy8(Enum):
     NoneType_None = None
 
 
-class MetricType11(Enum):
+class MetricType12(Enum):
     """
     The AI metric the rule evaluates against
     """
@@ -1686,7 +1964,7 @@ class Source6(Enum):
     API = 'API'
 
 
-class Action4(Enum):
+class Action5(Enum):
     """
     The enforcement action declared by the rule at the time of evaluation. An older rule can report an action that is no longer accepted on create or update; it has no effect.
     """
@@ -1695,7 +1973,7 @@ class Action4(Enum):
     WARN_ONLY = 'WARN_ONLY'
 
 
-class GroupBy9(Enum):
+class GroupBy10(Enum):
     """
     Which dimension `groupValue` names. Null for a pooled rule, and for events written before this field existed.
     """
@@ -1704,16 +1982,7 @@ class GroupBy9(Enum):
     DEPARTMENT = 'DEPARTMENT'
 
 
-class Level(Enum):
-    """
-    Which tier of the rule this event records. `HARD` when it records a cap breach, or a would-be breach in shadow mode. `WARN` when it records a warning-line crossing, where nothing was blocked. Warn events are excluded from the endpoint's default listing.
-    """
-
-    HARD = 'HARD'
-    WARN = 'WARN'
-
-
-class MetricType12(Enum):
+class MetricType13(Enum):
     """
     The metric the rule was evaluating
     """
@@ -1729,26 +1998,6 @@ class MetricType12(Enum):
     AUDIO_COUNT = 'AUDIO_COUNT'
     CHARACTER_COUNT = 'CHARACTER_COUNT'
     CREDITS_CONSUMED = 'CREDITS_CONSUMED'
-
-
-class Outcome(Enum):
-    """
-    What this event records having happened, as opposed to `action`, which is the action the rule was configured with. `BLOCKED` when the request was refused, `WARNED` when a warning line was crossed and nothing was refused, and `WOULD_BLOCK` or `WOULD_WARN` when a shadow-mode rule did neither. Null on older events. Use `operation` for those.
-    """
-
-    BLOCKED = 'BLOCKED'
-    WARNED = 'WARNED'
-    WOULD_BLOCK = 'WOULD_BLOCK'
-    WOULD_WARN = 'WOULD_WARN'
-
-
-class Tier(Enum):
-    """
-    Which line this event crossed: `HARD` for the cap, `WARN` for the warning line. Differs from `level` only when a non-blocking rule crosses its cap: nothing was blocked, so `level` is `WARN`.
-    """
-
-    HARD = 'HARD'
-    WARN = 'WARN'
 
 
 class AccountState(Enum):
@@ -1811,7 +2060,7 @@ class PaymentSource(StrEnum):
     INVOICE_ONLY_NO_PAYMENT = 'INVOICE_ONLY_NO_PAYMENT'
 
 
-class State1(Enum):
+class State2(Enum):
     """
     The current state of the invoice in its lifecycle
     """
@@ -2207,7 +2456,7 @@ class FilterValuesResponse(BaseModel):
     )
 
 
-class MetricType13(StrEnum):
+class MetricType14(StrEnum):
     """
     Metric type being tracked
     """
@@ -2250,7 +2499,7 @@ class GroupedBudgetProgressResource(BaseModel):
     groups: Optional[list[BudgetGroupResult]] = Field(
         None, description='Per-group budget progress results'
     )
-    metricType: Optional[MetricType13] = Field(
+    metricType: Optional[MetricType14] = Field(
         None, description='Metric type being tracked', examples=['TOTAL_COST']
     )
     threshold: Optional[float] = Field(
@@ -2696,6 +2945,219 @@ class Link(BaseModel):
     type: Optional[str] = None
 
 
+class LinkedAlertResource(BaseModel):
+    """
+    The alert linked to a budget
+    """
+
+    deleted: Optional[bool] = Field(
+        None,
+        description='True when the alert has been deleted; the link is kept',
+        examples=[False],
+    )
+    id: Optional[str] = Field(None, description="The alert's id", examples=['xK9mPq2'])
+    name: Optional[str] = Field(
+        None, description="The alert's name", examples=['Daily spend spike']
+    )
+
+
+class LinkedAlertResourceRead(BaseModel):
+    """
+    The alert linked to a budget
+    """
+
+    deleted: Optional[bool] = Field(
+        None,
+        description='True when the alert has been deleted; the link is kept',
+        examples=[False],
+    )
+    id: Optional[str] = Field(None, description="The alert's id", examples=['xK9mPq2'])
+    name: Optional[str] = Field(
+        None, description="The alert's name", examples=['Daily spend spike']
+    )
+
+
+class LinkedAlertResourceWrite(BaseModel):
+    """
+    The alert linked to a budget
+    """
+
+    deleted: Optional[bool] = Field(
+        None,
+        description='True when the alert has been deleted; the link is kept',
+        examples=[False],
+    )
+    id: Optional[str] = Field(None, description="The alert's id", examples=['xK9mPq2'])
+    name: Optional[str] = Field(
+        None, description="The alert's name", examples=['Daily spend spike']
+    )
+
+
+class Action6(StrEnum):
+    """
+    What the rule does once crossed: BLOCK refuses calls, WARN_ONLY warns.
+    """
+
+    BLOCK = 'BLOCK'
+    WARN_ONLY = 'WARN_ONLY'
+
+
+class GroupBy11(Enum):
+    """
+    The dimension the rule splits its limit by, such as SUBSCRIBER, DEPARTMENT or MODEL. Null for one shared limit.
+    """
+
+    ORGANIZATION = 'ORGANIZATION'
+    CREDENTIAL = 'CREDENTIAL'
+    PRODUCT = 'PRODUCT'
+    MODEL = 'MODEL'
+    PROVIDER = 'PROVIDER'
+    AGENT = 'AGENT'
+    SUBSCRIBER = 'SUBSCRIBER'
+    TASK_TYPE = 'TASK_TYPE'
+    WORKSPACE = 'WORKSPACE'
+    API_KEY = 'API_KEY'
+    DEPARTMENT = 'DEPARTMENT'
+
+
+class MetricType15(StrEnum):
+    """
+    What the rule measures.
+    """
+
+    TOTAL_COST = 'TOTAL_COST'
+    COST_PER_TRANSACTION = 'COST_PER_TRANSACTION'
+    TOKENS_PER_MINUTE = 'TOKENS_PER_MINUTE'
+    TOKEN_COUNT = 'TOKEN_COUNT'
+    INPUT_TOKEN_COUNT = 'INPUT_TOKEN_COUNT'
+    OUTPUT_TOKEN_COUNT = 'OUTPUT_TOKEN_COUNT'
+    CACHED_TOKEN_COUNT = 'CACHED_TOKEN_COUNT'
+    TOKENS_PER_REQUEST = 'TOKENS_PER_REQUEST'
+    TIME_TO_FIRST_TOKEN = 'TIME_TO_FIRST_TOKEN'
+    DURATION = 'DURATION'
+    ERROR_COUNT = 'ERROR_COUNT'
+    ERROR_RATE = 'ERROR_RATE'
+    QUALITY_RATE = 'QUALITY_RATE'
+    REQUESTS_PER_MINUTE = 'REQUESTS_PER_MINUTE'
+    REQUEST_COUNT = 'REQUEST_COUNT'
+    IMAGE_COUNT = 'IMAGE_COUNT'
+    DURATION_SECONDS = 'DURATION_SECONDS'
+    CHARACTER_COUNT = 'CHARACTER_COUNT'
+    CREDITS_CONSUMED = 'CREDITS_CONSUMED'
+    COST_PER_IMAGE = 'COST_PER_IMAGE'
+    COST_PER_SECOND = 'COST_PER_SECOND'
+    VIDEO_COUNT = 'VIDEO_COUNT'
+    AUDIO_COUNT = 'AUDIO_COUNT'
+
+
+class PeriodType1(StrEnum):
+    """
+    The length of the rule's window.
+    """
+
+    ONE_MINUTE = 'ONE_MINUTE'
+    FIVE_MINUTES = 'FIVE_MINUTES'
+    FIFTEEN_MINUTES = 'FIFTEEN_MINUTES'
+    THIRTY_MINUTES = 'THIRTY_MINUTES'
+    ONE_HOUR = 'ONE_HOUR'
+    TWELVE_HOURS = 'TWELVE_HOURS'
+    TWENTY_FOUR_HOURS = 'TWENTY_FOUR_HOURS'
+    SEVEN_DAYS = 'SEVEN_DAYS'
+    THIRTY_DAYS = 'THIRTY_DAYS'
+    DAILY = 'DAILY'
+    WEEKLY = 'WEEKLY'
+    MONTHLY = 'MONTHLY'
+    QUARTERLY = 'QUARTERLY'
+
+
+class LockedEnforcementRule(BaseModel):
+    """
+    A rule that binds a Member or Department Admin whose figure is not theirs to see, with its limit and standing and no spend.
+    """
+
+    action: Optional[Action6] = Field(
+        None,
+        description='What the rule does once crossed: BLOCK refuses calls, WARN_ONLY warns.',
+        examples=['BLOCK'],
+    )
+    breached: Optional[bool] = Field(
+        None,
+        description='True when the rule is over its limit, for everyone it covers or for the caller.',
+    )
+    compiledAt: Optional[AwareDatetime] = Field(
+        None,
+        description="When Revenium last computed the rule's standing.",
+        examples=['2026-11-03T21:14:30Z'],
+    )
+    departmentId: Optional[int] = Field(
+        None,
+        description='The department this rule is scoped to, as a numeric ID. Null for a rule that covers the whole team.',
+    )
+    filters: Optional[list[EnforcementFilterEntry]] = Field(
+        None,
+        description="The rule's filters, naming nobody outside what the caller may see.",
+    )
+    groupBy: Optional[GroupBy11] = Field(
+        None,
+        description='The dimension the rule splits its limit by, such as SUBSCRIBER, DEPARTMENT or MODEL. Null for one shared limit.',
+        examples=['SUBSCRIBER'],
+    )
+    metricType: Optional[MetricType15] = Field(
+        None, description='What the rule measures.', examples=['TOTAL_COST']
+    )
+    name: Optional[str] = Field(
+        None,
+        description="The cost control's name.",
+        examples=['Company-wide daily limit'],
+    )
+    periodType: Optional[PeriodType1] = Field(
+        None, description="The length of the rule's window.", examples=['DAILY']
+    )
+    ruleId: Optional[int] = Field(
+        None,
+        description='The cost control this rule was compiled from, as a numeric ID.',
+        examples=[4211],
+    )
+    shadowMode: Optional[bool] = Field(
+        None,
+        description='True when the rule only records what it would do and blocks nothing.',
+        examples=[False],
+    )
+    teamId: Optional[int] = Field(
+        None,
+        description='The team this rule belongs to, as a numeric ID.',
+        examples=[1052],
+    )
+    threshold: Optional[float] = Field(
+        None,
+        description='The line the rule is measured against: its hard limit, or its warning threshold when it has no hard limit.',
+        examples=[750.0],
+    )
+    warnBreached: Optional[bool] = Field(
+        None,
+        description='True when the rule is over its warning threshold and not over its limit.',
+    )
+    warnThreshold: Optional[float] = Field(
+        None,
+        description="The rule's warning threshold, when it has both a warning threshold and a hard limit.",
+    )
+    windowEnd: Optional[AwareDatetime] = Field(
+        None,
+        description="End of the rule's current window.",
+        examples=['2026-11-04T00:00:00Z'],
+    )
+    windowKey: Optional[str] = Field(
+        None,
+        description="Identifier of the rule's current window.",
+        examples=['DAILY:2026-11-03'],
+    )
+    windowStart: Optional[AwareDatetime] = Field(
+        None,
+        description="Start of the rule's current window.",
+        examples=['2026-11-03T00:00:00Z'],
+    )
+
+
 class MarketplaceSettingsResourceRead(BaseModel):
     """
     Team internal (company-owned) Claude Code plugin marketplace settings
@@ -2738,8 +3200,10 @@ class NavCustomization(BaseModel):
         None,
         description='Sidebar section labels the user chose to hide',
         examples=[['Billing']],
+        max_length=100,
+        min_length=0,
     )
-    homepage: Optional[str] = Field(
+    homepage: Optional[constr(min_length=0, max_length=2048)] = Field(
         None,
         description='The app path the user lands on after signing in',
         examples=['/analytics/spend'],
@@ -2753,6 +3217,8 @@ class NavCustomization(BaseModel):
         None,
         description='Sidebar section labels in the order the user arranged them',
         examples=[['Analytics', 'Cost Controls']],
+        max_length=100,
+        min_length=0,
     )
 
 
@@ -2765,8 +3231,10 @@ class NavCustomizationRead(BaseModel):
         None,
         description='Sidebar section labels the user chose to hide',
         examples=[['Billing']],
+        max_length=100,
+        min_length=0,
     )
-    homepage: Optional[str] = Field(
+    homepage: Optional[constr(min_length=0, max_length=2048)] = Field(
         None,
         description='The app path the user lands on after signing in',
         examples=['/analytics/spend'],
@@ -2780,6 +3248,8 @@ class NavCustomizationRead(BaseModel):
         None,
         description='Sidebar section labels in the order the user arranged them',
         examples=[['Analytics', 'Cost Controls']],
+        max_length=100,
+        min_length=0,
     )
 
 
@@ -2792,8 +3262,10 @@ class NavCustomizationWrite(BaseModel):
         None,
         description='Sidebar section labels the user chose to hide',
         examples=[['Billing']],
+        max_length=100,
+        min_length=0,
     )
-    homepage: Optional[str] = Field(
+    homepage: Optional[constr(min_length=0, max_length=2048)] = Field(
         None,
         description='The app path the user lands on after signing in',
         examples=['/analytics/spend'],
@@ -2807,6 +3279,8 @@ class NavCustomizationWrite(BaseModel):
         None,
         description='Sidebar section labels in the order the user arranged them',
         examples=[['Analytics', 'Cost Controls']],
+        max_length=100,
+        min_length=0,
     )
 
 
@@ -2849,13 +3323,13 @@ class OutcomeMetricEntry(BaseModel):
     One outcome metric value for a job
     """
 
-    key: Optional[str] = Field(
-        None, description='The metric key, as declared on the job type.'
+    key: constr(min_length=0, max_length=64) = Field(
+        ..., description='The metric key, as declared on the job type.'
     )
     provenance: Optional[Provenance2] = Field(
         None, description='Optional. Defaults to SELF_REPORTED when omitted.'
     )
-    reason: Optional[str] = Field(
+    reason: Optional[constr(min_length=0, max_length=2048)] = Field(
         None,
         description='Why this value is being recorded or corrected. Required when it replaces an earlier value for the same metric.',
     )
@@ -2863,15 +3337,15 @@ class OutcomeMetricEntry(BaseModel):
         None,
         description='When the value was measured (ISO 8601). Defaults to the time Revenium receives it. Cannot be in the future or more than a year in the past.',
     )
-    recordedBy: Optional[str] = Field(
+    recordedBy: Optional[constr(min_length=0, max_length=256)] = Field(
         None,
         description='Who recorded this value. Defaults to the name of the API key used, or the signed-in user.',
     )
-    source: Optional[str] = Field(
+    source: Optional[constr(min_length=0, max_length=128)] = Field(
         None, description='Optional. Defaults to api when omitted.'
     )
-    value: Optional[float] = Field(
-        None,
+    value: float = Field(
+        ...,
         description='The value, in the unit declared for this metric on the job type. For quality_rate, a share from 0 to 1.',
     )
 
@@ -2881,13 +3355,13 @@ class OutcomeMetricEntryRead(BaseModel):
     One outcome metric value for a job
     """
 
-    key: Optional[str] = Field(
-        None, description='The metric key, as declared on the job type.'
+    key: constr(min_length=0, max_length=64) = Field(
+        ..., description='The metric key, as declared on the job type.'
     )
     provenance: Optional[Provenance2] = Field(
         None, description='Optional. Defaults to SELF_REPORTED when omitted.'
     )
-    reason: Optional[str] = Field(
+    reason: Optional[constr(min_length=0, max_length=2048)] = Field(
         None,
         description='Why this value is being recorded or corrected. Required when it replaces an earlier value for the same metric.',
     )
@@ -2895,15 +3369,15 @@ class OutcomeMetricEntryRead(BaseModel):
         None,
         description='When the value was measured (ISO 8601). Defaults to the time Revenium receives it. Cannot be in the future or more than a year in the past.',
     )
-    recordedBy: Optional[str] = Field(
+    recordedBy: Optional[constr(min_length=0, max_length=256)] = Field(
         None,
         description='Who recorded this value. Defaults to the name of the API key used, or the signed-in user.',
     )
-    source: Optional[str] = Field(
+    source: Optional[constr(min_length=0, max_length=128)] = Field(
         None, description='Optional. Defaults to api when omitted.'
     )
-    value: Optional[float] = Field(
-        None,
+    value: float = Field(
+        ...,
         description='The value, in the unit declared for this metric on the job type. For quality_rate, a share from 0 to 1.',
     )
 
@@ -2990,40 +3464,40 @@ class PeriodFactEntry(BaseModel):
     One metric value for a period and a dimension value of a job type
     """
 
-    dimensionKey: Optional[str] = Field(
-        None,
+    dimensionKey: constr(min_length=0, max_length=64) = Field(
+        ...,
         description='The dimension this value is split by, as declared on the job type (for example team).',
     )
-    dimensionValue: Optional[str] = Field(
-        None,
+    dimensionValue: constr(min_length=0, max_length=128) = Field(
+        ...,
         description='The value of that dimension, which must be one of the allowed values declared on the job type.',
     )
-    key: Optional[str] = Field(
-        None,
+    key: constr(min_length=0, max_length=64) = Field(
+        ...,
         description='The metric key, as declared on the job type with period resolution.',
     )
-    periodEnd: Optional[AwareDatetime] = Field(
-        None, description='When the period ends (ISO 8601).'
+    periodEnd: AwareDatetime = Field(
+        ..., description='When the period ends (ISO 8601).'
     )
-    periodStart: Optional[AwareDatetime] = Field(
-        None, description='When the period starts (ISO 8601). Must be before periodEnd.'
+    periodStart: AwareDatetime = Field(
+        ..., description='When the period starts (ISO 8601). Must be before periodEnd.'
     )
     provenance: Optional[Provenance2] = Field(
         None, description='Optional. Defaults to SELF_REPORTED when omitted.'
     )
-    reason: Optional[str] = Field(
+    reason: Optional[constr(min_length=0, max_length=2048)] = Field(
         None,
         description='Why this value is being recorded or corrected. Required when it replaces an earlier value for the same period, dimension value and metric.',
     )
-    recordedBy: Optional[str] = Field(
+    recordedBy: Optional[constr(min_length=0, max_length=256)] = Field(
         None,
         description='Who recorded this value. Defaults to the name of the API key used, or the signed-in user.',
     )
-    source: Optional[str] = Field(
+    source: Optional[constr(min_length=0, max_length=128)] = Field(
         None, description='Optional. Defaults to api when omitted.'
     )
-    value: Optional[float] = Field(
-        None,
+    value: float = Field(
+        ...,
         description='The value, in the unit declared for this metric on the job type. For quality_rate, a share from 0 to 1.',
     )
 
@@ -3101,7 +3575,7 @@ class PlanElement(BaseModel):
     """
 
     distinctValue: Optional[str] = Field(
-        None,
+        ...,
         description="Optional filter value to charge only for specific metric values. For example, if measuring by country, this could be 'FRANCE' to charge only for French traffic. Case insensitive",
         examples=['premium'],
     )
@@ -3138,7 +3612,7 @@ class PlanElementRead(BaseModel):
     """
 
     distinctValue: Optional[str] = Field(
-        None,
+        ...,
         description="Optional filter value to charge only for specific metric values. For example, if measuring by country, this could be 'FRANCE' to charge only for French traffic. Case insensitive",
         examples=['premium'],
     )
@@ -3197,7 +3671,7 @@ class PrHealthSettingsResource(BaseModel):
     Team-level PR Health configuration settings
     """
 
-    agingDays: int = Field(
+    agingDays: conint(ge=1, le=365) = Field(
         ...,
         description='Days without activity before an open PR counts as aging. Must be lower than rottingDays.',
         examples=[14],
@@ -3239,7 +3713,7 @@ class PrHealthSettingsResource(BaseModel):
         None,
         description='Repositories (owner/name) left out of every PR Health figure, matched case-insensitively. Returned sorted; an empty list on write clears them. At most 200.',
     )
-    rottingDays: int = Field(
+    rottingDays: conint(ge=1, le=365) = Field(
         ...,
         description='Days without activity before an open PR counts as rotting. Must be higher than agingDays.',
         examples=[30],
@@ -3471,11 +3945,17 @@ class ComparisonState(StrEnum):
 
 class QuotaConsumed(BaseModel):
     """
-    Quota consumed
+    Usage of the subscription's current call-count tier
     """
 
-    consumed: Optional[int] = Field(None, description='Quota consumed')
-    limit: Optional[int] = Field(None, description='Quota')
+    consumed: Optional[int] = Field(
+        None,
+        description='Calls counted in that tier, as last written to the database (it can trail live metering by a few seconds). 0 when the current period has no call-count quota.',
+    )
+    limit: Optional[int] = Field(
+        None,
+        description='Calls allowed in the current call-count tier (the lowest tier not yet over quota, else the highest tier). 0 when that tier has no cap or the current period has no call-count quota.',
+    )
 
 
 class AggregationType(StrEnum):
@@ -3568,7 +4048,7 @@ class ReportOutcomeRequestRead(BaseModel):
         description='Currency for the outcome value. Defaults to USD.',
         examples=['USD'],
     )
-    outcomeReason: Optional[str] = Field(
+    outcomeReason: Optional[constr(min_length=0, max_length=2048)] = Field(
         None,
         description='Human-readable explanation of the outcome — why the job failed or was cancelled. This is the prescribed field for a failure reason; do not encode it inside `metadata`.',
         examples=['Upstream Hermes agent timed out after 300s'],
@@ -4004,14 +4484,6 @@ class SourceResource(BaseModel):
         description='Whether or not the source is auto-discovered',
         examples=[False],
     )
-    contractIds: Optional[list[str]] = Field(
-        None,
-        description='The API contract/specifications IDs associated with the source',
-        examples=[['af75417c71d24e708f506596ce5ab675']],
-    )
-    contracts: Optional[list[ResourceMetadata]] = Field(
-        None, description='The API contract/specifications associated with the source'
-    )
     created: Optional[str] = Field(
         None,
         description='The creation timestamp (ISO 8601 extended date-time format, e.g., 2024-09-01T00:00:00Z)',
@@ -4073,11 +4545,11 @@ class SourceResource(BaseModel):
     method: Optional[str] = Field(
         None, description="The source's method", examples=['GET']
     )
-    name: str = Field(
+    name: constr(min_length=1) = Field(
         ..., description='The name of the source', examples=['my-awesome-source']
     )
     owner: Optional[ResourceMetadata] = None
-    ownerId: Optional[str] = Field(
+    ownerId: Optional[constr(min_length=1)] = Field(
         ...,
         description='The unique identifier of the source owner',
         examples=['LjRrbJ'],
@@ -4118,7 +4590,9 @@ class SourceResource(BaseModel):
         description='The updated timestamp (ISO 8601 extended date-time format, e.g., 2024-09-01T00:00:00Z)',
         examples=['2024-09-01T00:00:00Z'],
     )
-    version: str = Field(..., description="The source's version", examples=['1.0.0'])
+    version: constr(min_length=1) = Field(
+        ..., description="The source's version", examples=['1.0.0']
+    )
 
 
 class SourceResourceRead(BaseModel):
@@ -4136,14 +4610,6 @@ class SourceResourceRead(BaseModel):
         None,
         description='Whether or not the source is auto-discovered',
         examples=[False],
-    )
-    contractIds: Optional[list[str]] = Field(
-        None,
-        description='The API contract/specifications IDs associated with the source',
-        examples=[['af75417c71d24e708f506596ce5ab675']],
-    )
-    contracts: Optional[list[ResourceMetadataRead]] = Field(
-        None, description='The API contract/specifications associated with the source'
     )
     created: Optional[str] = Field(
         None,
@@ -4206,11 +4672,11 @@ class SourceResourceRead(BaseModel):
     method: Optional[str] = Field(
         None, description="The source's method", examples=['GET']
     )
-    name: str = Field(
+    name: constr(min_length=1) = Field(
         ..., description='The name of the source', examples=['my-awesome-source']
     )
     owner: Optional[ResourceMetadataRead] = None
-    ownerId: Optional[str] = Field(
+    ownerId: Optional[constr(min_length=1)] = Field(
         ...,
         description='The unique identifier of the source owner',
         examples=['LjRrbJ'],
@@ -4251,7 +4717,9 @@ class SourceResourceRead(BaseModel):
         description='The updated timestamp (ISO 8601 extended date-time format, e.g., 2024-09-01T00:00:00Z)',
         examples=['2024-09-01T00:00:00Z'],
     )
-    version: str = Field(..., description="The source's version", examples=['1.0.0'])
+    version: constr(min_length=1) = Field(
+        ..., description="The source's version", examples=['1.0.0']
+    )
 
 
 class SourceResourceWrite(BaseModel):
@@ -4269,14 +4737,6 @@ class SourceResourceWrite(BaseModel):
         None,
         description='Whether or not the source is auto-discovered',
         examples=[False],
-    )
-    contractIds: Optional[list[str]] = Field(
-        None,
-        description='The API contract/specifications IDs associated with the source',
-        examples=[['af75417c71d24e708f506596ce5ab675']],
-    )
-    contracts: Optional[list[Any]] = Field(
-        None, description='The API contract/specifications associated with the source'
     )
     created: Optional[str] = Field(
         None,
@@ -4339,11 +4799,11 @@ class SourceResourceWrite(BaseModel):
     method: Optional[str] = Field(
         None, description="The source's method", examples=['GET']
     )
-    name: str = Field(
+    name: constr(min_length=1) = Field(
         ..., description='The name of the source', examples=['my-awesome-source']
     )
     owner: Any = None
-    ownerId: Optional[str] = Field(
+    ownerId: Optional[constr(min_length=1)] = Field(
         ...,
         description='The unique identifier of the source owner',
         examples=['LjRrbJ'],
@@ -4384,7 +4844,9 @@ class SourceResourceWrite(BaseModel):
         description='The updated timestamp (ISO 8601 extended date-time format, e.g., 2024-09-01T00:00:00Z)',
         examples=['2024-09-01T00:00:00Z'],
     )
-    version: str = Field(..., description="The source's version", examples=['1.0.0'])
+    version: constr(min_length=1) = Field(
+        ..., description="The source's version", examples=['1.0.0']
+    )
 
 
 class SplitAttributionMember(BaseModel):
@@ -4441,9 +4903,9 @@ class StrictIngestionModeRequestRead(BaseModel):
         description='Applies only while strictIngestionMode is true. When on, Revenium still creates a job for each ticket your coding sessions are linked to, even in strict mode. Omit to leave the current value unchanged. Defaults to false. Rejected with a 400 when combined with strictIngestionMode=false in the same request: the sub-flag has no effect while strict ingestion is off.',
         examples=[False],
     )
-    strictIngestionMode: bool = Field(
+    strictIngestionMode: Optional[bool] = Field(
         ...,
-        description='Whether strict ingestion mode should be enabled for the tenant. When true, AI ingestion rejects transactions that reference a product, subscriber, credential or organization that does not already exist, instead of creating it.',
+        description='Whether strict ingestion mode should be enabled for the tenant. When true, AI ingestion rejects transactions that reference a product, subscriber, credential or organization that does not already exist, instead of creating it. Required: omitting it or sending null is rejected with a 400.',
         examples=[True],
     )
 
@@ -4511,7 +4973,7 @@ class SubscriberResource(BaseModel):
         description='The creation timestamp (ISO 8601 extended date-time format, e.g., 2024-09-01T00:00:00Z)',
         examples=['2024-09-01T00:00:00Z'],
     )
-    email: str = Field(
+    email: constr(min_length=1) = Field(
         ...,
         description='The email address of the user',
         examples=['ash@weyland-yutani.io'],
@@ -4528,10 +4990,11 @@ class SubscriberResource(BaseModel):
     lastName: Optional[str] = Field(
         None, description='The last name of the user', examples=['Williams']
     )
-    organizationIds: Optional[list[str]] = Field(
-        None,
+    organizationIds: list[str] = Field(
+        ...,
         description='The organization IDs the user belongs to',
         examples=[['6PV0xe']],
+        min_length=1,
     )
     organizations: Optional[list[ResourceMetadata]] = Field(
         None, description='The organizations the user belongs to'
@@ -4568,7 +5031,7 @@ class SubscriberResourceRead(BaseModel):
         description='The creation timestamp (ISO 8601 extended date-time format, e.g., 2024-09-01T00:00:00Z)',
         examples=['2024-09-01T00:00:00Z'],
     )
-    email: str = Field(
+    email: constr(min_length=1) = Field(
         ...,
         description='The email address of the user',
         examples=['ash@weyland-yutani.io'],
@@ -4585,10 +5048,11 @@ class SubscriberResourceRead(BaseModel):
     lastName: Optional[str] = Field(
         None, description='The last name of the user', examples=['Williams']
     )
-    organizationIds: Optional[list[str]] = Field(
-        None,
+    organizationIds: list[str] = Field(
+        ...,
         description='The organization IDs the user belongs to',
         examples=[['6PV0xe']],
+        min_length=1,
     )
     organizations: Optional[list[ResourceMetadataRead]] = Field(
         None, description='The organizations the user belongs to'
@@ -4625,7 +5089,7 @@ class SubscriberResourceWrite(BaseModel):
         description='The creation timestamp (ISO 8601 extended date-time format, e.g., 2024-09-01T00:00:00Z)',
         examples=['2024-09-01T00:00:00Z'],
     )
-    email: str = Field(
+    email: constr(min_length=1) = Field(
         ...,
         description='The email address of the user',
         examples=['ash@weyland-yutani.io'],
@@ -4642,10 +5106,11 @@ class SubscriberResourceWrite(BaseModel):
     lastName: Optional[str] = Field(
         None, description='The last name of the user', examples=['Williams']
     )
-    organizationIds: Optional[list[str]] = Field(
-        None,
+    organizationIds: list[str] = Field(
+        ...,
         description='The organization IDs the user belongs to',
         examples=[['6PV0xe']],
+        min_length=1,
     )
     organizations: Optional[list[Any]] = Field(
         None, description='The organizations the user belongs to'
@@ -4945,7 +5410,7 @@ class TeamResource(BaseModel):
         description="The team's metadata (in key / value pairs)",
         examples=[{'key1': 'value1', 'key2': 'value2'}],
     )
-    name: str = Field(
+    name: constr(min_length=1) = Field(
         ..., description='The name of the team', examples=['Weyland-Yutani Corporation']
     )
     parent: Optional[ResourceMetadata] = None
@@ -5097,7 +5562,7 @@ class TeamResourceRead(BaseModel):
         description="The team's metadata (in key / value pairs)",
         examples=[{'key1': 'value1', 'key2': 'value2'}],
     )
-    name: str = Field(
+    name: constr(min_length=1) = Field(
         ..., description='The name of the team', examples=['Weyland-Yutani Corporation']
     )
     parent: Optional[ResourceMetadataRead] = None
@@ -5330,7 +5795,7 @@ class Terms(BaseModel):
     Terms and conditions document associated with a product. Defines legal terms, service agreements, or usage policies that customers must accept when subscribing to or purchasing a product
     """
 
-    link: str = Field(
+    link: constr(min_length=1) = Field(
         ...,
         description='URL or reference link to the full terms and conditions document. Can be an external URL or internal document identifier',
         examples=['https://example.com/terms/standard-tos.pdf'],
@@ -5340,7 +5805,7 @@ class Terms(BaseModel):
         description='Display order for multiple terms documents. Lower numbers appear first. Used when a product has multiple terms documents that should be presented in a specific sequence',
         examples=[1],
     )
-    terms: str = Field(
+    terms: constr(min_length=1) = Field(
         ...,
         description='The full text or summary of the terms and conditions. Can contain the complete legal text or a brief description with a link to the full document',
         examples=[
@@ -5354,7 +5819,7 @@ class TermsRead(BaseModel):
     Terms and conditions document associated with a product. Defines legal terms, service agreements, or usage policies that customers must accept when subscribing to or purchasing a product
     """
 
-    link: str = Field(
+    link: constr(min_length=1) = Field(
         ...,
         description='URL or reference link to the full terms and conditions document. Can be an external URL or internal document identifier',
         examples=['https://example.com/terms/standard-tos.pdf'],
@@ -5364,7 +5829,7 @@ class TermsRead(BaseModel):
         description='Display order for multiple terms documents. Lower numbers appear first. Used when a product has multiple terms documents that should be presented in a specific sequence',
         examples=[1],
     )
-    terms: str = Field(
+    terms: constr(min_length=1) = Field(
         ...,
         description='The full text or summary of the terms and conditions. Can contain the complete legal text or a brief description with a link to the full document',
         examples=[
@@ -5388,7 +5853,7 @@ class TierModel(BaseModel):
         description='The unique identifier of the pricing tier',
         examples=['af75417c71d24e708f506596ce5ab675'],
     )
-    name: str = Field(
+    name: constr(min_length=1) = Field(
         ...,
         description='The name of the pricing tier for identification and display purposes',
         examples=['First 1000 units'],
@@ -5414,7 +5879,7 @@ class TierQuota(BaseModel):
     lowerTierQuotaLimit: Optional[float] = Field(
         None, description='Lower Tier Quota Limit', examples=[4]
     )
-    tierId: Optional[str] = Field(None, description='The tier Id')
+    tierId: Optional[str] = Field(..., description='The tier Id')
     tierName: Optional[str] = Field(None, description='The tier Name')
     tierQuota: Optional[float] = Field(None, description='Tier Quota', examples=[4])
     tierQuotaConsumed: Optional[float] = Field(
@@ -5429,7 +5894,7 @@ class TierQuotaRead(BaseModel):
     lowerTierQuotaLimit: Optional[float] = Field(
         None, description='Lower Tier Quota Limit', examples=[4]
     )
-    tierId: Optional[str] = Field(None, description='The tier Id')
+    tierId: Optional[str] = Field(..., description='The tier Id')
     tierName: Optional[str] = Field(None, description='The tier Name')
     tierQuota: Optional[float] = Field(None, description='Tier Quota', examples=[4])
     tierQuotaConsumed: Optional[float] = Field(
@@ -5444,7 +5909,7 @@ class TierQuotaWrite(BaseModel):
     lowerTierQuotaLimit: Optional[float] = Field(
         None, description='Lower Tier Quota Limit', examples=[4]
     )
-    tierId: Optional[str] = Field(None, description='The tier Id')
+    tierId: Optional[str] = Field(..., description='The tier Id')
     tierName: Optional[str] = Field(None, description='The tier Name')
     tierQuota: Optional[float] = Field(None, description='Tier Quota', examples=[4])
     tierQuotaConsumed: Optional[float] = Field(
@@ -5470,7 +5935,7 @@ class TierRead(BaseModel):
         description='The unique identifier of the pricing tier',
         examples=['af75417c71d24e708f506596ce5ab675'],
     )
-    name: str = Field(
+    name: constr(min_length=1) = Field(
         ...,
         description='The name of the pricing tier for identification and display purposes',
         examples=['First 1000 units'],
@@ -5635,7 +6100,7 @@ class UpdateOutcomeRequestRead(BaseModel):
         description='Updated currency for the outcome value. Defaults to USD.',
         examples=['USD'],
     )
-    outcomeReason: Optional[str] = Field(
+    outcomeReason: Optional[constr(min_length=0, max_length=2048)] = Field(
         None,
         description='Updated explanation of the outcome: why the job failed or was cancelled. Omit to leave the current value untouched; send an empty string to clear it.',
         examples=['Upstream Hermes agent timed out after 300s'],
@@ -5703,13 +6168,13 @@ class UserResource(BaseModel):
         description='The ID of the default team to load on login',
         examples=['a91XJp'],
     )
-    email: str = Field(
+    email: constr(min_length=1) = Field(
         ...,
         description='The email address of the user',
         examples=['ash@weyland-yutani.io'],
     )
-    firstName: Optional[str] = Field(
-        None, description='The first name of the user', examples=['Ash']
+    firstName: Optional[constr(min_length=1)] = Field(
+        ..., description='The first name of the user', examples=['Ash']
     )
     homepagePreference: Optional[HomepagePreference] = Field(
         None, description="The user's homepage preference", examples=['PRODUCTS']
@@ -5720,8 +6185,8 @@ class UserResource(BaseModel):
         description="The user's label (automatically set to the email address for display purposes)",
         examples=['ash@weyland-yutani.io'],
     )
-    lastName: Optional[str] = Field(
-        None, description='The last name of the user', examples=['Williams']
+    lastName: Optional[constr(min_length=1)] = Field(
+        ..., description='The last name of the user', examples=['Williams']
     )
     navCustomization: Optional[NavCustomization] = None
     persona: Optional[Persona] = Field(
@@ -5748,7 +6213,10 @@ class UserResource(BaseModel):
         None, description='The type of object', examples=['user']
     )
     roles: list[str] = Field(
-        ..., description='The roles of the user', examples=[['ROLE_API_CONSUMER']]
+        ...,
+        description='The roles of the user',
+        examples=[['ROLE_API_CONSUMER']],
+        min_length=1,
     )
     scheduledForDeletionAt: Optional[str] = Field(
         None,
@@ -5758,10 +6226,11 @@ class UserResource(BaseModel):
     subscriberId: Optional[str] = Field(
         None, description='The ID of the subscriber', examples=['pEjxgX']
     )
-    teamIds: Optional[list[str]] = Field(
-        None,
+    teamIds: list[str] = Field(
+        ...,
         description='The IDs of the teams the user belongs to',
         examples=[['a91XJp']],
+        min_length=1,
     )
     teams: Optional[list[TeamMetadata]] = Field(
         None, description='The teams the user belongs to'
@@ -5802,13 +6271,13 @@ class UserResourceRead(BaseModel):
         description='The ID of the default team to load on login',
         examples=['a91XJp'],
     )
-    email: str = Field(
+    email: constr(min_length=1) = Field(
         ...,
         description='The email address of the user',
         examples=['ash@weyland-yutani.io'],
     )
-    firstName: Optional[str] = Field(
-        None, description='The first name of the user', examples=['Ash']
+    firstName: Optional[constr(min_length=1)] = Field(
+        ..., description='The first name of the user', examples=['Ash']
     )
     homepagePreference: Optional[HomepagePreference] = Field(
         None, description="The user's homepage preference", examples=['PRODUCTS']
@@ -5819,8 +6288,8 @@ class UserResourceRead(BaseModel):
         description="The user's label (automatically set to the email address for display purposes)",
         examples=['ash@weyland-yutani.io'],
     )
-    lastName: Optional[str] = Field(
-        None, description='The last name of the user', examples=['Williams']
+    lastName: Optional[constr(min_length=1)] = Field(
+        ..., description='The last name of the user', examples=['Williams']
     )
     navCustomization: Optional[NavCustomizationRead] = None
     persona: Optional[Persona] = Field(
@@ -5847,7 +6316,10 @@ class UserResourceRead(BaseModel):
         None, description='The type of object', examples=['user']
     )
     roles: list[str] = Field(
-        ..., description='The roles of the user', examples=[['ROLE_API_CONSUMER']]
+        ...,
+        description='The roles of the user',
+        examples=[['ROLE_API_CONSUMER']],
+        min_length=1,
     )
     scheduledForDeletionAt: Optional[str] = Field(
         None,
@@ -5857,10 +6329,11 @@ class UserResourceRead(BaseModel):
     subscriberId: Optional[str] = Field(
         None, description='The ID of the subscriber', examples=['pEjxgX']
     )
-    teamIds: Optional[list[str]] = Field(
-        None,
+    teamIds: list[str] = Field(
+        ...,
         description='The IDs of the teams the user belongs to',
         examples=[['a91XJp']],
+        min_length=1,
     )
     teams: Optional[list[TeamMetadataRead]] = Field(
         None, description='The teams the user belongs to'
@@ -5901,13 +6374,13 @@ class UserResourceWrite(BaseModel):
         description='The ID of the default team to load on login',
         examples=['a91XJp'],
     )
-    email: str = Field(
+    email: constr(min_length=1) = Field(
         ...,
         description='The email address of the user',
         examples=['ash@weyland-yutani.io'],
     )
-    firstName: Optional[str] = Field(
-        None, description='The first name of the user', examples=['Ash']
+    firstName: Optional[constr(min_length=1)] = Field(
+        ..., description='The first name of the user', examples=['Ash']
     )
     homepagePreference: Optional[HomepagePreference] = Field(
         None, description="The user's homepage preference", examples=['PRODUCTS']
@@ -5918,8 +6391,8 @@ class UserResourceWrite(BaseModel):
         description="The user's label (automatically set to the email address for display purposes)",
         examples=['ash@weyland-yutani.io'],
     )
-    lastName: Optional[str] = Field(
-        None, description='The last name of the user', examples=['Williams']
+    lastName: Optional[constr(min_length=1)] = Field(
+        ..., description='The last name of the user', examples=['Williams']
     )
     navCustomization: Optional[NavCustomizationWrite] = None
     persona: Optional[Persona] = Field(
@@ -5946,7 +6419,10 @@ class UserResourceWrite(BaseModel):
         None, description='The type of object', examples=['user']
     )
     roles: list[str] = Field(
-        ..., description='The roles of the user', examples=[['ROLE_API_CONSUMER']]
+        ...,
+        description='The roles of the user',
+        examples=[['ROLE_API_CONSUMER']],
+        min_length=1,
     )
     scheduledForDeletionAt: Optional[str] = Field(
         None,
@@ -5956,10 +6432,11 @@ class UserResourceWrite(BaseModel):
     subscriberId: Optional[str] = Field(
         None, description='The ID of the subscriber', examples=['pEjxgX']
     )
-    teamIds: Optional[list[str]] = Field(
-        None,
+    teamIds: list[str] = Field(
+        ...,
         description='The IDs of the teams the user belongs to',
         examples=[['a91XJp']],
+        min_length=1,
     )
     teams: Optional[list[Any]] = Field(
         None, description='The teams the user belongs to'
@@ -6610,7 +7087,7 @@ class VcsPrHealthTrendWeekRead(BaseModel):
     )
 
 
-class Action5(StrEnum):
+class Action7(StrEnum):
     DISMISSED = 'DISMISSED'
     SNOOZED = 'SNOOZED'
 
@@ -6625,7 +7102,7 @@ class Reason(Enum):
 class VcsPrHealthTriageRead(BaseModel):
     actedAt: Optional[AwareDatetime] = None
     actedBy: Optional[str] = None
-    action: Optional[Action5] = None
+    action: Optional[Action7] = None
     prNumber: Optional[int] = None
     reason: Optional[Reason] = None
     repoName: Optional[str] = None
@@ -6846,15 +7323,6 @@ class V2ApiAiAlertsBudgetsPortfolioGetParametersQuery(BaseModel):
     groupLimit: Optional[int] = None
 
 
-class V2ApiAiAlertsBudgetsPortfolioPostParametersQuery(BaseModel):
-    now: Optional[str] = None
-    page: Optional[conint(ge=0)] = 0
-    size: Optional[conint(ge=1)] = 20
-    sort: Optional[list[str]] = None
-    teamId: Optional[str] = None
-    groupLimit: Optional[int] = None
-
-
 class V2ApiAiAlertsBudgetsProgressGetParametersQuery(BaseModel):
     ids: str
     now: Optional[str] = None
@@ -6864,7 +7332,6 @@ class V2ApiAiAlertsBudgetsProgressGetParametersQuery(BaseModel):
 class V2ApiAiAlertsAnomalyIdBudgetProgressGetParametersQuery(BaseModel):
     now: Optional[str] = None
     includeTrend: Optional[bool] = None
-    spend: Optional[float] = None
 
 
 class V2ApiAiCostControlsGetParametersQuery(BaseModel):
@@ -6875,13 +7342,17 @@ class V2ApiAiCostControlsGetParametersQuery(BaseModel):
     sort: Optional[list[str]] = None
 
 
+class V2ApiAiCostControlsIdDeleteParametersQuery(BaseModel):
+    changeReason: Optional[str] = None
+
+
 class Mode(StrEnum):
     ENFORCED = 'ENFORCED'
     SHADOW = 'SHADOW'
     ALL = 'ALL'
 
 
-class Level1(StrEnum):
+class Level2(StrEnum):
     HARD = 'HARD'
     WARN = 'WARN'
     ALL = 'ALL'
@@ -6897,9 +7368,10 @@ class V2ApiAiEnforcementEventsGetParametersQuery(BaseModel):
     ruleId: Optional[str] = None
     until: Optional[AwareDatetime] = None
     mode: Optional[Mode] = None
-    level: Optional[Level1] = None
+    level: Optional[Level2] = None
     groupValue: Optional[str] = None
     groupBy: Optional[str] = None
+    includeTotal: Optional[bool] = True
     transactionId: Optional[str] = None
 
 
@@ -6908,7 +7380,7 @@ class V2ApiAiEnforcementEventsAffectedGetParametersQuery(BaseModel):
     since: Optional[str] = None
     until: Optional[str] = None
     ruleId: Optional[str] = None
-    level: Optional[Level1] = None
+    level: Optional[Level2] = None
     mode: Optional[Mode] = None
     query: Optional[str] = None
     groupValue: Optional[str] = None
@@ -6928,7 +7400,7 @@ class V2ApiAiEnforcementEventsHistoryGetParametersQuery(BaseModel):
     since: Optional[str] = None
     until: Optional[str] = None
     ruleId: Optional[str] = None
-    level: Optional[Level1] = None
+    level: Optional[Level2] = None
     mode: Optional[Mode] = None
     query: Optional[str] = None
     groupValue: Optional[str] = None
@@ -6943,7 +7415,7 @@ class V2ApiAiEnforcementEventsSummaryGetParametersQuery(BaseModel):
     since: Optional[str] = None
     until: Optional[str] = None
     ruleId: Optional[str] = None
-    level: Optional[Level1] = None
+    level: Optional[Level2] = None
     mode: Optional[Mode] = None
     query: Optional[str] = None
     groupValue: Optional[str] = None
@@ -7060,6 +7532,11 @@ class V2ApiBillingCoverageGetParametersQuery(BaseModel):
         description="Narrow results to a single API key id within the caller's organization, matched exactly. Honoured by /billing/chart, /billing/models, /billing/api-keys and /billing/users; other billing endpoints ignore it. On those four, rows and totals cover only charges stored under that id, so a value that matches no stored charge returns a zero total, never the organization total.",
         examples=['apikey_011K4gLy'],
     )
+    workspace: Optional[str] = Field(
+        None,
+        description='Narrow results to a single workspace, given as the `id` /billing/workspaces returns, matched exactly. A Revenium name covers every provider workspace merged under it; an `unassigned:` id covers that one provider workspace. Honoured by /billing/chart, /billing/models, /billing/api-keys, /billing/users and /billing/daily; other billing endpoints ignore it. On those five, rows and totals cover only charges stored under that workspace, so a value that matches no workspace returns a zero total, never the organization total.',
+        examples=['unassigned:anthropic:wrkspc_01RqcXmnt6FxhXWUbRnvp6cw'],
+    )
     minCost: Optional[confloat(ge=0.0)] = Field(
         None, description='Filter by a starting cost (inclusive).', examples=[1.0]
     )
@@ -7097,6 +7574,11 @@ class V2ApiBillingCoveragePostParametersQuery(BaseModel):
         None,
         description="Narrow results to a single API key id within the caller's organization, matched exactly. Honoured by /billing/chart, /billing/models, /billing/api-keys and /billing/users; other billing endpoints ignore it. On those four, rows and totals cover only charges stored under that id, so a value that matches no stored charge returns a zero total, never the organization total.",
         examples=['apikey_011K4gLy'],
+    )
+    workspace: Optional[str] = Field(
+        None,
+        description='Narrow results to a single workspace, given as the `id` /billing/workspaces returns, matched exactly. A Revenium name covers every provider workspace merged under it; an `unassigned:` id covers that one provider workspace. Honoured by /billing/chart, /billing/models, /billing/api-keys, /billing/users and /billing/daily; other billing endpoints ignore it. On those five, rows and totals cover only charges stored under that workspace, so a value that matches no workspace returns a zero total, never the organization total.',
+        examples=['unassigned:anthropic:wrkspc_01RqcXmnt6FxhXWUbRnvp6cw'],
     )
     minCost: Optional[confloat(ge=0.0)] = Field(
         None, description='Filter by a starting cost (inclusive).', examples=[1.0]
@@ -7285,6 +7767,18 @@ class V2ApiDepartmentsPersonsPersonIdDeleteParametersQuery(BaseModel):
     teamId: str
 
 
+class V2ApiDepartmentsIdAdminsPutParametersQuery(BaseModel):
+    teamId: str
+
+
+class V2ApiDepartmentsIdAdminsPutResponse(RootModel[list[DepartmentAdminResponseRead]]):
+    root: list[DepartmentAdminResponseRead]
+
+
+class V2ApiDepartmentsIdAdminsPersonIdDeleteParametersQuery(BaseModel):
+    teamId: str
+
+
 class PayState(StrEnum):
     """
     Filter by invoice pay state(s). Accepts a single value or a comma-separated list.
@@ -7297,7 +7791,7 @@ class PayState(StrEnum):
     INVOICE_ONLY = 'INVOICE_ONLY'
 
 
-class State2(StrEnum):
+class State3(StrEnum):
     """
     Filter by invoice state(s). Accepts a single value or a comma-separated list.
     """
@@ -7347,7 +7841,7 @@ class V2ApiInvoicesGetParametersQuery(BaseModel):
         description='Filter by invoice pay state(s). Accepts a single value or a comma-separated list.',
         examples=['PAID,UNPAID'],
     )
-    states: Optional[list[State2]] = Field(
+    states: Optional[list[State3]] = Field(
         None,
         description='Filter by invoice state(s). Accepts a single value or a comma-separated list.',
         examples=['FINALIZED,ISSUED'],
@@ -7684,6 +8178,10 @@ class V2ApiSourcesAiAnomalyProviderDimensionsApiKeysGetParametersQuery(BaseModel
     apiKeyIds: Optional[list[str]] = None
     page: Optional[int] = 0
     size: Optional[int] = 50
+
+
+class V2ApiSourcesAiAnomalyIdDeleteParametersQuery(BaseModel):
+    changeReason: Optional[str] = None
 
 
 class ModelType(StrEnum):
@@ -8187,6 +8685,12 @@ class V2ApiTeamsIdTagsGetResponse(RootModel[list[str]]):
     root: list[str]
 
 
+class V2ApiTeamsTeamIdCoworkOrgLinksGetResponse(
+    RootModel[list[CoworkOrgLinkResponseRead]]
+):
+    root: list[CoworkOrgLinkResponseRead]
+
+
 class V2ApiTeamsTeamIdSettingsVerifiedDomainsDeleteParametersQuery(BaseModel):
     domain: str
 
@@ -8252,6 +8756,11 @@ class AIAnomalyResource(BaseModel):
         ...,
         description='The monitoring strategy of the alert rule. THRESHOLD monitors for absolute values exceeding a threshold, RELATIVE_CHANGE monitors for percentage changes between periods, CUMULATIVE_USAGE monitors for total usage over a period',
         examples=['THRESHOLD'],
+    )
+    changeReason: Optional[constr(max_length=500)] = Field(
+        None,
+        description='Why you are making this change. Optional plain text, trimmed, up to 500 characters; an empty value means no reason. Write-only: it is never returned on this item. Read it back as `reason` on the change history entries and in the change history CSV export. A reason sent with a save that changes nothing is dropped, unless the save is recorded anyway because a different person or API key made it.',
+        examples=['Threshold lowered after the October invoice'],
     )
     created: Optional[str] = Field(
         None,
@@ -8393,6 +8902,11 @@ class AIAnomalyResourceRead(BaseModel):
         description='The monitoring strategy of the alert rule. THRESHOLD monitors for absolute values exceeding a threshold, RELATIVE_CHANGE monitors for percentage changes between periods, CUMULATIVE_USAGE monitors for total usage over a period',
         examples=['THRESHOLD'],
     )
+    changeReason: Optional[constr(max_length=500)] = Field(
+        None,
+        description='Why you are making this change. Optional plain text, trimmed, up to 500 characters; an empty value means no reason. Write-only: it is never returned on this item. Read it back as `reason` on the change history entries and in the change history CSV export. A reason sent with a save that changes nothing is dropped, unless the save is recorded anyway because a different person or API key made it.',
+        examples=['Threshold lowered after the October invoice'],
+    )
     created: Optional[str] = Field(
         None,
         description='The creation timestamp (ISO 8601 extended date-time format, e.g., 2024-09-01T00:00:00Z)',
@@ -8533,6 +9047,11 @@ class AIAnomalyResourceWrite(BaseModel):
         description='The monitoring strategy of the alert rule. THRESHOLD monitors for absolute values exceeding a threshold, RELATIVE_CHANGE monitors for percentage changes between periods, CUMULATIVE_USAGE monitors for total usage over a period',
         examples=['THRESHOLD'],
     )
+    changeReason: Optional[constr(max_length=500)] = Field(
+        None,
+        description='Why you are making this change. Optional plain text, trimmed, up to 500 characters; an empty value means no reason. Write-only: it is never returned on this item. Read it back as `reason` on the change history entries and in the change history CSV export. A reason sent with a save that changes nothing is dropped, unless the save is recorded anyway because a different person or API key made it.',
+        examples=['Threshold lowered after the October invoice'],
+    )
     created: Optional[str] = Field(
         None,
         description='The creation timestamp (ISO 8601 extended date-time format, e.g., 2024-09-01T00:00:00Z)',
@@ -8657,6 +9176,28 @@ class AIAnomalyResourceWrite(BaseModel):
     )
 
 
+class AIModelContextPricingResource(BaseModel):
+    """
+    Long-prompt prices. A prompt larger than a band's lower bound bills at that band's prices instead of the model's ordinary prices. Send an empty band list to bill every prompt at the ordinary prices.
+    """
+
+    bands: Optional[list[ContextPriceBandResource]] = Field(
+        ...,
+        description='The long-prompt price bands, at most one covering any prompt size. Required: send an empty list for no long-prompt price.',
+    )
+
+
+class AIModelContextPricingResourceRead(BaseModel):
+    """
+    Long-prompt prices. A prompt larger than a band's lower bound bills at that band's prices instead of the model's ordinary prices. Send an empty band list to bill every prompt at the ordinary prices.
+    """
+
+    bands: Optional[list[ContextPriceBandResourceRead]] = Field(
+        ...,
+        description='The long-prompt price bands, at most one covering any prompt size. Required: send an empty list for no long-prompt price.',
+    )
+
+
 class AIModelResource(BaseModel):
     """
     AI model metadata
@@ -8678,6 +9219,7 @@ class AIModelResource(BaseModel):
         description='The cost per input token for cache reads in USD (for models that support prompt caching). Omit it to leave the leg unpriced; send 0 to price it at zero.',
         examples=[1e-06],
     )
+    contextPricing: Optional[AIModelContextPricingResource] = None
     created: Optional[str] = Field(
         None,
         description='The creation timestamp (ISO 8601 extended date-time format, e.g., 2024-09-01T00:00:00Z)',
@@ -8768,7 +9310,7 @@ class AIModelResource(BaseModel):
     )
     team: Optional[ResourceMetadata] = None
     teamId: Optional[str] = Field(
-        None,
+        ...,
         description='The unique identifier of the team that owns this AI model configuration. This field should be included in the request body when creating a new AI model.',
         examples=['a91XJp'],
     )
@@ -8800,6 +9342,7 @@ class AIModelResourceRead(BaseModel):
         description='The cost per input token for cache reads in USD (for models that support prompt caching). Omit it to leave the leg unpriced; send 0 to price it at zero.',
         examples=[1e-06],
     )
+    contextPricing: Optional[AIModelContextPricingResourceRead] = None
     created: Optional[str] = Field(
         None,
         description='The creation timestamp (ISO 8601 extended date-time format, e.g., 2024-09-01T00:00:00Z)',
@@ -8890,7 +9433,7 @@ class AIModelResourceRead(BaseModel):
     )
     team: Optional[ResourceMetadataRead] = None
     teamId: Optional[str] = Field(
-        None,
+        ...,
         description='The unique identifier of the team that owns this AI model configuration. This field should be included in the request body when creating a new AI model.',
         examples=['a91XJp'],
     )
@@ -9018,12 +9561,12 @@ class AgentResourceWrite(BaseModel):
         description='The creation timestamp (ISO 8601 extended date-time format, e.g., 2024-09-01T00:00:00Z)',
         examples=['2024-09-01T00:00:00Z'],
     )
-    description: Optional[str] = Field(
+    description: Optional[constr(min_length=0, max_length=1024)] = Field(
         None,
         description="Optional human-readable description of the agent's purpose. On update, an empty string clears the field; omit the field entirely to leave it unchanged",
         examples=['Answers customer billing questions'],
     )
-    displayName: Optional[str] = Field(
+    displayName: Optional[constr(min_length=0, max_length=255)] = Field(
         None,
         description='Human-readable name for the agent. Defaults to the telemetry key when omitted',
         examples=['Marketing Agent'],
@@ -9048,7 +9591,7 @@ class AgentResourceWrite(BaseModel):
         None,
         description='The team identifier. Required when creating an agent. Immutable after creation',
     )
-    telemetryKey: Optional[str] = Field(
+    telemetryKey: Optional[constr(min_length=0, max_length=255)] = Field(
         ...,
         description='The exact string sent in the `agent` field of telemetry. Matched case-insensitively and unique per organization. Immutable after creation',
         examples=['marketing-agent'],
@@ -9575,7 +10118,7 @@ class CompiledEnforcementRule(BaseModel):
 
 class CostControlResource(BaseModel):
     """
-    Cost control configuration for cost enforcement. Shadow mode evaluates without blocking; non-shadow rules block AI transactions when the threshold is crossed within the rolling window.
+    Cost control configuration for cost enforcement. A rule in shadow mode records events, sends Slack and email notifications as previews, and blocks nothing. When the threshold is crossed within the rolling window, a non-shadow rule's action is carried out by the Revenium SDK in the customer's application, or the Developer Cost Toolkit in Claude Code, where either enforces the rules.
     """
 
     field_links: Optional[dict[str, Link]] = Field(None, alias='_links')
@@ -9584,6 +10127,17 @@ class CostControlResource(BaseModel):
         description='Enforcement action taken when `hardLimit` is crossed (and rule is not in shadow mode). Only `BLOCK` and `WARN_ONLY` are accepted on create and update.',
         examples=['BLOCK'],
     )
+    aiAnomaly: Optional[LinkedAlertResource] = None
+    aiAnomalyId: Optional[str] = Field(
+        None,
+        description="The id of one active alert of the budget's team to link to this budget. A link only adds that alert's changes to the budget's change history; it does not change when the budget or the alert fires. Resending the budget's current link is always accepted. Omit a field to keep its current value. Send null to clear it.",
+        examples=['xK9mPq2'],
+    )
+    changeReason: Optional[constr(max_length=500)] = Field(
+        None,
+        description='Why you are making this change. Optional plain text, trimmed, up to 500 characters; an empty value means no reason. Write-only: it is never returned on this item. Read it back as `reason` on the change history entries and in the change history CSV export. A reason sent with a save that changes nothing is dropped, unless the save is recorded anyway because a different person or API key made it.',
+        examples=['Raised for the Q4 launch'],
+    )
     created: Optional[str] = Field(
         None,
         description='The creation timestamp (ISO 8601 extended date-time format)',
@@ -9591,7 +10145,7 @@ class CostControlResource(BaseModel):
     )
     createdBy: Optional[str] = Field(
         None,
-        description='Who created this rule: the user\'s email address; for an API key, its owner\'s email followed by "via API key" and the key\'s id and name; "Revenium Support" when Revenium staff made the change. Empty for rules created before this was recorded.',
+        description='Who created this rule: the user\'s email address; for an API key, its owner\'s email followed by "via API key" and the key\'s id and name; "Revenium Support" when Revenium staff made the change. Empty for rules created before this was recorded. A Member sees the author\'s role, `administrator`, instead of a name; a Department Admin sees the name only on a rule over a department they administer.',
         examples=['user@example.com'],
     )
     denyMessage: Optional[constr(max_length=2000)] = Field(
@@ -9635,6 +10189,11 @@ class CostControlResource(BaseModel):
         description="The rule's label (automatically set to the rule name)",
         examples=['Monthly OpenAI Cap'],
     )
+    locked: Optional[bool] = Field(
+        None,
+        description="Present only for a Member or Department Admin. True when the rule binds them but its figure is not theirs to see: a per-person limit on a metric other than cost inside a department, whose total is one person's balance, or a per-department limit on a metric other than cost. Its spend is not shown to them anywhere. False when they may see the rule's spend: in full when every figure on it is theirs, including the total of a shared limit they are under, such as a company-wide limit or a limit on a department above theirs, or only their own rows on a rule split per person or per department. Their answer also leaves out `notificationChannelIds`, `notificationEmails` and any person a filter names outside their scope, and gives `createdBy` and `modifiedBy` as the author's role wherever it may not name them.",
+        examples=[True],
+    )
     metricType: Optional[MetricType6] = Field(
         ...,
         description='The AI metric the rule evaluates against',
@@ -9664,7 +10223,7 @@ class CostControlResource(BaseModel):
     )
     shadowMode: Optional[bool] = Field(
         None,
-        description='When true, the rule evaluates without actually blocking. Use it to validate limits before enforcing them.',
+        description='When true, the rule records events, sends Slack and email notifications as previews, and blocks nothing; webhooks do not fire. Use it to validate limits before enforcing them.',
         examples=[True],
     )
     team: Optional[ResourceMetadata] = None
@@ -9692,7 +10251,7 @@ class CostControlResource(BaseModel):
 
 class CostControlResourceRead(BaseModel):
     """
-    Cost control configuration for cost enforcement. Shadow mode evaluates without blocking; non-shadow rules block AI transactions when the threshold is crossed within the rolling window.
+    Cost control configuration for cost enforcement. A rule in shadow mode records events, sends Slack and email notifications as previews, and blocks nothing. When the threshold is crossed within the rolling window, a non-shadow rule's action is carried out by the Revenium SDK in the customer's application, or the Developer Cost Toolkit in Claude Code, where either enforces the rules.
     """
 
     field_links: Optional[dict[str, Link]] = Field(None, alias='_links')
@@ -9701,6 +10260,17 @@ class CostControlResourceRead(BaseModel):
         description='Enforcement action taken when `hardLimit` is crossed (and rule is not in shadow mode). Only `BLOCK` and `WARN_ONLY` are accepted on create and update.',
         examples=['BLOCK'],
     )
+    aiAnomaly: Optional[LinkedAlertResourceRead] = None
+    aiAnomalyId: Optional[str] = Field(
+        None,
+        description="The id of one active alert of the budget's team to link to this budget. A link only adds that alert's changes to the budget's change history; it does not change when the budget or the alert fires. Resending the budget's current link is always accepted. Omit a field to keep its current value. Send null to clear it.",
+        examples=['xK9mPq2'],
+    )
+    changeReason: Optional[constr(max_length=500)] = Field(
+        None,
+        description='Why you are making this change. Optional plain text, trimmed, up to 500 characters; an empty value means no reason. Write-only: it is never returned on this item. Read it back as `reason` on the change history entries and in the change history CSV export. A reason sent with a save that changes nothing is dropped, unless the save is recorded anyway because a different person or API key made it.',
+        examples=['Raised for the Q4 launch'],
+    )
     created: Optional[str] = Field(
         None,
         description='The creation timestamp (ISO 8601 extended date-time format)',
@@ -9708,7 +10278,7 @@ class CostControlResourceRead(BaseModel):
     )
     createdBy: Optional[str] = Field(
         None,
-        description='Who created this rule: the user\'s email address; for an API key, its owner\'s email followed by "via API key" and the key\'s id and name; "Revenium Support" when Revenium staff made the change. Empty for rules created before this was recorded.',
+        description='Who created this rule: the user\'s email address; for an API key, its owner\'s email followed by "via API key" and the key\'s id and name; "Revenium Support" when Revenium staff made the change. Empty for rules created before this was recorded. A Member sees the author\'s role, `administrator`, instead of a name; a Department Admin sees the name only on a rule over a department they administer.',
         examples=['user@example.com'],
     )
     denyMessage: Optional[constr(max_length=2000)] = Field(
@@ -9752,6 +10322,11 @@ class CostControlResourceRead(BaseModel):
         description="The rule's label (automatically set to the rule name)",
         examples=['Monthly OpenAI Cap'],
     )
+    locked: Optional[bool] = Field(
+        None,
+        description="Present only for a Member or Department Admin. True when the rule binds them but its figure is not theirs to see: a per-person limit on a metric other than cost inside a department, whose total is one person's balance, or a per-department limit on a metric other than cost. Its spend is not shown to them anywhere. False when they may see the rule's spend: in full when every figure on it is theirs, including the total of a shared limit they are under, such as a company-wide limit or a limit on a department above theirs, or only their own rows on a rule split per person or per department. Their answer also leaves out `notificationChannelIds`, `notificationEmails` and any person a filter names outside their scope, and gives `createdBy` and `modifiedBy` as the author's role wherever it may not name them.",
+        examples=[True],
+    )
     metricType: Optional[MetricType6] = Field(
         ...,
         description='The AI metric the rule evaluates against',
@@ -9781,7 +10356,7 @@ class CostControlResourceRead(BaseModel):
     )
     shadowMode: Optional[bool] = Field(
         None,
-        description='When true, the rule evaluates without actually blocking. Use it to validate limits before enforcing them.',
+        description='When true, the rule records events, sends Slack and email notifications as previews, and blocks nothing; webhooks do not fire. Use it to validate limits before enforcing them.',
         examples=[True],
     )
     team: Optional[ResourceMetadataRead] = None
@@ -9809,7 +10384,7 @@ class CostControlResourceRead(BaseModel):
 
 class CostControlResourceWrite(BaseModel):
     """
-    Cost control configuration for cost enforcement. Shadow mode evaluates without blocking; non-shadow rules block AI transactions when the threshold is crossed within the rolling window.
+    Cost control configuration for cost enforcement. A rule in shadow mode records events, sends Slack and email notifications as previews, and blocks nothing. When the threshold is crossed within the rolling window, a non-shadow rule's action is carried out by the Revenium SDK in the customer's application, or the Developer Cost Toolkit in Claude Code, where either enforces the rules.
     """
 
     field_links: Optional[dict[str, Link]] = Field(None, alias='_links')
@@ -9818,6 +10393,17 @@ class CostControlResourceWrite(BaseModel):
         description='Enforcement action taken when `hardLimit` is crossed (and rule is not in shadow mode). Only `BLOCK` and `WARN_ONLY` are accepted on create and update.',
         examples=['BLOCK'],
     )
+    aiAnomaly: Optional[LinkedAlertResourceWrite] = None
+    aiAnomalyId: Optional[str] = Field(
+        None,
+        description="The id of one active alert of the budget's team to link to this budget. A link only adds that alert's changes to the budget's change history; it does not change when the budget or the alert fires. Resending the budget's current link is always accepted. Omit a field to keep its current value. Send null to clear it.",
+        examples=['xK9mPq2'],
+    )
+    changeReason: Optional[constr(max_length=500)] = Field(
+        None,
+        description='Why you are making this change. Optional plain text, trimmed, up to 500 characters; an empty value means no reason. Write-only: it is never returned on this item. Read it back as `reason` on the change history entries and in the change history CSV export. A reason sent with a save that changes nothing is dropped, unless the save is recorded anyway because a different person or API key made it.',
+        examples=['Raised for the Q4 launch'],
+    )
     created: Optional[str] = Field(
         None,
         description='The creation timestamp (ISO 8601 extended date-time format)',
@@ -9825,7 +10411,7 @@ class CostControlResourceWrite(BaseModel):
     )
     createdBy: Optional[str] = Field(
         None,
-        description='Who created this rule: the user\'s email address; for an API key, its owner\'s email followed by "via API key" and the key\'s id and name; "Revenium Support" when Revenium staff made the change. Empty for rules created before this was recorded.',
+        description='Who created this rule: the user\'s email address; for an API key, its owner\'s email followed by "via API key" and the key\'s id and name; "Revenium Support" when Revenium staff made the change. Empty for rules created before this was recorded. A Member sees the author\'s role, `administrator`, instead of a name; a Department Admin sees the name only on a rule over a department they administer.',
         examples=['user@example.com'],
     )
     denyMessage: Optional[constr(max_length=2000)] = Field(
@@ -9869,6 +10455,11 @@ class CostControlResourceWrite(BaseModel):
         description="The rule's label (automatically set to the rule name)",
         examples=['Monthly OpenAI Cap'],
     )
+    locked: Optional[bool] = Field(
+        None,
+        description="Present only for a Member or Department Admin. True when the rule binds them but its figure is not theirs to see: a per-person limit on a metric other than cost inside a department, whose total is one person's balance, or a per-department limit on a metric other than cost. Its spend is not shown to them anywhere. False when they may see the rule's spend: in full when every figure on it is theirs, including the total of a shared limit they are under, such as a company-wide limit or a limit on a department above theirs, or only their own rows on a rule split per person or per department. Their answer also leaves out `notificationChannelIds`, `notificationEmails` and any person a filter names outside their scope, and gives `createdBy` and `modifiedBy` as the author's role wherever it may not name them.",
+        examples=[True],
+    )
     metricType: Optional[MetricType6] = Field(
         ...,
         description='The AI metric the rule evaluates against',
@@ -9879,7 +10470,7 @@ class CostControlResourceWrite(BaseModel):
         description='Who last created, changed or deleted this rule, in the same form as createdBy.',
         examples=['user@example.com via API key 5jW1GD (ci-bot)'],
     )
-    name: Optional[str] = Field(
+    name: Optional[constr(min_length=1)] = Field(
         ..., description='Display name for this rule', examples=['Monthly OpenAI Cap']
     )
     notificationChannelIds: Optional[list[str]] = Field(
@@ -9898,7 +10489,7 @@ class CostControlResourceWrite(BaseModel):
     )
     shadowMode: Optional[bool] = Field(
         None,
-        description='When true, the rule evaluates without actually blocking. Use it to validate limits before enforcing them.',
+        description='When true, the rule records events, sends Slack and email notifications as previews, and blocks nothing; webhooks do not fire. Use it to validate limits before enforcing them.',
         examples=[True],
     )
     team: Any = None
@@ -9935,7 +10526,7 @@ class CredentialResource(BaseModel):
         description='The creation timestamp (ISO 8601 extended date-time format, e.g., 2024-09-01T00:00:00Z)',
         examples=['2024-09-01T00:00:00Z'],
     )
-    externalId: str = Field(
+    externalId: constr(min_length=1) = Field(
         ...,
         description="The ID your customer sends with their usage data (as subscriberCredential), for example their API key ID. Usage carrying this value is attributed to this credential's subscriber and organization. Responses show it masked, as three dots and its last four characters, for example ...9c2e.",
         examples=['ak_live_7f3a9c2e'],
@@ -9957,7 +10548,7 @@ class CredentialResource(BaseModel):
         description="A display label. Set automatically to the credential's name.",
         examples=['Acme Production Key'],
     )
-    name: str = Field(
+    name: constr(min_length=1) = Field(
         ...,
         description="The credential's name. Must be unique within the customer organization.",
         examples=['Acme Production Key'],
@@ -10016,7 +10607,7 @@ class CredentialResourceRead(BaseModel):
         description='The creation timestamp (ISO 8601 extended date-time format, e.g., 2024-09-01T00:00:00Z)',
         examples=['2024-09-01T00:00:00Z'],
     )
-    externalId: str = Field(
+    externalId: constr(min_length=1) = Field(
         ...,
         description="The ID your customer sends with their usage data (as subscriberCredential), for example their API key ID. Usage carrying this value is attributed to this credential's subscriber and organization. Responses show it masked, as three dots and its last four characters, for example ...9c2e.",
         examples=['ak_live_7f3a9c2e'],
@@ -10038,7 +10629,7 @@ class CredentialResourceRead(BaseModel):
         description="A display label. Set automatically to the credential's name.",
         examples=['Acme Production Key'],
     )
-    name: str = Field(
+    name: constr(min_length=1) = Field(
         ...,
         description="The credential's name. Must be unique within the customer organization.",
         examples=['Acme Production Key'],
@@ -10097,7 +10688,7 @@ class CredentialResourceWrite(BaseModel):
         description='The creation timestamp (ISO 8601 extended date-time format, e.g., 2024-09-01T00:00:00Z)',
         examples=['2024-09-01T00:00:00Z'],
     )
-    externalId: str = Field(
+    externalId: constr(min_length=1) = Field(
         ...,
         description="The ID your customer sends with their usage data (as subscriberCredential), for example their API key ID. Usage carrying this value is attributed to this credential's subscriber and organization. Responses show it masked, as three dots and its last four characters, for example ...9c2e.",
         examples=['ak_live_7f3a9c2e'],
@@ -10119,7 +10710,7 @@ class CredentialResourceWrite(BaseModel):
         description="A display label. Set automatically to the credential's name.",
         examples=['Acme Production Key'],
     )
-    name: str = Field(
+    name: constr(min_length=1) = Field(
         ...,
         description="The credential's name. Must be unique within the customer organization.",
         examples=['Acme Production Key'],
@@ -10237,6 +10828,161 @@ class EnforcementEventHistoryPageResourceRead(BaseModel):
     )
 
 
+class EnforcementEventResourceRead(BaseModel):
+    """
+    Enforcement event: a record that a cost control was evaluated against incoming AI usage. An event where the limit was reached means the request was blocked (`ENFORCEMENT_VIOLATION`) or would have been blocked if shadow mode were disabled (`ENFORCEMENT_SHADOW_VIOLATION`). A warn-tier event means the rule's warning line was crossed without the cap being reached (`ENFORCEMENT_WARN`, or `ENFORCEMENT_SHADOW_WARN` in shadow mode); nothing was blocked. Use `level` to tell the two tiers apart, and the endpoint's `level` query parameter to select them. It defaults to events where the limit was reached only. `rawDetails` holds the full event text for any field that could not be read.
+    """
+
+    field_links: Optional[dict[str, Link]] = Field(None, alias='_links')
+    action: Optional[Action3] = Field(
+        None,
+        description='The enforcement action declared by the rule at the time of evaluation. An older rule can report an action that is no longer accepted on create or update; it has no effect.',
+        examples=['BLOCK'],
+    )
+    apiKeyHint: Optional[str] = Field(
+        None,
+        description='Masked API-key hint associated with the request that triggered the evaluation (e.g. `hak_…9c02`).',
+        examples=['hak_…9c02'],
+    )
+    created: Optional[str] = Field(
+        None,
+        description='The event timestamp (ISO 8601 extended date-time format)',
+        examples=['2026-04-21T10:00:00Z'],
+    )
+    currentValue: Optional[float] = Field(
+        None,
+        description='The accumulated value over the rolling window at the moment of evaluation',
+        examples=[105.5],
+    )
+    groupBy: Optional[GroupBy7] = Field(
+        None,
+        description='Which dimension `groupValue` names. Null for a pooled rule, and for events written before this field existed.',
+        examples=['SUBSCRIBER'],
+    )
+    groupLabel: Optional[str] = Field(
+        None,
+        description="Display name of the object `groupValue` identifies. On a rule grouped by department this is the department's name. For every other dimension, and whenever the department cannot be resolved (renamed away, deleted, or owned by another team), it repeats `groupValue`, so you can compare the two and show the identifier once. Null exactly when `groupValue` is null. Display only: send `groupValue` back when you filter.",
+        examples=['Data Science'],
+    )
+    groupValue: Optional[str] = Field(
+        None,
+        description='For a rule grouped by subscriber or department, the group this event belongs to: the subscriber key (usually an email address) or the Revenium-generated identifier of the department. Null for a pooled rule, and for events written before this field existed.',
+        examples=['jane@acme.com'],
+    )
+    id: Optional[str] = Field(
+        None,
+        description='The Revenium-generated identifier of the event',
+        examples=['jR2kmLs'],
+    )
+    isShadow: Optional[bool] = Field(
+        None,
+        description='True when this event was produced by a shadow-mode evaluation (no real block was performed)',
+        examples=[False],
+    )
+    label: Optional[str] = Field(
+        None, description='Display label (the rule name when known)'
+    )
+    level: Optional[Level] = Field(
+        None,
+        description="Which tier of the rule this event records. `HARD` when it records a cap breach, or a would-be breach in shadow mode. `WARN` when it records a warning-line crossing, where nothing was blocked. Warn events are excluded from the endpoint's default listing.",
+        examples=['HARD'],
+    )
+    metricType: Optional[MetricType9] = Field(
+        None, description='The metric the rule was evaluating', examples=['TOTAL_COST']
+    )
+    model: Optional[str] = Field(
+        None,
+        description='The AI model the request named, as the request reported it. Null on events written before this field existed, and on an event whose request carried no model.',
+        examples=['gpt-4'],
+    )
+    operation: Optional[str] = Field(
+        None,
+        description='The kind of event recorded: `ENFORCEMENT_VIOLATION` (enforced block), `ENFORCEMENT_SHADOW_VIOLATION` (would-block), `ENFORCEMENT_WARN` (warning line crossed) or `ENFORCEMENT_SHADOW_WARN` (would-warn)',
+        examples=['ENFORCEMENT_VIOLATION'],
+    )
+    outcome: Optional[Outcome] = Field(
+        None,
+        description='What this event records having happened, as opposed to `action`, which is the action the rule was configured with. `BLOCKED` when the request was refused, `WARNED` when a warning line was crossed and nothing was refused, and `WOULD_BLOCK` or `WOULD_WARN` when a shadow-mode rule did neither. Null on older events. Use `operation` for those.',
+        examples=['BLOCKED'],
+    )
+    provider: Optional[str] = Field(
+        None,
+        description='The AI provider the request named, as the request reported it. Null on events written before this field existed, and on an event whose request carried no provider.',
+        examples=['OpenAI'],
+    )
+    rawDetails: Optional[str] = Field(
+        None,
+        description='The full event text. Use it when a structured field is empty.',
+    )
+    resourceType: Optional[str] = Field(
+        None,
+        description='The type of object (automatically set by the system)',
+        examples=['enforcement_event'],
+    )
+    ruleDeleted: Optional[bool] = Field(
+        None,
+        description='True when the cost control (rule) that `ruleId` names has since been deleted. False when the rule still exists, and false when `ruleId` is null.',
+        examples=[False],
+    )
+    ruleId: Optional[str] = Field(
+        None,
+        description='Revenium-generated identifier of the cost control this event was produced by. Null when the rule was deleted and could not be matched by name.',
+        examples=['jR2kmLs'],
+    )
+    ruleName: Optional[str] = Field(
+        None,
+        description='Display name of the cost control that was violated.',
+        examples=['Monthly OpenAI Cap'],
+    )
+    subscriberEmail: Optional[str] = Field(
+        None,
+        description='Email address of the person the rule was evaluated for. Carried beside `groupValue`, never instead of it, because a subscriber known by an opaque id has that id as the group key and would otherwise appear with no address at all. For a subscriber known only by email, `groupValue` and this field hold the same address, so show it once if you display both. Null on events written before this field existed, and on a request that carried no subscriber email.',
+        examples=['jane@acme.com'],
+    )
+    tenantId: Optional[str] = Field(
+        None,
+        description='Your account identifier for the request that triggered the rule. On a grouped rule the group is reported separately in `groupValue`.',
+    )
+    threshold: Optional[float] = Field(
+        None,
+        description='The configured hard limit the rule evaluated against',
+        examples=[100.0],
+    )
+    tier: Optional[Tier] = Field(
+        None,
+        description='Which line this event crossed: `HARD` for the cap, `WARN` for the warning line. Differs from `level` only when a non-blocking rule crosses its cap: nothing was blocked, so `level` is `WARN`.',
+        examples=['HARD'],
+    )
+    transactionId: Optional[str] = Field(
+        None,
+        description='Identifier of the AI request the rule was evaluated against. An enforced block refuses the request before it is metered, so on such an event this names the request that tripped the rule rather than a stored transaction. Null on events written before this field existed.',
+        examples=['a3f1c8e2-5b60-4d19-9a77-0f2b4c6d8e10'],
+    )
+    updated: Optional[str] = Field(
+        None, description='Events cannot be changed; this mirrors `created`'
+    )
+    usagePercent: Optional[float] = Field(
+        None,
+        description='Current value as a percentage of threshold (if known)',
+        examples=[105.5],
+    )
+
+
+class EnforcementEventUncountedEmbeddedRead(BaseModel):
+    enforcementEventResourceList: Optional[list[EnforcementEventResourceRead]] = None
+
+
+class EnforcementEventUncountedPagedModelRead(BaseModel):
+    """
+    A page of enforcement events read without counting the matching events (includeTotal=false).
+    """
+
+    field_embedded: Optional[EnforcementEventUncountedEmbeddedRead] = Field(
+        None, alias='_embedded'
+    )
+    page: Optional[EnforcementEventUncountedPageRead] = None
+
+
 class EnforcementRuleRosterResource(BaseModel):
     blockedCount: Optional[int] = Field(
         None,
@@ -10324,6 +11070,10 @@ class EnforcementRulesPayload(BaseModel):
         None
     )
     departmentBudgetWarnings: Optional[dict[str, int]] = None
+    lockedRules: Optional[list[LockedEnforcementRule]] = Field(
+        None,
+        description="Only for a Member or Department Admin: the rules that bind them but whose figure is not theirs to see: a per-person limit on a metric other than cost inside a department, whose total is one person's balance, a per-department limit on a metric other than cost, or a rule whose per-person figures could not be read. Each carries its limit and whether it is crossed, never its spend. A shared limit they are under, such as a company-wide limit, stays in `rules` with the pool's spend. Absent for everyone else, whose `rules` hold every rule.",
+    )
     rules: Optional[list[CompiledEnforcementRule]] = None
     session: Optional[SessionIdentityResource] = None
 
@@ -10334,6 +11084,11 @@ class EntityModelAIAnomalyResourceRead(BaseModel):
         ...,
         description='The monitoring strategy of the alert rule. THRESHOLD monitors for absolute values exceeding a threshold, RELATIVE_CHANGE monitors for percentage changes between periods, CUMULATIVE_USAGE monitors for total usage over a period',
         examples=['THRESHOLD'],
+    )
+    changeReason: Optional[constr(max_length=500)] = Field(
+        None,
+        description='Why you are making this change. Optional plain text, trimmed, up to 500 characters; an empty value means no reason. Write-only: it is never returned on this item. Read it back as `reason` on the change history entries and in the change history CSV export. A reason sent with a save that changes nothing is dropped, unless the save is recorded anyway because a different person or API key made it.',
+        examples=['Threshold lowered after the October invoice'],
     )
     created: Optional[str] = Field(
         None,
@@ -10374,7 +11129,7 @@ class EntityModelAIAnomalyResourceRead(BaseModel):
         description='Whether this alert rule is firing right now: FIRING, NOT_FIRING, or UNKNOWN when it could not be read just now. Filled on list and get only; absent elsewhere, including the rule nested in alert history. A disabled rule can keep its last state; check `enabled` first. Prefer this over `firing`, which is not kept current.',
         examples=['FIRING'],
     )
-    groupBy: Optional[GroupBy7] = Field(
+    groupBy: Optional[GroupBy8] = Field(
         None,
         description='The dimension by which to group monitoring. When specified, the alert rule is evaluated separately for each unique value of this dimension (e.g., per ORGANIZATION, per MODEL, per PRODUCT)',
         examples=['MODEL'],
@@ -10393,7 +11148,7 @@ class EntityModelAIAnomalyResourceRead(BaseModel):
         description='The label of the alert rule, automatically set to its name',
         examples=['High Cost Anomaly - GPT-4'],
     )
-    metricType: MetricType9 = Field(
+    metricType: MetricType10 = Field(
         ...,
         description='The AI metric to monitor. Cost metrics track spending, token metrics track usage, performance metrics track latency and duration, error metrics track failures',
         examples=['TOTAL_COST'],
@@ -10891,6 +11646,7 @@ class EntityModelAIModelResourceRead(BaseModel):
         description='The cost per input token for cache reads in USD (for models that support prompt caching). Omit it to leave the leg unpriced; send 0 to price it at zero.',
         examples=[1e-06],
     )
+    contextPricing: Optional[AIModelContextPricingResourceRead] = None
     created: Optional[str] = Field(
         None,
         description='The creation timestamp (ISO 8601 extended date-time format, e.g., 2024-09-01T00:00:00Z)',
@@ -10981,7 +11737,7 @@ class EntityModelAIModelResourceRead(BaseModel):
     )
     team: Optional[ResourceMetadataRead] = None
     teamId: Optional[str] = Field(
-        None,
+        ...,
         description='The unique identifier of the team that owns this AI model configuration. This field should be included in the request body when creating a new AI model.',
         examples=['a91XJp'],
     )
@@ -11070,7 +11826,7 @@ class EntityModelBudgetPortfolioItemResource(BaseModel):
         description='Grouped budgets only: groups whose currentValue is at or above the threshold (threshold above zero)',
         examples=[0],
     )
-    metricType: Optional[MetricType10] = Field(
+    metricType: Optional[MetricType11] = Field(
         None, description='Metric type being tracked', examples=['TOTAL_COST']
     )
     name: Optional[str] = Field(
@@ -11106,10 +11862,21 @@ class EntityModelBudgetPortfolioItemResource(BaseModel):
 
 class EntityModelCostControlResourceRead(BaseModel):
     field_links: Optional[dict[str, Link]] = Field(None, alias='_links')
-    action: Optional[Action] = Field(
+    action: Optional[Action4] = Field(
         ...,
         description='Enforcement action taken when `hardLimit` is crossed (and rule is not in shadow mode). Only `BLOCK` and `WARN_ONLY` are accepted on create and update.',
         examples=['BLOCK'],
+    )
+    aiAnomaly: Optional[LinkedAlertResourceRead] = None
+    aiAnomalyId: Optional[str] = Field(
+        None,
+        description="The id of one active alert of the budget's team to link to this budget. A link only adds that alert's changes to the budget's change history; it does not change when the budget or the alert fires. Resending the budget's current link is always accepted. Omit a field to keep its current value. Send null to clear it.",
+        examples=['xK9mPq2'],
+    )
+    changeReason: Optional[constr(max_length=500)] = Field(
+        None,
+        description='Why you are making this change. Optional plain text, trimmed, up to 500 characters; an empty value means no reason. Write-only: it is never returned on this item. Read it back as `reason` on the change history entries and in the change history CSV export. A reason sent with a save that changes nothing is dropped, unless the save is recorded anyway because a different person or API key made it.',
+        examples=['Raised for the Q4 launch'],
     )
     created: Optional[str] = Field(
         None,
@@ -11118,7 +11885,7 @@ class EntityModelCostControlResourceRead(BaseModel):
     )
     createdBy: Optional[str] = Field(
         None,
-        description='Who created this rule: the user\'s email address; for an API key, its owner\'s email followed by "via API key" and the key\'s id and name; "Revenium Support" when Revenium staff made the change. Empty for rules created before this was recorded.',
+        description='Who created this rule: the user\'s email address; for an API key, its owner\'s email followed by "via API key" and the key\'s id and name; "Revenium Support" when Revenium staff made the change. Empty for rules created before this was recorded. A Member sees the author\'s role, `administrator`, instead of a name; a Department Admin sees the name only on a rule over a department they administer.',
         examples=['user@example.com'],
     )
     denyMessage: Optional[constr(max_length=2000)] = Field(
@@ -11142,7 +11909,7 @@ class EntityModelCostControlResourceRead(BaseModel):
         None,
         description='Optional filter predicates narrowing which AI metric events the rule applies to. PATCH: passing an empty list clears all filters; passing a non-empty list replaces the set.',
     )
-    groupBy: Optional[GroupBy8] = Field(
+    groupBy: Optional[GroupBy9] = Field(
         None,
         description='Optional dimension to partition the rule evaluation (per-model, per-provider, etc.). Omit a field to keep its current value. Send null to clear it.',
         examples=['MODEL'],
@@ -11162,7 +11929,12 @@ class EntityModelCostControlResourceRead(BaseModel):
         description="The rule's label (automatically set to the rule name)",
         examples=['Monthly OpenAI Cap'],
     )
-    metricType: Optional[MetricType11] = Field(
+    locked: Optional[bool] = Field(
+        None,
+        description="Present only for a Member or Department Admin. True when the rule binds them but its figure is not theirs to see: a per-person limit on a metric other than cost inside a department, whose total is one person's balance, or a per-department limit on a metric other than cost. Its spend is not shown to them anywhere. False when they may see the rule's spend: in full when every figure on it is theirs, including the total of a shared limit they are under, such as a company-wide limit or a limit on a department above theirs, or only their own rows on a rule split per person or per department. Their answer also leaves out `notificationChannelIds`, `notificationEmails` and any person a filter names outside their scope, and gives `createdBy` and `modifiedBy` as the author's role wherever it may not name them.",
+        examples=[True],
+    )
+    metricType: Optional[MetricType12] = Field(
         ...,
         description='The AI metric the rule evaluates against',
         examples=['TOTAL_COST'],
@@ -11191,7 +11963,7 @@ class EntityModelCostControlResourceRead(BaseModel):
     )
     shadowMode: Optional[bool] = Field(
         None,
-        description='When true, the rule evaluates without actually blocking. Use it to validate limits before enforcing them.',
+        description='When true, the rule records events, sends Slack and email notifications as previews, and blocks nothing; webhooks do not fire. Use it to validate limits before enforcing them.',
         examples=[True],
     )
     team: Optional[ResourceMetadataRead] = None
@@ -11224,7 +11996,7 @@ class EntityModelCredentialResource(BaseModel):
         description='The creation timestamp (ISO 8601 extended date-time format, e.g., 2024-09-01T00:00:00Z)',
         examples=['2024-09-01T00:00:00Z'],
     )
-    externalId: str = Field(
+    externalId: constr(min_length=1) = Field(
         ...,
         description="The ID your customer sends with their usage data (as subscriberCredential), for example their API key ID. Usage carrying this value is attributed to this credential's subscriber and organization. Responses show it masked, as three dots and its last four characters, for example ...9c2e.",
         examples=['ak_live_7f3a9c2e'],
@@ -11246,7 +12018,7 @@ class EntityModelCredentialResource(BaseModel):
         description="A display label. Set automatically to the credential's name.",
         examples=['Acme Production Key'],
     )
-    name: str = Field(
+    name: constr(min_length=1) = Field(
         ...,
         description="The credential's name. Must be unique within the customer organization.",
         examples=['Acme Production Key'],
@@ -11301,7 +12073,7 @@ class EntityModelCredentialResourceRead(BaseModel):
         description='The creation timestamp (ISO 8601 extended date-time format, e.g., 2024-09-01T00:00:00Z)',
         examples=['2024-09-01T00:00:00Z'],
     )
-    externalId: str = Field(
+    externalId: constr(min_length=1) = Field(
         ...,
         description="The ID your customer sends with their usage data (as subscriberCredential), for example their API key ID. Usage carrying this value is attributed to this credential's subscriber and organization. Responses show it masked, as three dots and its last four characters, for example ...9c2e.",
         examples=['ak_live_7f3a9c2e'],
@@ -11323,7 +12095,7 @@ class EntityModelCredentialResourceRead(BaseModel):
         description="A display label. Set automatically to the credential's name.",
         examples=['Acme Production Key'],
     )
-    name: str = Field(
+    name: constr(min_length=1) = Field(
         ...,
         description="The credential's name. Must be unique within the customer organization.",
         examples=['Acme Production Key'],
@@ -11431,7 +12203,7 @@ class EntityModelDiscoveredAgentResourceRead(BaseModel):
 
 class EntityModelEnforcementEventResourceRead(BaseModel):
     field_links: Optional[dict[str, Link]] = Field(None, alias='_links')
-    action: Optional[Action4] = Field(
+    action: Optional[Action5] = Field(
         None,
         description='The enforcement action declared by the rule at the time of evaluation. An older rule can report an action that is no longer accepted on create or update; it has no effect.',
         examples=['BLOCK'],
@@ -11451,7 +12223,7 @@ class EntityModelEnforcementEventResourceRead(BaseModel):
         description='The accumulated value over the rolling window at the moment of evaluation',
         examples=[105.5],
     )
-    groupBy: Optional[GroupBy9] = Field(
+    groupBy: Optional[GroupBy10] = Field(
         None,
         description='Which dimension `groupValue` names. Null for a pooled rule, and for events written before this field existed.',
         examples=['SUBSCRIBER'],
@@ -11484,7 +12256,7 @@ class EntityModelEnforcementEventResourceRead(BaseModel):
         description="Which tier of the rule this event records. `HARD` when it records a cap breach, or a would-be breach in shadow mode. `WARN` when it records a warning-line crossing, where nothing was blocked. Warn events are excluded from the endpoint's default listing.",
         examples=['HARD'],
     )
-    metricType: Optional[MetricType12] = Field(
+    metricType: Optional[MetricType13] = Field(
         None, description='The metric the rule was evaluating', examples=['TOTAL_COST']
     )
     model: Optional[str] = Field(
@@ -11675,7 +12447,7 @@ class EntityModelInvoiceResourceRead(BaseModel):
         description='The start date of the billing period covered by this invoice in ISO 8601 extended date-time format',
         examples=['2024-09-01T00:00:00Z'],
     )
-    state: Optional[State1] = Field(
+    state: Optional[State2] = Field(
         None,
         description='The current state of the invoice in its lifecycle',
         examples=['ISSUED'],
@@ -11855,7 +12627,7 @@ class EntityModelMeteringElementDefinitionResourceRead(BaseModel):
         description="The metering element's label (automatically set to the element name for display purposes)",
         examples=['country'],
     )
-    name: str = Field(
+    name: constr(min_length=1) = Field(
         ...,
         description='The name of the metering element definition',
         examples=['definition one'],
@@ -11866,7 +12638,7 @@ class EntityModelMeteringElementDefinitionResourceRead(BaseModel):
         examples=['metering_element_definition'],
     )
     team: Optional[ResourceMetadataRead] = None
-    teamId: Optional[str] = Field(
+    teamId: Optional[constr(min_length=1)] = Field(
         ...,
         description='The unique identifier of the team that owns this metering element definition',
         examples=['a91XJp'],
@@ -11948,7 +12720,7 @@ class EntityModelOrganizationResourceRead(BaseModel):
         description="The organization's metadata (in key / value pairs)",
         examples=["{'key1': 'value1', 'key2': 'value2'}"],
     )
-    name: str = Field(
+    name: constr(min_length=1) = Field(
         ...,
         description='The name of the organization',
         examples=['Weyland-Yutani Corporation'],
@@ -11982,7 +12754,7 @@ class EntityModelOrganizationResourceRead(BaseModel):
         None, description="The organization's state address", examples=['NY']
     )
     tenant: Optional[ResourceMetadataRead]
-    tenantId: Optional[str] = Field(
+    tenantId: Optional[constr(min_length=1)] = Field(
         ...,
         description='The ID of the account that owns this customer organization. Format: Revenium hashid (URL-safe encoded string).',
         examples=['6PV0xe'],
@@ -12262,14 +13034,6 @@ class EntityModelSourceResourceRead(BaseModel):
         description='Whether or not the source is auto-discovered',
         examples=[False],
     )
-    contractIds: Optional[list[str]] = Field(
-        None,
-        description='The API contract/specifications IDs associated with the source',
-        examples=[['af75417c71d24e708f506596ce5ab675']],
-    )
-    contracts: Optional[list[ResourceMetadataRead]] = Field(
-        None, description='The API contract/specifications associated with the source'
-    )
     created: Optional[str] = Field(
         None,
         description='The creation timestamp (ISO 8601 extended date-time format, e.g., 2024-09-01T00:00:00Z)',
@@ -12331,11 +13095,11 @@ class EntityModelSourceResourceRead(BaseModel):
     method: Optional[str] = Field(
         None, description="The source's method", examples=['GET']
     )
-    name: str = Field(
+    name: constr(min_length=1) = Field(
         ..., description='The name of the source', examples=['my-awesome-source']
     )
     owner: Optional[ResourceMetadataRead] = None
-    ownerId: Optional[str] = Field(
+    ownerId: Optional[constr(min_length=1)] = Field(
         ...,
         description='The unique identifier of the source owner',
         examples=['LjRrbJ'],
@@ -12376,7 +13140,9 @@ class EntityModelSourceResourceRead(BaseModel):
         description='The updated timestamp (ISO 8601 extended date-time format, e.g., 2024-09-01T00:00:00Z)',
         examples=['2024-09-01T00:00:00Z'],
     )
-    version: str = Field(..., description="The source's version", examples=['1.0.0'])
+    version: constr(min_length=1) = Field(
+        ..., description="The source's version", examples=['1.0.0']
+    )
 
 
 class EntityModelSubscriberResourceRead(BaseModel):
@@ -12386,7 +13152,7 @@ class EntityModelSubscriberResourceRead(BaseModel):
         description='The creation timestamp (ISO 8601 extended date-time format, e.g., 2024-09-01T00:00:00Z)',
         examples=['2024-09-01T00:00:00Z'],
     )
-    email: str = Field(
+    email: constr(min_length=1) = Field(
         ...,
         description='The email address of the user',
         examples=['ash@weyland-yutani.io'],
@@ -12403,10 +13169,11 @@ class EntityModelSubscriberResourceRead(BaseModel):
     lastName: Optional[str] = Field(
         None, description='The last name of the user', examples=['Williams']
     )
-    organizationIds: Optional[list[str]] = Field(
-        None,
+    organizationIds: list[str] = Field(
+        ...,
         description='The organization IDs the user belongs to',
         examples=[['6PV0xe']],
+        min_length=1,
     )
     organizations: Optional[list[ResourceMetadataRead]] = Field(
         None, description='The organizations the user belongs to'
@@ -12527,13 +13294,13 @@ class EntityModelUserResourceRead(BaseModel):
         description='The ID of the default team to load on login',
         examples=['a91XJp'],
     )
-    email: str = Field(
+    email: constr(min_length=1) = Field(
         ...,
         description='The email address of the user',
         examples=['ash@weyland-yutani.io'],
     )
-    firstName: Optional[str] = Field(
-        None, description='The first name of the user', examples=['Ash']
+    firstName: Optional[constr(min_length=1)] = Field(
+        ..., description='The first name of the user', examples=['Ash']
     )
     homepagePreference: Optional[HomepagePreference] = Field(
         None, description="The user's homepage preference", examples=['PRODUCTS']
@@ -12544,8 +13311,8 @@ class EntityModelUserResourceRead(BaseModel):
         description="The user's label (automatically set to the email address for display purposes)",
         examples=['ash@weyland-yutani.io'],
     )
-    lastName: Optional[str] = Field(
-        None, description='The last name of the user', examples=['Williams']
+    lastName: Optional[constr(min_length=1)] = Field(
+        ..., description='The last name of the user', examples=['Williams']
     )
     navCustomization: Optional[NavCustomizationRead] = None
     persona: Optional[Persona] = Field(
@@ -12572,7 +13339,10 @@ class EntityModelUserResourceRead(BaseModel):
         None, description='The type of object', examples=['user']
     )
     roles: list[str] = Field(
-        ..., description='The roles of the user', examples=[['ROLE_API_CONSUMER']]
+        ...,
+        description='The roles of the user',
+        examples=[['ROLE_API_CONSUMER']],
+        min_length=1,
     )
     scheduledForDeletionAt: Optional[str] = Field(
         None,
@@ -12582,10 +13352,11 @@ class EntityModelUserResourceRead(BaseModel):
     subscriberId: Optional[str] = Field(
         None, description='The ID of the subscriber', examples=['pEjxgX']
     )
-    teamIds: Optional[list[str]] = Field(
-        None,
+    teamIds: list[str] = Field(
+        ...,
         description='The IDs of the teams the user belongs to',
         examples=[['a91XJp']],
+        min_length=1,
     )
     teams: Optional[list[TeamMetadataRead]] = Field(
         None, description='The teams the user belongs to'
@@ -12868,12 +13639,13 @@ class JobTypeEconomicsRequest(BaseModel):
         None,
         description='The dimensions you can attach to period facts, each with its allowed values. Optional, at most 20.',
     )
-    metrics: Optional[list[JobTypeMetricDefinition]] = Field(
-        None,
+    metrics: list[JobTypeMetricDefinition] = Field(
+        ...,
         description='The metrics you report for this job type. At least one, at most 100, each key unique.',
+        min_length=1,
     )
     monetization: Optional[JobTypeMonetization] = None
-    overheadCurrency: Optional[str] = Field(
+    overheadCurrency: Optional[constr(min_length=0, max_length=3)] = Field(
         None,
         description='Optional. Currency of overheadPerUnit. Must be USD today, and sent together with overheadPerUnit.',
         examples=['USD'],
@@ -12883,13 +13655,13 @@ class JobTypeEconomicsRequest(BaseModel):
         description='Optional. Your overhead cost for each unit of work, in USD. Zero or more, at most 1,000,000,000. Send it together with overheadCurrency.',
         examples=[0.25],
     )
-    unitLabel: Optional[str] = Field(
-        None,
+    unitLabel: constr(min_length=0, max_length=64) = Field(
+        ...,
         description='Label shown for the unit of work. At most 64 characters.',
         examples=['invoices'],
     )
-    unitMetricKey: Optional[str] = Field(
-        None,
+    unitMetricKey: constr(min_length=0, max_length=64) = Field(
+        ...,
         description='The key of the metric that counts one unit of work. It must be one of the declared metrics and must have type COUNT. At most 64 characters.',
         examples=['invoices_processed'],
     )
@@ -12973,7 +13745,7 @@ class MeteringElementDefinitionResource(BaseModel):
         description="The metering element's label (automatically set to the element name for display purposes)",
         examples=['country'],
     )
-    name: str = Field(
+    name: constr(min_length=1) = Field(
         ...,
         description='The name of the metering element definition',
         examples=['definition one'],
@@ -12984,7 +13756,7 @@ class MeteringElementDefinitionResource(BaseModel):
         examples=['metering_element_definition'],
     )
     team: Optional[ResourceMetadata] = None
-    teamId: Optional[str] = Field(
+    teamId: Optional[constr(min_length=1)] = Field(
         ...,
         description='The unique identifier of the team that owns this metering element definition',
         examples=['a91XJp'],
@@ -13028,7 +13800,7 @@ class MeteringElementDefinitionResourceRead(BaseModel):
         description="The metering element's label (automatically set to the element name for display purposes)",
         examples=['country'],
     )
-    name: str = Field(
+    name: constr(min_length=1) = Field(
         ...,
         description='The name of the metering element definition',
         examples=['definition one'],
@@ -13039,7 +13811,7 @@ class MeteringElementDefinitionResourceRead(BaseModel):
         examples=['metering_element_definition'],
     )
     team: Optional[ResourceMetadataRead] = None
-    teamId: Optional[str] = Field(
+    teamId: Optional[constr(min_length=1)] = Field(
         ...,
         description='The unique identifier of the team that owns this metering element definition',
         examples=['a91XJp'],
@@ -13083,7 +13855,7 @@ class MeteringElementDefinitionResourceWrite(BaseModel):
         description="The metering element's label (automatically set to the element name for display purposes)",
         examples=['country'],
     )
-    name: str = Field(
+    name: constr(min_length=1) = Field(
         ...,
         description='The name of the metering element definition',
         examples=['definition one'],
@@ -13094,7 +13866,7 @@ class MeteringElementDefinitionResourceWrite(BaseModel):
         examples=['metering_element_definition'],
     )
     team: Any = None
-    teamId: Optional[str] = Field(
+    teamId: Optional[constr(min_length=1)] = Field(
         ...,
         description='The unique identifier of the team that owns this metering element definition',
         examples=['a91XJp'],
@@ -13190,7 +13962,7 @@ class OrganizationResource(BaseModel):
         description="The organization's metadata (in key / value pairs)",
         examples=["{'key1': 'value1', 'key2': 'value2'}"],
     )
-    name: str = Field(
+    name: constr(min_length=1) = Field(
         ...,
         description='The name of the organization',
         examples=['Weyland-Yutani Corporation'],
@@ -13224,7 +13996,7 @@ class OrganizationResource(BaseModel):
         None, description="The organization's state address", examples=['NY']
     )
     tenant: Optional[ResourceMetadata]
-    tenantId: Optional[str] = Field(
+    tenantId: Optional[constr(min_length=1)] = Field(
         ...,
         description='The ID of the account that owns this customer organization. Format: Revenium hashid (URL-safe encoded string).',
         examples=['6PV0xe'],
@@ -13315,7 +14087,7 @@ class OrganizationResourceRead(BaseModel):
         description="The organization's metadata (in key / value pairs)",
         examples=["{'key1': 'value1', 'key2': 'value2'}"],
     )
-    name: str = Field(
+    name: constr(min_length=1) = Field(
         ...,
         description='The name of the organization',
         examples=['Weyland-Yutani Corporation'],
@@ -13349,7 +14121,7 @@ class OrganizationResourceRead(BaseModel):
         None, description="The organization's state address", examples=['NY']
     )
     tenant: Optional[ResourceMetadataRead]
-    tenantId: Optional[str] = Field(
+    tenantId: Optional[constr(min_length=1)] = Field(
         ...,
         description='The ID of the account that owns this customer organization. Format: Revenium hashid (URL-safe encoded string).',
         examples=['6PV0xe'],
@@ -13526,7 +14298,7 @@ class ProviderRatioItemRead(BaseModel):
     )
     billing: Optional[float] = Field(
         None,
-        description='Billing cost for this provider in the period',
+        description='Billing cost for this provider over comparisonStartDate to comparisonEndDate, the window it is compared with metered cost in. Zero on a no-overlap row. See periodBilling for the whole requested period.',
         examples=[15.0],
     )
     billingCredentialConnected: Optional[bool] = Field(
@@ -13586,8 +14358,13 @@ class ProviderRatioItemRead(BaseModel):
     )
     metered: Optional[float] = Field(
         None,
-        description='Metered cost for this provider in the period',
+        description='Metered cost for this provider over comparisonStartDate to comparisonEndDate',
         examples=[12.5],
+    )
+    periodBilling: Optional[float] = Field(
+        None,
+        description='Billing cost for this provider over the whole requested period, startDate to endDate, whatever comparison window the row uses. Equals billing on a full-window row. Zero when nothing was billed in the period or no billing credential is connected. State and ratio are about the comparison window; this field is not.',
+        examples=[65.09],
     )
     previousWindowPredatesTelemetry: Optional[bool] = Field(
         None,
@@ -13609,7 +14386,7 @@ class ProviderRatioItemRead(BaseModel):
     )
     state: Optional[str] = Field(
         None,
-        description="Provider state: 'active' if billing data exists in period, 'no-data' otherwise",
+        description="Provider state: 'active' if billing or metered data exists in this row's comparison window (comparisonStartDate to comparisonEndDate), 'no-data' otherwise. A no-overlap row reads 'no-data' even when periodBilling is positive.",
         examples=['active'],
     )
     usageTypeBreakdown: Optional[list[UsageTypeBillingRead]] = Field(
@@ -13629,7 +14406,7 @@ class RatingAggregation(BaseModel):
         examples=['SUM'],
     )
     distinctValue: Optional[str] = Field(
-        None,
+        ...,
         description="Optional filter value for distinct-value-based aggregations. When specified, only metrics matching this value (case insensitive) are included in the aggregation. For example, 'FRANCE' to aggregate only transactions where the metering element was sent with the value 'FRANCE' to aggregate French transactions.",
         examples=['PREMIUM'],
     )
@@ -13665,17 +14442,17 @@ class RatingAggregationQuota(BaseModel):
     """
 
     elementDefinitionDescription: Optional[str] = Field(
-        None,
+        ...,
         description='The description of the element definition explaining what metric is being measured',
         examples=['Total number of API requests made to the service'],
     )
     elementDefinitionId: Optional[str] = Field(
-        None,
+        ...,
         description='The identifier of the element definition that specifies which metric is being tracked',
         examples=['3By6OgB'],
     )
     elementDefinitionName: Optional[str] = Field(
-        None,
+        ...,
         description='The name of the element definition for display purposes',
         examples=['API Request Count'],
     )
@@ -13683,24 +14460,24 @@ class RatingAggregationQuota(BaseModel):
         None, description='The rating aggregation Distinct Value', examples=['region']
     )
     ratingAggregationId: Optional[str] = Field(
-        None,
+        ...,
         description='The unique identifier of the rating aggregation being tracked',
         examples=['l3kR6l'],
     )
     ratingAggregationName: Optional[str] = Field(
-        None,
+        ...,
         description='The name of the rating aggregation for display purposes',
         examples=['API Calls by Region'],
     )
     ratingAggregationType: Optional[RatingAggregationType] = Field(
-        None, description='The rating aggregation Type', examples=['SUM']
+        ..., description='The rating aggregation Type', examples=['SUM']
     )
     tierQuotas: Optional[list[TierQuota]] = Field(
         None,
         description="Quota consumption breakdown by pricing tier. Shows how much quota was consumed within each tier's usage range",
     )
     totalQuotaConsumed: Optional[float] = Field(
-        None,
+        ...,
         description='The total amount of quota consumed across all tiers. Represents the cumulative usage for this rating aggregation',
         examples=[15750.5],
     )
@@ -13712,17 +14489,17 @@ class RatingAggregationQuotaRead(BaseModel):
     """
 
     elementDefinitionDescription: Optional[str] = Field(
-        None,
+        ...,
         description='The description of the element definition explaining what metric is being measured',
         examples=['Total number of API requests made to the service'],
     )
     elementDefinitionId: Optional[str] = Field(
-        None,
+        ...,
         description='The identifier of the element definition that specifies which metric is being tracked',
         examples=['3By6OgB'],
     )
     elementDefinitionName: Optional[str] = Field(
-        None,
+        ...,
         description='The name of the element definition for display purposes',
         examples=['API Request Count'],
     )
@@ -13730,24 +14507,24 @@ class RatingAggregationQuotaRead(BaseModel):
         None, description='The rating aggregation Distinct Value', examples=['region']
     )
     ratingAggregationId: Optional[str] = Field(
-        None,
+        ...,
         description='The unique identifier of the rating aggregation being tracked',
         examples=['l3kR6l'],
     )
     ratingAggregationName: Optional[str] = Field(
-        None,
+        ...,
         description='The name of the rating aggregation for display purposes',
         examples=['API Calls by Region'],
     )
     ratingAggregationType: Optional[RatingAggregationType] = Field(
-        None, description='The rating aggregation Type', examples=['SUM']
+        ..., description='The rating aggregation Type', examples=['SUM']
     )
     tierQuotas: Optional[list[TierQuotaRead]] = Field(
         None,
         description="Quota consumption breakdown by pricing tier. Shows how much quota was consumed within each tier's usage range",
     )
     totalQuotaConsumed: Optional[float] = Field(
-        None,
+        ...,
         description='The total amount of quota consumed across all tiers. Represents the cumulative usage for this rating aggregation',
         examples=[15750.5],
     )
@@ -13759,17 +14536,17 @@ class RatingAggregationQuotaWrite(BaseModel):
     """
 
     elementDefinitionDescription: Optional[str] = Field(
-        None,
+        ...,
         description='The description of the element definition explaining what metric is being measured',
         examples=['Total number of API requests made to the service'],
     )
     elementDefinitionId: Optional[str] = Field(
-        None,
+        ...,
         description='The identifier of the element definition that specifies which metric is being tracked',
         examples=['3By6OgB'],
     )
     elementDefinitionName: Optional[str] = Field(
-        None,
+        ...,
         description='The name of the element definition for display purposes',
         examples=['API Request Count'],
     )
@@ -13777,24 +14554,24 @@ class RatingAggregationQuotaWrite(BaseModel):
         None, description='The rating aggregation Distinct Value', examples=['region']
     )
     ratingAggregationId: Optional[str] = Field(
-        None,
+        ...,
         description='The unique identifier of the rating aggregation being tracked',
         examples=['l3kR6l'],
     )
     ratingAggregationName: Optional[str] = Field(
-        None,
+        ...,
         description='The name of the rating aggregation for display purposes',
         examples=['API Calls by Region'],
     )
     ratingAggregationType: Optional[RatingAggregationType] = Field(
-        None, description='The rating aggregation Type', examples=['SUM']
+        ..., description='The rating aggregation Type', examples=['SUM']
     )
     tierQuotas: Optional[list[TierQuotaWrite]] = Field(
         None,
         description="Quota consumption breakdown by pricing tier. Shows how much quota was consumed within each tier's usage range",
     )
     totalQuotaConsumed: Optional[float] = Field(
-        None,
+        ...,
         description='The total amount of quota consumed across all tiers. Represents the cumulative usage for this rating aggregation',
         examples=[15750.5],
     )
@@ -13811,7 +14588,7 @@ class RatingAggregationRead(BaseModel):
         examples=['SUM'],
     )
     distinctValue: Optional[str] = Field(
-        None,
+        ...,
         description="Optional filter value for distinct-value-based aggregations. When specified, only metrics matching this value (case insensitive) are included in the aggregation. For example, 'FRANCE' to aggregate only transactions where the metering element was sent with the value 'FRANCE' to aggregate French transactions.",
         examples=['PREMIUM'],
     )
@@ -13895,7 +14672,9 @@ class SessionAttributionRequest(BaseModel):
         description='Email of the subscriber/developer running the session, ≤ 255 characters. The first valid identity is retained across the session. Omission or null does not clear it; later assertions are validated but do not replace an established identity.',
         examples=['dev@example.com'],
     )
-    ticketId: Optional[str] = None
+    ticketId: Optional[
+        constr(pattern=r'^(?i)none$|^[A-Za-z][A-Za-z0-9_]{0,63}-\d{1,10}$')
+    ] = None
     ticketTitle: Optional[str] = Field(
         None,
         description='Human-readable ticket title, ≤ 500 characters. Omit to leave the stored title unchanged; send explicit null to clear it.',
@@ -14038,7 +14817,7 @@ class SubscriptionResource(BaseModel):
         description="A display label for the subscription. Set automatically to the subscriber's email address.",
         examples=['dev@acme.com'],
     )
-    name: str = Field(
+    name: constr(min_length=1) = Field(
         ...,
         description='The name of the subscription',
         examples=['my-awesome-subscription'],
@@ -14240,7 +15019,7 @@ class SubscriptionResourceRead(BaseModel):
         description="A display label for the subscription. Set automatically to the subscriber's email address.",
         examples=['dev@acme.com'],
     )
-    name: str = Field(
+    name: constr(min_length=1) = Field(
         ...,
         description='The name of the subscription',
         examples=['my-awesome-subscription'],
@@ -14442,7 +15221,7 @@ class SubscriptionResourceWrite(BaseModel):
         description="A display label for the subscription. Set automatically to the subscriber's email address.",
         examples=['dev@acme.com'],
     )
-    name: str = Field(
+    name: constr(min_length=1) = Field(
         ...,
         description='The name of the subscription',
         examples=['my-awesome-subscription'],
@@ -15754,7 +16533,7 @@ class EntityModelSubscriptionResource(BaseModel):
         description="A display label for the subscription. Set automatically to the subscriber's email address.",
         examples=['dev@acme.com'],
     )
-    name: str = Field(
+    name: constr(min_length=1) = Field(
         ...,
         description='The name of the subscription',
         examples=['my-awesome-subscription'],
@@ -15910,7 +16689,7 @@ class EntityModelToolResourceRead(BaseModel):
     label: Optional[str] = Field(
         None, description="The tool's display label", examples=['GitHub MCP Server']
     )
-    name: Optional[str] = Field(
+    name: Optional[constr(min_length=1)] = Field(
         ..., description='Display name', examples=['GitHub MCP Server']
     )
     plan: Optional[ResourceMetadataRead] = None
@@ -15920,7 +16699,7 @@ class EntityModelToolResourceRead(BaseModel):
     )
     team: Optional[ResourceMetadataRead] = None
     teamId: Optional[str] = Field(..., description='Team ID', examples=['a91XJp'])
-    toolId: Optional[str] = Field(
+    toolId: Optional[constr(min_length=1)] = Field(
         ...,
         description='Unique identifier within organization',
         examples=['mcp-github'],
@@ -15987,7 +16766,7 @@ class Plan(BaseModel):
         description="Indicates whether volume pricing tiers are graduated (cumulative) or not. When true, each tier applies only to usage within that tier's range. When false, the entire usage is charged at the rate of the highest tier reached",
         examples=[True],
     )
-    name: str = Field(
+    name: constr(min_length=1) = Field(
         ...,
         description='The name of the plan for identification and display purposes',
         examples=['Professional Plan'],
@@ -16060,7 +16839,7 @@ class PlanRead(BaseModel):
         description="Indicates whether volume pricing tiers are graduated (cumulative) or not. When true, each tier applies only to usage within that tier's range. When false, the entire usage is charged at the rate of the highest tier reached",
         examples=[True],
     )
-    name: str = Field(
+    name: constr(min_length=1) = Field(
         ...,
         description='The name of the plan for identification and display purposes',
         examples=['Professional Plan'],
@@ -16191,7 +16970,7 @@ class ProductResource(BaseModel):
         description='The metering models associated with the product. Optional field - can be omitted entirely, provided as empty array [], or contain model values',
         examples=[['TRANSACTIONAL']],
     )
-    name: str = Field(
+    name: constr(min_length=1) = Field(
         ..., description='The name of the product', examples=['my-awesome-product']
     )
     notificationAddressesOnInvoice: Optional[list[str]] = Field(
@@ -16313,7 +17092,7 @@ class ProductResource(BaseModel):
         description='The updated timestamp (ISO 8601 extended date-time format, e.g., 2024-09-01T00:00:00Z)',
         examples=['2024-09-01T00:00:00Z'],
     )
-    version: str = Field(
+    version: constr(min_length=1) = Field(
         ...,
         description='The product version, in MAJOR.MINOR.PATCH form such as 1.0.0. Required on create and update. On update the product is saved with the version you send, so send a new value to change it or the current value to keep it. One exception: for a product published to an API gateway, sending the current version unchanged raises the major number by one, for example 1.0.0 becomes 2.0.0.',
         examples=['1.0.0'],
@@ -16402,7 +17181,7 @@ class ProductResourceRead(BaseModel):
         description='The metering models associated with the product. Optional field - can be omitted entirely, provided as empty array [], or contain model values',
         examples=[['TRANSACTIONAL']],
     )
-    name: str = Field(
+    name: constr(min_length=1) = Field(
         ..., description='The name of the product', examples=['my-awesome-product']
     )
     notificationAddressesOnInvoice: Optional[list[str]] = Field(
@@ -16524,7 +17303,7 @@ class ProductResourceRead(BaseModel):
         description='The updated timestamp (ISO 8601 extended date-time format, e.g., 2024-09-01T00:00:00Z)',
         examples=['2024-09-01T00:00:00Z'],
     )
-    version: str = Field(
+    version: constr(min_length=1) = Field(
         ...,
         description='The product version, in MAJOR.MINOR.PATCH form such as 1.0.0. Required on create and update. On update the product is saved with the version you send, so send a new value to change it or the current value to keep it. One exception: for a product published to an API gateway, sending the current version unchanged raises the major number by one, for example 1.0.0 becomes 2.0.0.',
         examples=['1.0.0'],
@@ -16582,7 +17361,7 @@ class ToolResource(BaseModel):
     label: Optional[str] = Field(
         None, description="The tool's display label", examples=['GitHub MCP Server']
     )
-    name: Optional[str] = Field(
+    name: Optional[constr(min_length=1)] = Field(
         ..., description='Display name', examples=['GitHub MCP Server']
     )
     plan: Optional[ResourceMetadata] = None
@@ -16592,7 +17371,7 @@ class ToolResource(BaseModel):
     )
     team: Optional[ResourceMetadata] = None
     teamId: Optional[str] = Field(..., description='Team ID', examples=['a91XJp'])
-    toolId: Optional[str] = Field(
+    toolId: Optional[constr(min_length=1)] = Field(
         ...,
         description='Unique identifier within organization',
         examples=['mcp-github'],
@@ -16608,6 +17387,14 @@ class ToolResource(BaseModel):
         description='Last update timestamp (ISO 8601)',
         examples=['2024-09-01T00:00:00Z'],
     )
+
+
+class V2ApiAiEnforcementEventsGetResponse(
+    RootModel[
+        Union[EnforcementEventPagedModelRead, EnforcementEventUncountedPagedModelRead]
+    ]
+):
+    root: Union[EnforcementEventPagedModelRead, EnforcementEventUncountedPagedModelRead]
 
 
 class V2ApiSourcesMetricsAiTotalCostByProviderOverTimeGetResponse(
@@ -16694,7 +17481,7 @@ class EntityModelProductResource(BaseModel):
         description='The metering models associated with the product. Optional field - can be omitted entirely, provided as empty array [], or contain model values',
         examples=[['TRANSACTIONAL']],
     )
-    name: str = Field(
+    name: constr(min_length=1) = Field(
         ..., description='The name of the product', examples=['my-awesome-product']
     )
     notificationAddressesOnInvoice: Optional[list[str]] = Field(
@@ -16816,7 +17603,7 @@ class EntityModelProductResource(BaseModel):
         description='The updated timestamp (ISO 8601 extended date-time format, e.g., 2024-09-01T00:00:00Z)',
         examples=['2024-09-01T00:00:00Z'],
     )
-    version: str = Field(
+    version: constr(min_length=1) = Field(
         ...,
         description='The product version, in MAJOR.MINOR.PATCH form such as 1.0.0. Required on create and update. On update the product is saved with the version you send, so send a new value to change it or the current value to keep it. One exception: for a product published to an API gateway, sending the current version unchanged raises the major number by one, for example 1.0.0 becomes 2.0.0.',
         examples=['1.0.0'],
@@ -16874,7 +17661,7 @@ class BudgetProgressItemResponse1(BaseModel):
     Budget progress item response (success or error)
     """
 
-    ok: Literal['0']
+    ok: Literal['BudgetProgressItemSuccess']
 
 
 class BudgetProgressItemResponse2(BaseModel):
@@ -16882,7 +17669,7 @@ class BudgetProgressItemResponse2(BaseModel):
     Budget progress item response (success or error)
     """
 
-    ok: Literal['1']
+    ok: Literal['BudgetProgressItemError']
 
 
 class BudgetProgressItemSuccess(

@@ -36,36 +36,14 @@ from loguru import logger
 from ..common.called_tool import presented_name
 from ..common.department_aliases import mark_deprecated_aliases
 from ..common.tool_surface import domain_for
+from ..common.thin_tool_defaults import THIN_TOOL_DEFAULTS
 from ..common.unknown_arguments import refuse_unrecognized_arguments
-from ..constants import USER_COSTS_DEFAULT_PAGE_SIZE
 
 #: Parameters advertised on a thin schema when the tool declares them. These
 #: are the argument names that are meaningful across most actions of a tool,
 #: so leaving them visible saves a ``get_capabilities`` round trip for the
 #: common "list the next page" case.
 COMMON_PARAMETERS: Sequence[str] = ("page", "size", "filters", "dry_run")
-
-#: Defaults the thin-schema tools apply after the ``params`` bag is merged.
-#:
-#: These parameters used to carry their default in the closure signature,
-#: which made them unfillable from the bag: the signature had already put a
-#: value in the arguments dict before the merge ran, so ``{"params": {"page":
-#: 3}}`` silently paged from zero. The closures now declare them optional and
-#: call ``apply_thin_tool_defaults`` after merging, so the bag is honoured and
-#: the tool classes still receive the value they have always received. Keeping
-#: the map here rather than in the closures means the advertised schema and
-#: the runtime default cannot drift apart — ``thin_schema`` reads the same
-#: literal back onto the advertised property.
-#:
-#: The keys of this map double as the list of thin-schema tools. Every other
-#: tool keeps its full parameter list, merely slimmed.
-THIN_TOOL_DEFAULTS: Dict[str, Dict[str, Any]] = {
-    "manage_metering": {},
-    "get_business_analytics": {"page": 0, "size": 20},
-    "manage_alerts": {"page": 0, "size": 20},
-    "manage_ai_insights": {},
-    "manage_tools": {"page": 0, "size": 20},
-}
 
 #: Parameters a thin tool advertises without a default because its handler
 #: reads their absence. With no ``resource_type``, ``manage_alerts`` ``list``
@@ -75,14 +53,6 @@ THIN_TOOL_DEFAULTS: Dict[str, Dict[str, Any]] = {
 #: in before the handler ran made both routes unreachable.
 THIN_TOOL_PARAMETERS_WITHOUT_DEFAULT: Dict[str, Sequence[str]] = {
     "manage_alerts": ("resource_type",),
-}
-
-#: Per-action defaults that replace the tool's own default for one action.
-THIN_ACTION_DEFAULTS: Dict[str, Dict[str, Dict[str, Any]]] = {
-    "get_business_analytics": {
-        "get_user_costs": {"size": USER_COSTS_DEFAULT_PAGE_SIZE},
-        "get_agent_costs": {"size": USER_COSTS_DEFAULT_PAGE_SIZE},
-    },
 }
 
 #: Options a closure declares but no handler reads. FastMCP refuses an
@@ -370,21 +340,6 @@ def merge_params_argument(
     for name, value in bag.items():
         if arguments.get(name) is None:
             arguments[name] = value
-    return arguments
-
-
-def apply_thin_tool_defaults(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
-    """Apply a thin tool's defaults to whatever the caller and the bag left unset.
-
-    Called after ``merge_params_argument`` so the bag can override a default
-    the closure signature used to hard-code. An action's own default, from
-    ``THIN_ACTION_DEFAULTS``, replaces the tool's default for that action.
-    """
-    action_defaults = THIN_ACTION_DEFAULTS.get(tool_name, {}).get(str(arguments.get("action")), {})
-    defaults = {**THIN_TOOL_DEFAULTS.get(tool_name, {}), **action_defaults}
-    for name, default in defaults.items():
-        if arguments.get(name) is None:
-            arguments[name] = default
     return arguments
 
 

@@ -64,8 +64,14 @@ def counted(count: int, singular: str, plural: str) -> str:
     return f"{count} {singular if count == 1 else plural}"
 
 
-def pagination_lines(page: PageInfo, singular: str, plural: str) -> List[str]:
-    """``Page X of Y, N <things> in all.`` plus the call that reads the next page."""
+def pagination_lines(
+    page: PageInfo, singular: str, plural: str, repeated_arguments: str = ""
+) -> List[str]:
+    """``Page X of Y, N <things> in all.`` plus the call that reads the next page.
+
+    ``repeated_arguments`` (for example ``period=SEVEN_DAYS``) are named after
+    page and size, for a read whose next page must repeat them.
+    """
     if page.number is None or page.total_pages is None:
         return []
     total = (
@@ -75,21 +81,28 @@ def pagination_lines(page: PageInfo, singular: str, plural: str) -> List[str]:
     )
     lines = [f"Page {page.number + 1} of {max(page.total_pages, 1)}, {total} in all."]
     if page.next_number is not None:
-        lines.append(f"Pass page={page.next_number}{page.size_hint} for the next page.")
+        repeated = f" {repeated_arguments}" if repeated_arguments else ""
+        lines.append(f"Pass page={page.next_number}{page.size_hint}{repeated} for the next page.")
     return lines
 
 
-def past_last_page_sentence(page: PageInfo, described_total: str) -> str:
-    """Say that the requested page is past the last one and name the pages that exist."""
+def past_last_page_sentence(
+    page: PageInfo, described_total: str, repeated_arguments: str = ""
+) -> str:
+    """Say that the requested page is past the last one and name the pages that exist.
+
+    ``repeated_arguments`` are named after page and size, as in ``pagination_lines``.
+    """
     total_pages = max(page.total_pages or 1, 1)
     requested = "" if page.number is None else f" (page={page.number})"
     pages = counted(total_pages, "page", "pages")
+    repeated = f" {repeated_arguments}" if repeated_arguments else ""
     if total_pages == 1:
-        where_to_read = f"Pass page=0{page.size_hint} for the only page."
+        where_to_read = f"Pass page=0{page.size_hint}{repeated} for the only page."
     else:
         where_to_read = (
-            f"Pass page={total_pages - 1}{page.size_hint} for the last page, or "
-            f"page=0{page.size_hint} for the first."
+            f"Pass page={total_pages - 1}{page.size_hint}{repeated} for the last page, or "
+            f"page=0{page.size_hint}{repeated} for the first."
         )
     return (
         f"The report has {described_total} on {pages}, and the page "

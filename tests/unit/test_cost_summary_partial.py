@@ -7,8 +7,9 @@ analyzer, the formatter and the error handler run together.
 """
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
+import httpx
 import pytest
 
 from src.revenium_mcp_server.analytics import simple_cost_analyzer
@@ -16,8 +17,9 @@ from src.revenium_mcp_server.analytics.formatters.base_formatter import mask_api
 from src.revenium_mcp_server.analytics.simple_analytics_engine import (
     SimpleAnalyticsEngine,
 )
-from src.revenium_mcp_server.auth import AuthenticationError
-from src.revenium_mcp_server.client import ReveniumAPIError, ReveniumClient
+from src.revenium_mcp_server.auth import AuthConfig, AuthenticationError
+from src.revenium_mcp_server.client import DEFAULT_APP_BASE_URL, ReveniumAPIError, ReveniumClient
+from src.revenium_mcp_server.constants import DEFAULT_BASE_URL
 from src.revenium_mcp_server.common.error_handling import ToolError
 from src.revenium_mcp_server.common.team_scope_error import TeamScopeForbiddenError
 from src.revenium_mcp_server.endpoint_registry import get_endpoint_path
@@ -171,6 +173,153 @@ async def test_server_configuration_failure_names_the_server_setting(engine, rea
     assert "server's configuration" in text
     assert "Try a shorter period" not in text
     assert "Parts Not Read" not in text
+
+
+_UNPAIRED_PLATFORM = "https://api.staging.example.invalid"
+
+
+async def _summary_refused_by_the_analytics_host(monkeypatch, status, body, platform_base_url, content_type):
+    """The summary's refusal when every analytics read is answered with one refusal
+    through the real client, the analytics host left to the server to choose."""
+    settings = {"REVENIUM_APP_BASE_URL": None, "REVENIUM_BASE_URL": platform_base_url}
+    monkeypatch.setenv("REVENIUM_USE_NEW_ANALYTICS_API", "true")
+    client = ReveniumClient(
+        auth_config=AuthConfig(
+            api_key="test-key-xyz", team_id="team-abc", base_url=platform_base_url, timeout=5.0, max_retries=0
+        )
+    )
+
+    async def refuse(method, url, **kwargs):
+        return httpx.Response(
+            status, json=body, headers={"Content-Type": content_type}, request=httpx.Request(method, url)
+        )
+
+    def config_value(key, default=None):
+        return settings.get(key, default)
+
+    with patch("src.revenium_mcp_server.client.get_config_value", side_effect=config_value), patch(
+        "src.revenium_mcp_server.endpoint_registry.get_config_value", side_effect=config_value
+    ), patch.object(ReveniumClient, "team_id", new_callable=PropertyMock, return_value="team-abc"), patch.object(
+        client.client, "request", side_effect=refuse
+    ) as request:
+        text = await _failure(SimpleAnalyticsEngine(client).get_cost_summary(period="TWELVE_MONTHS"))
+    assert request.call_args_list
+    assert all(call.kwargs["url"].startswith(DEFAULT_APP_BASE_URL) for call in request.call_args_list)
+    return text
+
+
+_UNPAIRED_HOST_REFUSALS = [
+    (401, {"code": "UNAUTHORIZED", "message": "Invalid or inactive API key"}, "application/json"),
+    (403, {"message": "Forbidden"}, "application/json"),
+    (403, {"code": "FORBIDDEN", "message": "Forbidden"}, "application/json"),
+    (404, {"message": "Not Found"}, "application/json"),
+    (403, {"type": "about:blank", "title": "Forbidden", "detail": "Forbidden"}, "application/problem+json"),
+]
+
+
+@pytest.mark.parametrize(
+    "status, body, content_type",
+    _UNPAIRED_HOST_REFUSALS,
+    ids=["401 UNAUTHORIZED", "403 no code", "403 FORBIDDEN", "404 no code", "403 problem no code"],
+)
+@pytest.mark.asyncio
+async def test_an_unpaired_analytics_host_fails_the_summary_with_its_configuration_fix(
+    mock_env_vars, monkeypatch, status, body, content_type
+):
+    text = await _summary_refused_by_the_analytics_host(
+        monkeypatch, status, body, _UNPAIRED_PLATFORM, content_type
+    )
+
+    assert f"HTTP {status}" in text
+    assert text.count("set REVENIUM_APP_BASE_URL") == 1
+    assert "analytics host is refused the same way" in text
+    assert "Parts Not Read" not in text
+    assert "Try a shorter period" not in text
+    assert "refused the credential" not in text
+    assert "cannot read team" not in text
+
+
+_FORBIDDEN = {"code": "FORBIDDEN", "message": "Forbidden", "detail": "Forbidden"}
+
+
+@pytest.mark.parametrize("content_type", ["application/json", "application/problem+json"])
+@pytest.mark.asyncio
+async def test_a_forbidden_part_from_a_production_platform_is_named_and_the_others_are_shown(
+    mock_env_vars, content_type
+):
+    platform = ReveniumClient(
+        auth_config=AuthConfig(
+            api_key="test-key-xyz", team_id="team-abc", base_url=DEFAULT_BASE_URL, timeout=5.0, max_retries=0
+        )
+    )
+    engine = _engine(set())
+    answer_rows = engine.client.get.side_effect
+
+    async def get(path, *args, **kwargs):
+        if path == get_endpoint_path("cost_metric_by_model"):
+            return await platform.get(path, params=kwargs.get("params"))
+        return await answer_rows(path, *args, **kwargs)
+
+    async def forbid(method, url, **kwargs):
+        return httpx.Response(
+            403, json=_FORBIDDEN, headers={"Content-Type": content_type}, request=httpx.Request(method, url)
+        )
+
+    engine.client.get.side_effect = get
+    with patch.object(platform.client, "request", side_effect=forbid):
+        text = await engine.get_cost_summary(period="TWELVE_MONTHS")
+
+    assert "**Models**: HTTP 403: Forbidden" in text
+    assert (
+        "The platform does not permit this credential to read this part, so "
+        "`get_model_costs` is refused the same way." in text
+    )
+    assert "Retry this part alone with `get_model_costs`" not in text
+    for shown in ("OpenAI", "Acme Corp", mask_api_key_name("key-prod"), "support-bot"):
+        assert shown in text
+    assert "**Total Cost**: $100.00" in text
+    assert "refused the credential" not in text
+    assert "shorter period" not in text
+
+
+@pytest.mark.parametrize("content_type", ["application/json", "application/problem+json"])
+@pytest.mark.asyncio
+async def test_a_summary_forbidden_in_every_part_gets_permission_advice_not_retry_advice(
+    mock_env_vars, monkeypatch, content_type
+):
+    text = await _summary_refused_by_the_analytics_host(
+        monkeypatch, 403, _FORBIDDEN, DEFAULT_BASE_URL, content_type
+    )
+
+    assert "No part of the cost summary could be read" in text
+    for action in _ALL_ACTIONS:
+        assert f"`{action}` is refused the same way" in text
+    assert "does not permit this credential to read what was asked" in text
+    assert "Try a shorter period" not in text
+    assert "refused the credential" not in text
+    assert "REVENIUM_APP_BASE_URL" not in text
+
+
+@pytest.mark.asyncio
+async def test_a_summary_not_read_for_mixed_reasons_keeps_its_retry_advice():
+    engine = _engine(
+        set(_PART_ROWS),
+        error=lambda: ReveniumAPIError("HTTP 403: Forbidden", status_code=403, response_data={"error_data": _FORBIDDEN}),
+    )
+    refuse = engine.client.get.side_effect
+
+    async def get(path, *args, **kwargs):
+        if path == get_endpoint_path("cost_metric_by_model"):
+            raise _timeout()
+        return await refuse(path, *args, **kwargs)
+
+    engine.client.get.side_effect = get
+
+    text = await _failure(engine.get_cost_summary(period="TWELVE_MONTHS"))
+
+    assert "Try a shorter period" in text
+    assert "`get_provider_costs` is refused the same way" in text
+    assert "`get_model_costs` is refused the same way" not in text
 
 
 _ALL_ACTIONS = (

@@ -1521,7 +1521,7 @@ class ApiV2AnalyticsCostByDepartmentAggregatedGetParametersQuery(BaseModel):
     )
     costSources: Optional[list[CostSource]] = Field(
         ['coding_assistant'],
-        description="Which cost to count: coding_assistant (coding assistant seats and usage, shown as Assistants on the AI by Employee page), revenium_metered (usage metered by the Revenium SDK, shown as Direct on that page; the Metered total elsewhere also includes coding assistants) or provider_billing (cost reported by your AI provider's billing, shown as Billed, or Invoiced on the Providers pages). Defaults to coding_assistant only. Say Assistants, Direct or Billed, never the raw value. Repeat the parameter to pass several values.",
+        description="Which cost to count: coding_assistant (metered coding-assistant cost, shown as Assistants on the AI by Employee page, where Assistants can also hold seat-plan usage and invoice-billed Cursor or GitHub Copilot spend; the cost read here is also inside the cost-by-provider totals, so never add the two together), revenium_metered (usage metered by the Revenium SDK, shown as Direct on that page; the Metered total elsewhere also includes coding assistants) or provider_billing (cost reported by your AI provider's billing, shown as Billed, or Invoiced on the Providers pages). Defaults to coding_assistant only. Say Assistants, Direct or Billed, never the raw value. Repeat the parameter to pass several values.",
     )
     agents: Optional[list[str]] = Field(
         None,
@@ -1701,7 +1701,7 @@ class ApiV2AnalyticsCostByModelGetParametersQuery(BaseModel):
     )
     timezone: Optional[str] = Field(
         None,
-        description="IANA time zone for the buckets, such as America/Denver. Day, week, month and six-hour buckets start at that zone's midnight. With a zone, UTC included, the range is read exactly as given, so the first and last buckets can be partial. Buckets of 30 minutes or less stay on UTC's clock, so 30-minute buckets match the zone's half hours only where its offset from UTC is a whole or half hour, not in a zone such as Asia/Kathmandu. Defaults to UTC.",
+        description="IANA time zone for the buckets, such as America/Denver. Day, week, month and six-hour buckets start at that zone's midnight. Weeks start on Monday. With a zone, UTC included, the range is read exactly as given, so the first and last buckets can be partial. Buckets of 30 minutes or less stay on UTC's clock, so 30-minute buckets match the zone's half hours only where its offset from UTC is a whole or half hour, not in a zone such as Asia/Kathmandu. Defaults to UTC.",
         examples=['America/Denver'],
     )
     models: Optional[list[str]] = Field(
@@ -2668,7 +2668,7 @@ class ApiV2AnalyticsCostByProviderGetParametersQuery(BaseModel):
     )
     timezone: Optional[str] = Field(
         None,
-        description="IANA time zone for the buckets, such as America/Denver. Day, week, month and six-hour buckets start at that zone's midnight. With a zone, UTC included, the range is read exactly as given, so the first and last buckets can be partial. Buckets of 30 minutes or less stay on UTC's clock, so 30-minute buckets match the zone's half hours only where its offset from UTC is a whole or half hour, not in a zone such as Asia/Kathmandu. Defaults to UTC.",
+        description="IANA time zone for the buckets, such as America/Denver. Day, week, month and six-hour buckets start at that zone's midnight. Weeks start on Monday. With a zone, UTC included, the range is read exactly as given, so the first and last buckets can be partial. Buckets of 30 minutes or less stay on UTC's clock, so 30-minute buckets match the zone's half hours only where its offset from UTC is a whole or half hour, not in a zone such as Asia/Kathmandu. Defaults to UTC.",
         examples=['America/Denver'],
     )
     teamId: Optional[str] = Field(
@@ -4255,7 +4255,7 @@ class ApiV2AnalyticsCostByUserAggregatedGetParametersQuery(BaseModel):
     )
     costSources: Optional[list[CostSource]] = Field(
         ['coding_assistant'],
-        description="Which cost to count: coding_assistant (coding assistant seats and usage, shown as Assistants on the AI by Employee page), revenium_metered (usage metered by the Revenium SDK, shown as Direct on that page; the Metered total elsewhere also includes coding assistants) or provider_billing (cost reported by your AI provider's billing, shown as Billed, or Invoiced on the Providers pages). Defaults to coding_assistant only. Say Assistants, Direct or Billed, never the raw value. Repeat the parameter to pass several values.",
+        description="Which cost to count: coding_assistant (metered coding-assistant cost, shown as Assistants on the AI by Employee page, where Assistants can also hold seat-plan usage and invoice-billed Cursor or GitHub Copilot spend; the cost read here is also inside the cost-by-provider totals, so never add the two together), revenium_metered (usage metered by the Revenium SDK, shown as Direct on that page; the Metered total elsewhere also includes coding assistants) or provider_billing (cost reported by your AI provider's billing, shown as Billed, or Invoiced on the Providers pages). Defaults to coding_assistant only. Say Assistants, Direct or Billed, never the raw value. Repeat the parameter to pass several values.",
     )
     agents: Optional[list[str]] = Field(
         None,
@@ -6567,7 +6567,7 @@ class ApiV2AnalyticsTokenBreakdownByTypeGetParametersQuery(BaseModel):
     )
     timezone: Optional[str] = Field(
         None,
-        description="IANA time zone for the buckets, such as America/Denver. Day, week, month and six-hour buckets start at that zone's midnight. With a zone, UTC included, the range is read exactly as given, so the first and last buckets can be partial. Buckets of 30 minutes or less stay on UTC's clock, so 30-minute buckets match the zone's half hours only where its offset from UTC is a whole or half hour, not in a zone such as Asia/Kathmandu. Defaults to UTC.",
+        description="IANA time zone for the buckets, such as America/Denver. Day, week, month and six-hour buckets start at that zone's midnight. Weeks start on Monday. With a zone, UTC included, the range is read exactly as given, so the first and last buckets can be partial. Buckets of 30 minutes or less stay on UTC's clock, so 30-minute buckets match the zone's half hours only where its offset from UTC is a whole or half hour, not in a zone such as Asia/Kathmandu. Defaults to UTC.",
         examples=['America/Denver'],
     )
     page: Optional[conint(ge=0)] = Field(

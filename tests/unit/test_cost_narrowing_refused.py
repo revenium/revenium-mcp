@@ -40,6 +40,7 @@ _ENGINE_FILTERLESS_ACTIONS = [
     "get_top_tools",
     "get_tool_costs_by_agent",
     "get_tool_costs_by_provider",
+    "get_tool_cost_and_call_volume",
 ]
 
 _TOP_LEVEL_NARROWING = [

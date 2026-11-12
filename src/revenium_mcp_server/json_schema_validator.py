@@ -13,6 +13,12 @@ from .alert_operators import (
     FILTER_IN_OPERATOR_NOTE,
     FILTER_OPERATORS,
 )
+from .common.change_reason import (
+    ALERT_CHANGE_REASON,
+    CHANGE_REASON_ARGUMENT,
+    CHANGE_REASON_FIELD,
+    change_reason_field_schema,
+)
 from .common.customer_filters import CUSTOMER_FILTERS_DESCRIPTION
 from .common.subscription_create_fields import UNAPPLIED_DATES_RULE, UNSTORED_FIELDS_RULE
 from .plan_contract import platform_plan_currencies
@@ -946,6 +952,7 @@ class JSONSchemaValidator:
                     "pattern": "^[a-zA-Z0-9_-]+$",
                     "description": "Anomaly ID",
                 },
+                CHANGE_REASON_ARGUMENT: ALERT_CHANGE_REASON.schema(),
                 "alert_id": {
                     "type": "string",
                     "pattern": "^[a-zA-Z0-9_-]+$",
@@ -1102,6 +1109,7 @@ class JSONSchemaValidator:
                                 "dimensions. " + FILTER_IN_OPERATOR_NOTE
                             ),
                         },
+                        CHANGE_REASON_FIELD: change_reason_field_schema(),
                     },
                     "description": "Alert/anomaly data",
                 },

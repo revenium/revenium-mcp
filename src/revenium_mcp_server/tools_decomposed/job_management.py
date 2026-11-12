@@ -592,6 +592,10 @@ _BASELINE_REQUEST_FIELDS: Tuple[str, ...] = (
     "qualityRate",
     "hourlyRate",
     "currency",
+    "throughputValue",
+    "throughputPeriod",
+    "throughputScope",
+    "headcount",
     "provenance",
     "declaredBy",
     "evidenceUrl",
@@ -3072,7 +3076,8 @@ class JobManagement(ToolBase):
                                 "the immutable baseline versions, newest first — element 0 "
                                 "is the one in force. Each carries version, effectiveFrom, "
                                 "costPerUnit, minutesPerUnit, qualityRate, hourlyRate, "
-                                "currency, provenance "
+                                "currency, throughputValue, throughputPeriod, "
+                                "throughputScope, headcount, provenance "
                                 "(CUSTOMER_DECLARED|MEASURED|SIGNED_OFF), declaredBy, "
                                 "evidenceUrl and created. An empty list means no baseline "
                                 "has been declared, which is an answer and not an error."
@@ -3085,10 +3090,20 @@ class JobManagement(ToolBase):
                                 + ", ".join(_BASELINE_REQUEST_FIELDS)
                                 + ". effectiveFrom (ISO 8601) is the only field the "
                                 "platform requires and is refused here when missing; "
-                                "effective_from is accepted and sent as effectiveFrom. "
+                                "effective_from is accepted and sent as effectiveFrom, and "
+                                "the other snake_case spellings likewise. "
                                 "provenance defaults to CUSTOMER_DECLARED and declaredBy "
                                 "to the calling principal, so leave them out unless they "
-                                "are genuinely known."
+                                "are genuinely known. throughputValue is the units of "
+                                "work the process produced in each throughputPeriod "
+                                "(HOUR, DAY, WEEK or MONTH) before AI; throughputScope "
+                                "says whether that is the whole team's output (TEAM, the "
+                                "default when throughputValue is set) or one person's "
+                                "(PER_PERSON); headcount is the number of people who did "
+                                "the work, with or without a throughput. The platform "
+                                "refuses a body that breaks its pairing rules: "
+                                "throughputValue and throughputPeriod are sent together, "
+                                "and throughputScope only with throughputValue."
                             ),
                             "append_only": (
                                 "this never edits the baseline in force — it appends the "
@@ -3444,6 +3459,9 @@ class JobManagement(ToolBase):
                                 "minutesPerUnit": 12.0,
                                 "qualityRate": 0.91,
                                 "currency": "USD",
+                                "throughputValue": 3000,
+                                "throughputPeriod": "WEEK",
+                                "headcount": 12,
                                 "provenance": "CUSTOMER_DECLARED",
                             },
                         },

@@ -15,6 +15,8 @@ from mcp.types import TextContent, ImageContent, EmbeddedResource
 from pydantic import StrictInt
 
 from .config import ToolConfig
+from ..common.change_reason import ALERT_CHANGE_REASON, COST_CONTROL_CHANGE_REASON
+from ..common.thin_tool_defaults import apply_thin_tool_defaults
 from ..common.tool_surface import TOOL_DOMAINS, ToolDomain
 # Note: PROFILE_DEFINITIONS is used indirectly through ToolConfig.is_tool_enabled()
 # which queries profiles.PROFILE_DEFINITIONS as the single source of truth
@@ -33,7 +35,6 @@ from ..tools_decomposed.metering_elements_management import OVERRIDES_READERS
 from .tool_publishing import publish_tools
 from .schema_slimming import (
     apply_schema_slimming,
-    apply_thin_tool_defaults,
     merge_params_argument,
 )
 
@@ -577,6 +578,7 @@ class ToolConfigurationRegistry:
             metricType: Optional[str] = None,
             slackConfigurations: Optional[List[str]] = None,
             notificationAddresses: Optional[List[str]] = None,
+            change_reason: Optional[str] = None,
             # BACK-3170: per-action parameters may also arrive as one object.
             params: Optional[dict] = None,
         ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
@@ -617,8 +619,10 @@ class ToolConfigurationRegistry:
                 "metricType": metricType,
                 "slackConfigurations": slackConfigurations,
                 "notificationAddresses": notificationAddresses,
+                "change_reason": change_reason,
             }
             arguments = merge_params_argument(arguments, params, "manage_alerts")
+            arguments = validate_string_params(arguments, ["change_reason"], action=action)
 
             # SMART INPUT PREPROCESSING: agent interfaces serialize these two as
             # JSON strings. BACK-3170: decode AFTER the params merge, so a value
@@ -659,6 +663,12 @@ class ToolConfigurationRegistry:
             # Import tool class
             from ..tools_decomposed.alert_management import AlertManagement
             from ..common.tool_execution import standardized_tool_execution
+
+            ALERT_CHANGE_REASON.refuse_outside_readers(
+                action,
+                arguments,
+                known_actions=await AlertManagement()._get_supported_actions(),
+            )
 
             # Use standardized execution path
             result = await standardized_tool_execution(
@@ -2313,6 +2323,7 @@ class ToolConfigurationRegistry:
             action: _JSONScalar = "get_capabilities",
             control_id: Optional[_JSONScalar] = None,
             control_data: Optional[Union[dict, str]] = None,
+            change_reason: Optional[_JSONScalar] = None,
             parent_department_id: Optional[Union[int, str]] = None,
             parent_org_unit_id: Optional[Union[int, str]] = None,
             rule_id: Optional[_JSONScalar] = None,
@@ -2332,6 +2343,11 @@ class ToolConfigurationRegistry:
             band: Optional[_JSONScalar] = None,
             sort: Optional[_JSONScalar] = None,
             dimension: Optional[_JSONScalar] = None,
+            subject_type: Optional[_JSONScalar] = None,
+            subject_id: Optional[_JSONScalar] = None,
+            change_type: Optional[_JSONScalar] = None,
+            changed_by: Optional[_JSONScalar] = None,
+            api_key_id: Optional[_JSONScalar] = None,
             page: Union[int, str] = 0,
             size: Union[int, str] = 20,
             filters: Optional[Union[dict, str]] = None,
@@ -2340,6 +2356,7 @@ class ToolConfigurationRegistry:
                 "action": action,
                 "control_id": control_id,
                 "control_data": control_data,
+                "change_reason": change_reason,
                 # Raw numeric department id for preview_department_group. Kept out
                 # of string_fields below because both an int and a digit string
                 # are legitimate here (the department listing hands out strings,
@@ -2363,6 +2380,11 @@ class ToolConfigurationRegistry:
                 "band": band,
                 "sort": sort,
                 "dimension": dimension,
+                "subject_type": subject_type,
+                "subject_id": subject_id,
+                "change_type": change_type,
+                "changed_by": changed_by,
+                "api_key_id": api_key_id,
                 "page": page,
                 "size": size,
                 "filters": filters or {},
@@ -2373,6 +2395,12 @@ class ToolConfigurationRegistry:
                 string_fields=[
                     "action",
                     "control_id",
+                    "change_reason",
+                    "subject_type",
+                    "subject_id",
+                    "change_type",
+                    "changed_by",
+                    "api_key_id",
                     "rule_id",
                     "since",
                     "until",
@@ -2413,6 +2441,12 @@ class ToolConfigurationRegistry:
 
             from ..tools_decomposed.cost_controls_management import CostControlsManagement
             from ..common.tool_execution import standardized_tool_execution
+
+            COST_CONTROL_CHANGE_REASON.refuse_outside_readers(
+                action if isinstance(action, str) else str(action),
+                arguments,
+                known_actions=await CostControlsManagement()._get_supported_actions(),
+            )
 
             result = await standardized_tool_execution(
                 tool_name="manage_cost_controls",
