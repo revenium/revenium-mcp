@@ -182,6 +182,20 @@ class TestOneAlertsHistory:
         assert "- Last changed: 2026-10-28T14:14:03.512Z by API key ci-bot" in text
         platform.get_anomaly_change_summary.assert_awaited_once_with("anom_7")
 
+    async def test_the_summary_says_why_it_was_changed_last(self):
+        platform = _platform()
+        platform.get_anomaly_change_summary.return_value = {
+            **SUMMARY,
+            "lastChangeReason": "Threshold lowered after the October invoice",
+        }
+
+        text = await _act("get_changes_summary", {"anomaly_id": "anom_7"}, platform)
+
+        assert text.splitlines()[2:4] == [
+            "- Last changed: 2026-10-28T14:14:03.512Z by API key ci-bot (owner ops@acme.com)",
+            "- Last change reason: Threshold lowered after the October invoice",
+        ]
+
     @pytest.mark.parametrize("action", HISTORY_ACTIONS)
     async def test_a_missing_alert_id_is_refused(self, action):
         platform = _platform()

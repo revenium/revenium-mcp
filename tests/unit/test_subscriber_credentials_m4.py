@@ -572,7 +572,7 @@ class TestCreateCredential:
     @pytest.mark.asyncio
     async def test_create_from_credential_data_dict(self, cred_tool, mock_client):
         """Create from credential_data dict succeeds with required fields (lines 535-536, 672-727)."""
-        created = {"id": "c_new", "label": "New Key", "externalSecret": "***"}
+        created = {"id": "c_new", "label": "New Key", "externalSecret": "secret123"}
         mock_client.create_credential = AsyncMock(return_value=created)
         with patch(
             "src.revenium_mcp_server.tools_decomposed.subscriber_credentials_management.obfuscate_credential_data",
@@ -597,7 +597,7 @@ class TestCreateCredential:
     @pytest.mark.asyncio
     async def test_create_from_individual_params(self, cred_tool, mock_client):
         """Create using individual field params instead of credential_data dict (lines 541-561)."""
-        created = {"id": "c_new2", "label": "Param Key"}
+        created = {"id": "c_new2", "label": "Param Key", "externalSecret": "secret456"}
         mock_client.create_credential = AsyncMock(return_value=created)
         with patch(
             "src.revenium_mcp_server.tools_decomposed.subscriber_credentials_management.obfuscate_credential_data",
@@ -641,7 +641,7 @@ class TestCreateCredential:
     @pytest.mark.asyncio
     async def test_create_sets_name_from_label(self, cred_tool, mock_client):
         """Create auto-sets name field from label when name not provided (lines 708-709)."""
-        created = {"id": "c3", "label": "Auto Name", "name": "Auto Name"}
+        created = {"id": "c3", "label": "Auto Name", "name": "Auto Name", "externalSecret": "s"}
         mock_client.create_credential = AsyncMock(return_value=created)
         with patch(
             "src.revenium_mcp_server.tools_decomposed.subscriber_credentials_management.obfuscate_credential_data",
@@ -666,7 +666,7 @@ class TestCreateCredential:
     @pytest.mark.asyncio
     async def test_create_sets_team_id(self, cred_tool, mock_client):
         """Create auto-sets teamId from client.team_id (lines 712-713)."""
-        created = {"id": "c4"}
+        created = {"id": "c4", "externalSecret": "s"}
         mock_client.create_credential = AsyncMock(return_value=created)
         with patch(
             "src.revenium_mcp_server.tools_decomposed.subscriber_credentials_management.obfuscate_credential_data",
@@ -738,7 +738,7 @@ class TestCreateCredential:
     async def test_create_resolves_subscriber_email(self, cred_tool, mock_client):
         """subscriber_email in credential_data triggers resolution (lines 604-613)."""
         mock_client.resolve_subscriber_email_to_id = AsyncMock(return_value="sub_resolved")
-        created = {"id": "c5"}
+        created = {"id": "c5", "externalSecret": "s"}
         mock_client.create_credential = AsyncMock(return_value=created)
         with patch(
             "src.revenium_mcp_server.tools_decomposed.subscriber_credentials_management.obfuscate_credential_data",
@@ -956,7 +956,7 @@ class TestCreateCredential:
     async def test_create_resolves_organization_name(self, cred_tool, mock_client):
         """organization_name in credential_data triggers resolution (lines 614-623)."""
         mock_client.resolve_organization_name_to_id = AsyncMock(return_value="org_resolved")
-        created = {"id": "c7"}
+        created = {"id": "c7", "externalSecret": "s"}
         mock_client.create_credential = AsyncMock(return_value=created)
         with patch(
             "src.revenium_mcp_server.tools_decomposed.subscriber_credentials_management.obfuscate_credential_data",

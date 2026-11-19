@@ -340,6 +340,77 @@ async def test_invalidate_evicts_cached_entry():
     assert client.get.await_count == 2
 
 
+def _users_me_by_key(identities: dict[str, dict]):
+    """A platform stub whose /users/me answers each key with its own user."""
+
+    async def get(url, headers):
+        return _resp(200, json_body=identities[headers["x-api-key"]])
+
+    client = MagicMock()
+    client.get = AsyncMock(side_effect=get)
+    return client
+
+
+@pytest.mark.asyncio
+async def test_two_keys_never_share_a_cached_identity():
+    """BACK-4675: customer B signing in after customer A gets B's tenant, not A's."""
+    customer_b = {**USERS_ME, "id": "usr_b", "tenantId": "tenant_b", "defaultTeamId": "team_b"}
+    client = _users_me_by_key(
+        {"rev_rk_customer_a_key": USERS_ME, "rev_rk_customer_b_key": customer_b}
+    )
+    v = ApiKeyValidator(platform_base_url="https://platform.test")
+    with patch(
+        "src.revenium_mcp_server.auth.api_key_validator.get_shared_http_client",
+        return_value=client,
+    ):
+        first = await v.validate("rev_rk_customer_a_key")
+        second = await v.validate("rev_rk_customer_b_key")
+        first_again = await v.validate("rev_rk_customer_a_key")
+
+    assert (first.user_id, first.tenant_id, first.team_id) == ("usr_123", "tenant_abc", "team_xyz")
+    assert (second.user_id, second.tenant_id, second.team_id) == ("usr_b", "tenant_b", "team_b")
+    assert first_again == first
+    assert client.get.await_count == 2
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 1_000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+@pytest.mark.asyncio
+async def test_a_cached_identity_is_revalidated_once_its_time_is_up(monkeypatch):
+    """BACK-4675: a key revoked at the platform stops working when its cache entry expires."""
+    from functools import partial
+
+    from cachetools import TTLCache
+
+    from src.revenium_mcp_server.auth import api_key_validator
+
+    clock = _Clock()
+    monkeypatch.setattr(api_key_validator, "TTLCache", partial(TTLCache, timer=clock))
+    client = MagicMock()
+    client.get = AsyncMock(
+        side_effect=[_resp(200, json_body=USERS_ME), _resp(403, text="Forbidden")]
+    )
+    v = ApiKeyValidator(platform_base_url="https://platform.test")
+    with patch(
+        "src.revenium_mcp_server.auth.api_key_validator.get_shared_http_client",
+        return_value=client,
+    ):
+        await v.validate("rev_rk_abcdef123456")
+        clock.now += api_key_validator.DEFAULT_CACHE_TTL_SECONDS - 1
+        await v.validate("rev_rk_abcdef123456")
+        clock.now += 2
+        with pytest.raises(InvalidTokenError):
+            await v.validate("rev_rk_abcdef123456")
+
+    assert client.get.await_count == 2
+
+
 @pytest.mark.asyncio
 async def test_concurrent_same_key_single_flight():
     """A burst of concurrent validations for one key triggers exactly one HTTP call."""

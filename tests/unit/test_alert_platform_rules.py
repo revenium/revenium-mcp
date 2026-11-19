@@ -1,5 +1,6 @@
 """BACK-4706: create, validate, the update and its preview refuse every alert the platform's rule table refuses."""
 
+import re
 from typing import Any, Dict, NamedTuple
 from unittest.mock import AsyncMock, patch
 
@@ -7,6 +8,7 @@ import pytest
 
 from src.revenium_mcp_server.alerts.update_fidelity import PLATFORM_ALERT_RULES
 from src.revenium_mcp_server.client import ReveniumAPIError
+from src.revenium_mcp_server.common.error_handling import ToolError
 from src.revenium_mcp_server.tools_decomposed.alert_management import AlertManagement
 from tests.unit.anomaly_platform_fake import FakeAnomalyPlatform, answer, threshold_alert
 
@@ -57,8 +59,8 @@ BREACHES: Dict[str, Breach] = {
         "metricType ERROR_RATE is not supported for provider alerts",
     ),
     "filter dimension is known": Breach(
-        {"filters": _row("DEPARTMENT", value="d1")}, "a1", {"filters": _row("DEPARTMENT", value="d1")},
-        "filter dimension DEPARTMENT is not supported for AI alerts",
+        {"filters": _row("REGION", value="d1")}, "a1", {"filters": _row("REGION", value="d1")},
+        "filter dimension REGION is not supported for AI alerts",
     ),
     "provider filter dimension": Breach(
         {**PROVIDER, "filters": _row("ORGANIZATION", value="o1")},
@@ -318,7 +320,7 @@ STORED_BREACHES = {
     "operator": ({"operatorType": "EQUAL_TO"}, "operatorType EQUAL_TO"),
     "operator by alert type": ({"operatorType": "INCREASES_BY"}, "operatorType INCREASES_BY"),
     "metric": ({"metricType": "TOKENS_PER_SECOND"}, "metricType TOKENS_PER_SECOND"),
-    "filter dimension": ({"filters": _row("DEPARTMENT", value="d1")}, "filters DEPARTMENT"),
+    "filter dimension": ({"filters": _row("REGION", value="d1")}, "filters REGION"),
     "provider alert type": (
         {**PROVIDER, "alertType": "RELATIVE_CHANGE", "operatorType": "INCREASES_BY"},
         "alertType RELATIVE_CHANGE",
@@ -568,23 +570,9 @@ def test_no_published_metric_list_names_a_per_second_metric():
 def _published_examples():
     from src.revenium_mcp_server.schema_discovery import SchemaDiscoveryEngine
 
-    examples = SchemaDiscoveryEngine().get_agent_friendly_summary("anomalies")[
+    return SchemaDiscoveryEngine().get_agent_friendly_summary("anomalies")[
         "natural_language_examples"
     ]
-    return [
-        pytest.param(text, marks=pytest.mark.xfail(strict=True, reason=PARSER_GAPS[text]))
-        if text in PARSER_GAPS
-        else text
-        for text in examples
-    ]
-
-
-PARSER_GAPS = {
-    "Alert when OpenAI model costs exceed $50 per hour": (
-        "the text parser reads 'model costs' as a MODEL filter on 'costs', which the "
-        "create refuses; the text parser belongs to the sibling lane"
-    ),
-}
 
 
 @pytest.mark.asyncio
@@ -604,6 +592,206 @@ async def test_every_natural_language_example_creates_without_a_per_second_refus
     assert "PER_SECOND" not in result[1].upper()
     assert "not one the platform measures" not in result[1]
     assert all("PER_SECOND" not in str(body.get("metricType")) for body in platform.created_bodies)
+
+
+_CREATE_FROM_TEXT_CALLS = (
+    re.compile(r"create_from_text\(text=([\"'])(?P<text>.+?)\1"),
+    re.compile(r'"action": "create_from_text",\s*"text": "(?P<text>.+?)"'),
+    re.compile(r'Example: "(?P<text>.+?)"'),
+)
+_EXAMPLE_TYPES = ("", "cumulative_usage", "threshold", "relative_change", "update")
+
+
+async def _create_from_text_examples_the_tool_publishes(tools):
+    published = [example for capability in await tools._get_tool_capabilities() for example in capability.examples]
+    for alert_type in _EXAMPLE_TYPES:
+        answered = await tools.handle_action("get_examples", {"alert_type": alert_type})
+        published.extend(block.text for block in answered)
+    _, missing_text_refusal = await answer(tools.handle_action("create_from_text", {}))
+    published.append(missing_text_refusal)
+    return {
+        call.group("text")
+        for text in published
+        for pattern in _CREATE_FROM_TEXT_CALLS
+        for call in pattern.finditer(text)
+    } | await _descriptions_the_create_from_text_refusals_list(tools)
+
+
+async def _create_from_text_refusal(tools, arguments):
+    with pytest.raises(ToolError) as refused:
+        await tools._handle_create_from_text(await tools.get_client(), arguments)
+    return refused.value.examples
+
+
+async def _descriptions_the_create_from_text_refusals_list(tools):
+    missing_text = await _create_from_text_refusal(tools, {})
+    with patch.object(tools.anomaly_manager, "create_anomaly", AsyncMock(side_effect=RuntimeError("down"))):
+        failed = await _create_from_text_refusal(
+            tools, {"text": "Alert when costs exceed $50 per hour", "email": "owner@example.test"}
+        )
+    return set(missing_text["example_descriptions"]) | set(failed["better_descriptions"])
+
+
+_PROVIDER_OR_MODEL = re.compile(
+    r"\b(openai|anthropic|google|gemini|claude|sonnet|opus|haiku|(?:chat)?gpt-?[\w.]*|o[134](?:-mini)?"
+    r"|grok|xai|qwen|mistral|bedrock|azure|llama|deepseek|cohere)\b",
+    re.IGNORECASE,
+)
+
+
+def _scopes_missing_from(text, body):
+    scoped_to = " ".join(str(row.get("value", "")).lower() for row in body.get("filters") or [])
+    named = {name.lower() for name in _PROVIDER_OR_MODEL.findall(text)}
+    return {name for name in named if name not in scoped_to}
+
+
+@pytest.mark.parametrize(
+    "text, name",
+    [
+        ("Alert when ChatGPT spend exceeds $50", "chatgpt"),
+        ("Alert when GPT-4o cost exceeds $50", "gpt-4o"),
+        ("Alert when Sonnet cost exceeds $20", "sonnet"),
+        ("Alert when Opus cost exceeds $20", "opus"),
+        ("Alert when Haiku cost exceeds $20", "haiku"),
+        ("Alert when o3 cost exceeds $20", "o3"),
+        ("Alert when o4-mini cost exceeds $20", "o4-mini"),
+        ("Alert when Grok cost exceeds $20", "grok"),
+        ("Alert when xAI spend exceeds $20", "xai"),
+        ("Alert when Qwen cost exceeds $20", "qwen"),
+        ("Alert when OpenAI spend exceeds $20", "openai"),
+    ],
+)
+def test_the_scope_check_reports_a_named_provider_or_model_the_alert_is_not_scoped_to(text, name):
+    assert _scopes_missing_from(text, {"filters": []}) == {name}
+    assert _scopes_missing_from(text, {"filters": [{"value": name}]}) == set()
+
+
+def test_the_scope_check_reports_nothing_for_an_example_naming_no_provider_or_model():
+    assert _scopes_missing_from("Alert when monthly spending exceeds $2000", {"filters": []}) == set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("no_configured_defaults")
+async def test_every_create_from_text_example_the_tool_publishes_is_accepted():
+    """BACK-3977: create_from_text refuses a text it reads a filter from, so no published example may be one.
+
+    An example naming a provider or a model must create an alert scoped to it; one that
+    creates an alert over all usage says something the alert does not do.
+    """
+    examples = await _create_from_text_examples_the_tool_publishes(_tools(_platform()))
+    examples |= set(_published_examples())
+    assert "Alert when monthly token count exceeds 1000" in examples
+    assert {
+        "Notify when token usage goes above 10000 per hour",
+        "Send alert if request rate drops below 100 per minute",
+    } <= examples
+
+    refused, unscoped = {}, {}
+    for text in sorted(examples):
+        platform = _platform()
+        is_error, said = await answer(
+            _tools(platform).handle_action("create_from_text", {"text": text, "email": "owner@example.test"})
+        )
+        if is_error or len(platform.created_bodies) != 1:
+            refused[text] = said
+            continue
+        missing = _scopes_missing_from(text, platform.created_bodies[0])
+        if missing:
+            unscoped[text] = missing
+
+    assert refused == {}
+    assert unscoped == {}
+
+
+TEXTS_WITHOUT_A_THRESHOLD = (
+    "Alert when cumulative usage in period exceeds threshold",
+    "Track monthly token consumption",
+    "Monitor weekly spending",
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("no_configured_defaults")
+@pytest.mark.parametrize("text", TEXTS_WITHOUT_A_THRESHOLD)
+async def test_a_text_without_a_threshold_is_refused_instead_of_given_one(text):
+    """BACK-3977: a text with no number created an alert over all usage at an invented threshold of 100."""
+    platform = _platform()
+
+    is_error, said = await answer(
+        _tools(platform).handle_action("create_from_text", {"text": text, "email": "owner@example.test"})
+    )
+
+    assert is_error is True, said
+    assert platform.created_bodies == []
+    assert "could not read a threshold" in said
+    assert "Nothing was created" in said
+    assert "create(anomaly_data=" in said
+
+
+@pytest.mark.asyncio
+async def test_the_capability_text_says_a_text_without_a_threshold_is_refused():
+    capabilities = await _tools(_platform())._get_tool_capabilities()
+    described = [
+        capability.parameters["create_from_text"]["text"]
+        for capability in capabilities
+        if "create_from_text" in (capability.parameters or {})
+    ]
+
+    assert described
+    assert all("no number to read as the threshold is refused" in text for text in described)
+
+
+FILTERS_READ_WITHOUT_A_DETECTION_RULE = {
+    "Monitor weekly spending for customer Acme": "{'dimension': 'ORGANIZATION', 'operator': 'CONTAINS', 'value': 'acme'}",
+    "Alert when total daily cost reaches $1000 for customer Acme": (
+        "{'dimension': 'ORGANIZATION', 'operator': 'CONTAINS', 'value': 'acme'}"
+    ),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("no_configured_defaults")
+@pytest.mark.parametrize("text", FILTERS_READ_WITHOUT_A_DETECTION_RULE)
+async def test_a_filter_read_from_a_text_the_parser_builds_no_rule_for_is_refused_too(text):
+    """BACK-3977: the fallback parse dropped the filter it read and created an alert over all usage."""
+    platform = _platform()
+
+    is_error, said = await answer(
+        _tools(platform).handle_action("create_from_text", {"text": text, "email": "owner@example.test"})
+    )
+
+    assert is_error is True, said
+    assert platform.created_bodies == []
+    assert FILTERS_READ_WITHOUT_A_DETECTION_RULE[text] in said
+    assert "anomaly_data.filters" in said
+
+
+MISREAD_FILTERS = {
+    "Alert when OpenAI model costs exceed $50 per hour": "{'dimension': 'MODEL', 'operator': 'CONTAINS', 'value': 'costs'}",
+    "Alert when service costs exceed $100 per hour": "{'dimension': 'PRODUCT', 'operator': 'CONTAINS', 'value': 'costs'}",
+    "Alert when total cost excluding test traffic exceeds $100 per hour": (
+        "{'dimension': 'PRODUCT', 'operator': 'CONTAINS', 'value': 'test'}"
+    ),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("no_configured_defaults")
+@pytest.mark.parametrize("text", MISREAD_FILTERS)
+async def test_a_text_the_parser_reads_a_filter_from_is_refused_showing_that_filter(text):
+    """BACK-3977: the text parser misreads filters, so an alert is never created with one it read."""
+    platform = _platform()
+    tools = _tools(platform)
+
+    result = await answer(
+        tools.handle_action("create_from_text", {"text": text, "email": "owner@example.test"})
+    )
+
+    assert result[0] is True, result[1]
+    assert platform.created_bodies == []
+    assert MISREAD_FILTERS[text] in result[1]
+    assert "anomaly_data.filters" in result[1]
+    assert "Nothing was created" in result[1]
 
 
 EMPTY_VALUE_ROW = _row(value="")

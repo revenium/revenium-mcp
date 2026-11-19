@@ -20,10 +20,7 @@ from ..introspection.metadata import ToolCapability
 from ..capability_manager.integration_service import ucm_integration_service
 from ..capability_manager.static_capabilities import (
     STATIC_CAPABILITIES_NOTE,
-    checkable_capability_names,
     require_supported_resource_type,
-    static_capabilities,
-    static_verdict,
 )
 from .manage_capabilities_errors import (
     create_execution_error,
@@ -279,29 +276,10 @@ Get specific capabilities for any resource type:
         require_supported_resource_type(
             resource_type, ucm_integration_service.supported_resource_types()
         )
-        if ucm_integration_service.serves_static_capabilities():
-            return CapabilityTable(await static_capabilities(resource_type), is_static=True)
         capabilities = await ucm_integration_service.get_ucm_capabilities(resource_type)
-        return CapabilityTable(capabilities, is_static=False)
-
-    async def _verify_from_static_table(
-        self, resource_type: str, capability_name: str, value: str
-    ) -> bool:
-        capabilities = await static_capabilities(resource_type)
-        verdict = static_verdict(capabilities, resource_type, capability_name, value)
-        if verdict is None:
-            raise ValidationError(
-                message=(
-                    f"Capability '{capability_name}' is not in the static capability "
-                    f"set for {resource_type}"
-                ),
-                field="capability_name",
-                value=capability_name,
-                expected=(
-                    f"One of: {', '.join(checkable_capability_names(capabilities, resource_type))}"
-                ),
-            )
-        return verdict
+        return CapabilityTable(
+            capabilities, is_static=ucm_integration_service.serves_static_capabilities()
+        )
 
     async def _handle_verify_capability(self, request: CapabilityRequest) -> str:
         """Handle verify_capability action.
@@ -328,20 +306,14 @@ Get specific capabilities for any resource type:
         require_supported_resource_type(
             request.resource_type, ucm_integration_service.supported_resource_types()
         )
-        is_static = ucm_integration_service.serves_static_capabilities()
-        if is_static:
-            is_valid = await self._verify_from_static_table(
-                request.resource_type, request.capability_name, request.value
-            )
-        else:
-            is_valid = await ucm_integration_service.validate_capability_value(
-                request.resource_type, request.capability_name, request.value
-            )
+        is_valid = await ucm_integration_service.validate_capability_value(
+            request.resource_type, request.capability_name, request.value
+        )
         status = "✅ Valid" if is_valid else "❌ Invalid"
 
         return (
             f"# **Capability Verification**\n\n"
-            f"{_static_note(is_static)}"
+            f"{_static_note(ucm_integration_service.serves_static_capabilities())}"
             f"**Resource Type**: {request.resource_type}\n"
             f"**Capability**: {request.capability_name}\n"
             f"**Value**: {request.value}\n"
@@ -355,10 +327,12 @@ Get specific capabilities for any resource type:
             Formatted refresh response
         """
         health_status = await ucm_integration_service.refresh_all_capabilities()
-        return (
-            f"# **Capabilities Refreshed**\n\n"
-            f"```json\n{json.dumps(health_status, indent=2)}\n```"
+        heading = (
+            "Nothing to Refresh"
+            if ucm_integration_service.serves_static_capabilities()
+            else "Capabilities Refreshed"
         )
+        return f"# **{heading}**\n\n```json\n{json.dumps(health_status, indent=2)}\n```"
 
     async def _handle_get_health_status(self) -> str:
         """Handle get_health_status action.
@@ -399,6 +373,7 @@ Get specific capabilities for any resource type:
         capabilities_overview = await ucm_integration_service.get_all_capabilities()
         return (
             f"# **UCM Capabilities Management**\n\n"
+            f"{_static_note(ucm_integration_service.serves_static_capabilities())}"
             f"**Available Capabilities**: {len(capabilities_overview)} configured\n\n"
             f"```json\n{json.dumps(capabilities_overview, indent=2)}\n```\n\n"
             f"**Available Actions**: get_capabilities, get_capability, verify_capability, refresh_capabilities, get_health_status"

@@ -13,7 +13,12 @@ from ..client import ReveniumClient
 from .core import UnifiedCapabilityManager
 from .factory import UCMFactory, UCMIntegrationHelper
 from .mcp_integration import MCPCapabilityIntegration
-from .static_capabilities import SUPPORTED_RESOURCE_TYPES
+from .static_capabilities import (
+    STATIC_CAPABILITIES_HEALTH_DETAIL,
+    SUPPORTED_RESOURCE_TYPES,
+    static_capabilities,
+    verify_against_static_table,
+)
 
 
 class UCMIntegrationService:
@@ -173,6 +178,10 @@ class UCMIntegrationService:
         """
         return not self._initialized and credentials_are_per_request()
 
+    @staticmethod
+    def _static_capabilities_status() -> Dict[str, Any]:
+        return {"status": "static_capabilities", "detail": STATIC_CAPABILITIES_HEALTH_DETAIL}
+
     def supported_resource_types(self) -> AbstractSet[str]:
         """Resource types a capability read accepts in the current mode."""
         if self._initialized and self.ucm:
@@ -180,7 +189,7 @@ class UCMIntegrationService:
         return SUPPORTED_RESOURCE_TYPES
 
     async def get_ucm_capabilities(self, resource_type: str) -> Dict[str, Any]:
-        """Get capabilities for a resource type via UCM.
+        """Get capabilities for a resource type via UCM, or from the static table in static mode.
 
         Args:
             resource_type: Resource type to get capabilities for
@@ -188,6 +197,8 @@ class UCMIntegrationService:
         Returns:
             Dictionary of capabilities
         """
+        if self.serves_static_capabilities():
+            return await static_capabilities(resource_type)
         if not self._initialized or not self.ucm:
             raise RuntimeError("UCM integration service not initialized")
 
@@ -196,7 +207,7 @@ class UCMIntegrationService:
     async def validate_capability_value(
         self, resource_type: str, capability_name: str, value: str
     ) -> bool:
-        """Validate a capability value using UCM.
+        """Validate a capability value using UCM, or against the static table in static mode.
 
         Args:
             resource_type: Resource type
@@ -205,7 +216,12 @@ class UCMIntegrationService:
 
         Returns:
             True if value is valid, False otherwise
+
+        Raises:
+            ValidationError: In static mode, when the table lists no values for the capability
         """
+        if self.serves_static_capabilities():
+            return await verify_against_static_table(resource_type, capability_name, value)
         if not self._initialized or not self.integration_helper:
             raise RuntimeError("UCM integration service not initialized")
 
@@ -214,11 +230,14 @@ class UCMIntegrationService:
         )
 
     async def refresh_all_capabilities(self) -> Dict[str, Any]:
-        """Refresh all capabilities and return results.
+        """Refresh all capabilities and return the UCM health status after the refresh.
 
         Returns:
-            Dictionary of refresh results by resource type
+            UCM health status; in static mode, where there is nothing to refresh, the
+            static-capabilities status (keys ``status`` and ``detail``)
         """
+        if self.serves_static_capabilities():
+            return self._static_capabilities_status()
         if not self._initialized or not self.ucm:
             raise RuntimeError("UCM integration service not initialized")
 
@@ -231,15 +250,9 @@ class UCMIntegrationService:
         Returns:
             Dictionary containing health metrics
         """
+        if self.serves_static_capabilities():
+            return self._static_capabilities_status()
         if not self._initialized:
-            if self.serves_static_capabilities():
-                return {
-                    "status": "static_capabilities",
-                    "detail": (
-                        "UCM dynamic capabilities are unavailable by design in Clerk/OAuth "
-                        "and api_key modes; tools use static capabilities and operate normally."
-                    ),
-                }
             return {"status": "not_initialized", "error": "UCM integration service not initialized"}
 
         ucm_health = await self.ucm.get_health_status() if self.ucm else {}
@@ -257,6 +270,11 @@ class UCMIntegrationService:
         Returns:
             Dictionary of all capabilities organized by resource type
         """
+        if self.serves_static_capabilities():
+            return {
+                resource_type: await static_capabilities(resource_type)
+                for resource_type in sorted(SUPPORTED_RESOURCE_TYPES)
+            }
         if not self._initialized or not self.ucm:
             return {"status": "not_initialized", "capabilities": {}}
 

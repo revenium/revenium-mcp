@@ -1,4 +1,4 @@
-"""What the billing lists and the skill list send, refuse and say (BACK-4697).
+"""What the billing lists and the skill list send, refuse and say (BACK-4697, BACK-5956).
 
 The invoice, refund and period-charge lists take a yyyy-MM-dd day like the
 rest of get_business_analytics and send it as the UTC instants the
@@ -334,3 +334,143 @@ async def test_list_skills_page_past_the_last_says_so_instead_of_none_found(tool
 async def test_list_skills_with_no_skills_at_all_still_says_none_found(tool):
     text = await _skills_text(tool, {"number": 0, "size": 5, "totalElements": 0, "totalPages": 0})
     assert "No skills found for the given filters." in text
+
+
+# ── E. Failed payments, payment sources and generation time (BACK-5956) ──
+
+_PAYMENT_SOURCES = ["EXTERNAL_PAYMENT_NOTIFICATION", "PAYMENT_VIA_PAYMENT_PROVIDER", "INVOICE_ONLY_NO_PAYMENT"]
+
+
+@pytest.mark.asyncio
+async def test_list_invoices_sends_failed_payments_only_and_payment_sources(tool):
+    sent = await _sent(
+        tool, *_INVOICES, {"failed_payments_only": True, "payment_sources": ["INVOICE_ONLY_NO_PAYMENT"]}
+    )
+    assert sent["failedPaymentsOnly"] is True
+    assert sent["paymentSources"] == ["INVOICE_ONLY_NO_PAYMENT"]
+
+
+@pytest.mark.asyncio
+async def test_list_invoices_leaves_out_a_false_failed_payments_only(tool):
+    # The platform documents only what true does, so false keeps today's answer.
+    sent = await _sent(tool, *_INVOICES, {"failed_payments_only": False})
+    assert "failedPaymentsOnly" not in sent
+
+
+@pytest.mark.asyncio
+async def test_list_invoices_without_the_new_filters_sends_neither(tool):
+    sent = await _sent(tool, *_INVOICES, {})
+    assert "failedPaymentsOnly" not in sent
+    assert "paymentSources" not in sent
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("INVOICE_ONLY_NO_PAYMENT", ["INVOICE_ONLY_NO_PAYMENT"]),
+        (
+            "EXTERNAL_PAYMENT_NOTIFICATION, PAYMENT_VIA_PAYMENT_PROVIDER",
+            ["EXTERNAL_PAYMENT_NOTIFICATION", "PAYMENT_VIA_PAYMENT_PROVIDER"],
+        ),
+        (["invoice_only_no_payment"], ["INVOICE_ONLY_NO_PAYMENT"]),
+        (_PAYMENT_SOURCES, _PAYMENT_SOURCES),
+    ],
+)
+async def test_list_invoices_sends_payment_sources_in_the_platform_spelling(tool, value, expected):
+    sent = await _sent(tool, *_INVOICES, {"payment_sources": value})
+    assert sent["paymentSources"] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [["CREDIT_CARD"], "STRIPE", ["INVOICE_ONLY_NO_PAYMENT", "WIRE"], 7, [7]])
+async def test_list_invoices_refuses_an_unknown_payment_source_naming_the_accepted_ones(tool, value):
+    error = await _refused(tool, *_INVOICES, {"payment_sources": value})
+    assert error.field == "payment_sources"
+    for source in _PAYMENT_SOURCES:
+        assert source in str(error)
+    assert "Nothing was read" in error.message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [[], [""], " "])
+async def test_list_invoices_refuses_a_blank_payment_source(tool, value):
+    error = await _refused(tool, *_INVOICES, {"payment_sources": value})
+    assert error.field == "payment_sources"
+    assert "blank" in error.message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", ["maybe", "yes please", 1])
+async def test_list_invoices_refuses_a_failed_payments_only_that_is_not_true_or_false(tool, value):
+    error = await _refused(tool, *_INVOICES, {"failed_payments_only": value})
+    assert error.field == "failed_payments_only"
+    assert "true or false" in str(error)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "action,name,value",
+    [
+        ("list_refunds", "failed_payments_only", True),
+        ("list_refunds", "payment_sources", ["INVOICE_ONLY_NO_PAYMENT"]),
+        ("list_period_charges", "payment_sources", ["INVOICE_ONLY_NO_PAYMENT"]),
+        ("get_unpaid_invoice_totals", "failed_payments_only", True),
+    ],
+)
+async def test_the_payment_filters_are_refused_where_they_do_not_apply(tool, action, name, value):
+    error = await _refused_billing(tool, action, {name: value})
+    assert error.field == name
+    assert f"{action} does not apply {name}" in error.message
+    if action != "get_unpaid_invoice_totals":
+        assert any(f"{name} is applied by list_invoices" in s for s in error.suggestions)
+
+
+async def _invoice_rows(tool, invoices):
+    client = _client("get_invoices", "invoiceResourceList", items=invoices)
+    tool.get_client = AsyncMock(return_value=client)
+    return (await tool.handle_action("list_invoices", {}))[0].text
+
+
+@pytest.mark.asyncio
+async def test_an_invoice_row_says_when_the_invoice_was_generated(tool):
+    text = await _invoice_rows(
+        tool,
+        [
+            {
+                "invoiceNumber": "INV-1",
+                "state": "FINALIZED",
+                "invoicePayStatus": "UNPAID",
+                "totalAmount": 12.5,
+                "currency": "USD",
+                "startDate": "2026-10-01T00:00:00Z",
+                "endDate": "2026-10-31T23:59:59Z",
+                "timestamp": "2026-11-01T00:05:00Z",
+            },
+            {"invoiceNumber": "INV-2", "timestamp": None},
+            {"invoiceNumber": "INV-3"},
+        ],
+    )
+    rows = [line for line in text.splitlines() if line.startswith("- ")]
+    assert rows[0].endswith("| generated 2026-11-01T00:05:00Z")
+    assert rows[1].endswith("| generated n/a")
+    assert "generated" not in rows[2]
+
+
+@pytest.mark.asyncio
+async def test_billing_capabilities_describe_the_payment_filters_and_the_generation_time(tool):
+    parameters = _billing_capability_parameters(await tool._get_tool_capabilities())
+    assert "failed_payments_only" in parameters["list_invoices"]
+    assert "payment_sources" in parameters["list_invoices"]
+    schema = (await tool._get_input_schema())["properties"]
+    assert schema["failed_payments_only"]["type"] == "boolean"
+    assert schema["payment_sources"]["type"] == "array"
+    assert schema["payment_sources"]["items"]["enum"] == _PAYMENT_SOURCES
+    capabilities = (await tool.handle_action("get_capabilities", {}))[0].text
+    assert "failed_payments_only" in capabilities
+    assert "when each invoice was generated" in capabilities
+    examples = (await tool.handle_action("get_examples", {}))[0].text
+    assert "`failed_payments_only`, `payment_sources`" in examples
+    for source in _PAYMENT_SOURCES:
+        assert source in capabilities
+        assert source in examples

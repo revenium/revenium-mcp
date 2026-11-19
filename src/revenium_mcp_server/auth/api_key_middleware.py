@@ -33,6 +33,7 @@ from .api_key_validator import (
 )
 from .auth_events import emit_auth_event
 from .claims_middleware import _current_tenant
+from .credential_refusals import evicting_refused_keys
 from .tenant_context import TenantContext
 
 
@@ -185,12 +186,9 @@ class ApiKeyAuthMiddleware(Middleware):
 
         reset_token = _current_tenant.set(tenant_ctx)
         try:
-            return await call_next(context)
-        except Exception as exc:
-            # Best-effort: shrink the revocation window on an active 401/403.
-            # The 30s TTL is the primary expiry mechanism.
-            if getattr(exc, "status_code", None) in (401, 403):
-                self._validator.invalidate(token)
-            raise
+            with evicting_refused_keys(
+                self._validator.invalidate, self._validator.invalidate_after_ambiguous_refusal
+            ):
+                return await call_next(context)
         finally:
             _current_tenant.reset(reset_token)

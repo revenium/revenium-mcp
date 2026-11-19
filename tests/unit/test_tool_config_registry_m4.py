@@ -2279,6 +2279,19 @@ class TestBusinessAnalyticsBillingReadClosure:
         assert captured["states"] == ["FINALIZED", "DRAFT"]
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("given,expected", [("true", True), ("false", False), (True, True)])
+    async def test_failed_payments_only_string_read_as_a_boolean(self, given, expected):
+        captured = await self._run(action="list_invoices", failed_payments_only=given)
+        assert captured["failed_payments_only"] is expected
+
+    @pytest.mark.asyncio
+    async def test_payment_sources_json_string_parsed_to_list(self):
+        captured = await self._run(
+            action="list_invoices", payment_sources='["INVOICE_ONLY_NO_PAYMENT"]'
+        )
+        assert captured["payment_sources"] == ["INVOICE_ONLY_NO_PAYMENT"]
+
+    @pytest.mark.asyncio
     async def test_non_list_states_string_left_for_tool_to_reject(self):
         """A non-JSON-array string is left as-is (the anomaly_ids precedent):
         the array preprocessor keeps it a string so the tool layer rejects it,
@@ -2294,6 +2307,8 @@ class TestBusinessAnalyticsBillingReadClosure:
             "invoice_number",
             "pay_states",
             "states",
+            "payment_sources",
+            "failed_payments_only",
             "starting_amount",
             "ending_amount",
             "minimum",

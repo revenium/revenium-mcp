@@ -97,14 +97,6 @@ class TestProcessAdvancedConfiguration:
         )
         assert validated["notification_addresses"] == ["a@b.com"]
 
-    def test_filters(self, manager):
-        validated = {}
-        manager._process_advanced_configuration(
-            {"filters": [{"dimension": "MODEL", "operator": "IS", "value": "gpt-4"}]},
-            validated,
-        )
-        assert len(validated["filters"]) == 1
-
     def test_alert_type_snake_case(self, manager):
         validated = {}
         manager._process_advanced_configuration({"alert_type": "THRESHOLD"}, validated)

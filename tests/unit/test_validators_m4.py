@@ -560,40 +560,40 @@ class TestValidateThresholds:
 
 
 # ---------------------------------------------------------------------------
-# _convert_filters_to_api_format
+# convert_filters_to_api_format
 # ---------------------------------------------------------------------------
 
 class TestConvertFiltersToApiFormat:
     def test_empty_list_returns_empty(self):
-        result = InputValidator._convert_filters_to_api_format([])
+        result = InputValidator.convert_filters_to_api_format([])
         assert result == []
 
     def test_none_returns_empty(self):
-        result = InputValidator._convert_filters_to_api_format(None)
+        result = InputValidator.convert_filters_to_api_format(None)
         assert result == []
 
     def test_known_field_mapped_to_dimension(self):
         filters = [{"field": "organization", "operator": "contains", "value": "acme"}]
-        result = InputValidator._convert_filters_to_api_format(filters)
+        result = InputValidator.convert_filters_to_api_format(filters)
         assert result[0]["dimension"] == "ORGANIZATION"
 
     def test_known_operator_mapped(self):
         filters = [{"field": "model", "operator": "equals", "value": "gpt-4"}]
-        result = InputValidator._convert_filters_to_api_format(filters)
+        result = InputValidator.convert_filters_to_api_format(filters)
         assert result[0]["operator"] == "IS"
 
     def test_unknown_field_upcased(self):
         filters = [{"field": "custom_field", "operator": "is", "value": "x"}]
-        result = InputValidator._convert_filters_to_api_format(filters)
+        result = InputValidator.convert_filters_to_api_format(filters)
         assert result[0]["dimension"] == "CUSTOM_FIELD"
 
-    def test_non_dict_filter_skipped(self):
-        result = InputValidator._convert_filters_to_api_format(["bad_filter"])
-        assert result == []
+    def test_non_dict_filter_refused_not_dropped(self):
+        with pytest.raises(ValidationError, match="Each filter must be a dictionary"):
+            InputValidator.convert_filters_to_api_format(["bad_filter"])
 
     def test_value_converted_to_string(self):
         filters = [{"field": "model", "operator": "equals", "value": 42}]
-        result = InputValidator._convert_filters_to_api_format(filters)
+        result = InputValidator.convert_filters_to_api_format(filters)
         assert result[0]["value"] == "42"
 
     def test_multiple_filters_all_converted(self):
@@ -601,7 +601,7 @@ class TestConvertFiltersToApiFormat:
             {"field": "organization", "operator": "contains", "value": "acme"},
             {"field": "product", "operator": "starts_with", "value": "pro"},
         ]
-        result = InputValidator._convert_filters_to_api_format(filters)
+        result = InputValidator.convert_filters_to_api_format(filters)
         assert len(result) == 2
         assert result[1]["operator"] == "STARTS_WITH"
 

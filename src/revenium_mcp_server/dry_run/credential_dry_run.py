@@ -280,9 +280,7 @@ class CredentialDryRunValidator:
             return []
 
         try:
-            subscriber = await self.client.get_subscriber_by_id(
-                ReveniumClient._quote_path_segment(subscriber_id)
-            )
+            subscriber = await self.client.get_subscriber_by_id(subscriber_id)
         except ReveniumAPIError as e:
             if _is_unknown_subscriber(e):
                 return [_unknown_subscriber_issue(subscriber_id)]

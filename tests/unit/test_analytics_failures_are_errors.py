@@ -16,7 +16,13 @@ import re
 import pytest
 from werkzeug import Response
 
+from src.revenium_mcp_server import endpoint_registry
 from src.revenium_mcp_server.analytics.simple_analytics_engine import AnalyticsProcessor
+from src.revenium_mcp_server.client import (
+    UNPAIRED_ANALYTICS_HOST,
+    ReveniumAPIError,
+    ReveniumClient,
+)
 from src.revenium_mcp_server.common.error_handling import ToolError
 from src.revenium_mcp_server.introspection.integration import introspection_integration
 from src.revenium_mcp_server.tools_decomposed.business_analytics_management import (
@@ -33,7 +39,7 @@ from tests.unit._registered_tool_harness import (
 
 TOOL = "get_business_analytics"
 SKILL_PATH = "/profitstream/v2/api/skills/zzzzzzz"
-COVERAGE_PATH = "/profitstream/v2/api/billing/coverage"
+COVERAGE_PATH = "/api/v2/analytics/billing-coverage"
 INVOICES_PATH = "/profitstream/v2/api/invoices"
 
 SKILL_400_BODY = {
@@ -45,11 +51,20 @@ SKILL_400_BODY = {
     "details": {"Hashing error": "Couldn't decode: zzzzzzz"},
 }
 COVERAGE_400_BODY = {
-    "timestamp": "2026-10-16T03:16:01.120000000Z",
+    "type": "about:blank",
+    "title": "Invalid input",
     "status": 400,
-    "error": "Bad Request",
-    "message": "Invalid request - Invalid period: BOGUS. Must be one of: 24h, 7d, 30d, 90d, custom",
-    "path": COVERAGE_PATH,
+    "detail": "Invalid input",
+    "code": "VALIDATION_ERROR",
+    "errors": [
+        {
+            "code": "invalid_value",
+            "path": ["period"],
+            "message": 'Invalid option: expected one of "24h"|"7d"|"30d"|"90d"|"custom"',
+            "options": ["24h", "7d", "30d", "90d", "custom"],
+            "received": "bogus",
+        }
+    ],
 }
 AMOUNT_400_BODY = {
     "timestamp": "2026-10-16T03:15:05.608723447Z",
@@ -148,17 +163,101 @@ async def test_platform_400_survives_the_introspection_path(monkeypatch, httpser
 
 
 @pytest.mark.asyncio
-async def test_coverage_ratio_platform_400_is_an_error(monkeypatch, httpserver, tmp_path):
-    httpserver.expect_request(COVERAGE_PATH).respond_with_json(COVERAGE_400_BODY, status=400)
+async def test_coverage_ratio_analytics_400_is_an_error(monkeypatch, httpserver, tmp_path):
+    monkeypatch.setattr(endpoint_registry, "_resolved_app_base_url", lambda: platform_url(httpserver))
+    httpserver.expect_request(COVERAGE_PATH).respond_with_json(
+        COVERAGE_400_BODY, status=400, content_type="application/problem+json"
+    )
 
     result, text = await _call(
         monkeypatch, httpserver, tmp_path, {"action": "get_coverage_ratio", "period": "BOGUS"}
     )
 
     assert result.is_error is True
-    assert "Invalid period: BOGUS" in text
+    assert "period: Invalid option" in text
+    assert "accepted values: 24h, 7d, 30d, 90d, custom" in text
     assert "Provider Metering Coverage Failed" in text
+    assert _requests_to(httpserver, "/profitstream/v2/api/billing/coverage") == []
     _assert_no_raw_body(text)
+
+
+COVERAGE_PLATFORM_REFUSAL_BODY = {
+    "type": "about:blank",
+    "title": "Forbidden",
+    "status": 403,
+    "detail": "This credential may not read billing coverage for the team.",
+    "code": "FORBIDDEN",
+}
+COVERAGE_TEAM_REFUSAL_BODY = {
+    "code": "TEAM_NOT_IN_MEMBERSHIP",
+    "message": "The requested team is not one this credential can read",
+}
+
+
+@pytest.mark.asyncio
+async def test_coverage_ratio_platform_refusal_names_the_credential_not_a_feature_flag(
+    monkeypatch, httpserver, tmp_path
+):
+    """The route maps the platform's coverage 403 to a problem body coded FORBIDDEN.
+
+    The platform gates coverage only on whether the credential can view the
+    team's organization; the coding-assistant-separation gate is gone upstream.
+    """
+    monkeypatch.setattr(endpoint_registry, "_resolved_app_base_url", lambda: platform_url(httpserver))
+    httpserver.expect_request(COVERAGE_PATH).respond_with_json(
+        COVERAGE_PLATFORM_REFUSAL_BODY, status=403, content_type="application/problem+json"
+    )
+
+    result, text = await _call(monkeypatch, httpserver, tmp_path, {"action": "get_coverage_ratio"})
+
+    assert result.is_error is True
+    assert "This credential may not read billing coverage for the team." in text
+    assert "**HTTP Status**: 403" in text
+    assert "cannot read team" not in text
+    assert "coding-assistant-separation" not in text
+    assert "view the team's organization" in text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [401, 403, 404])
+async def test_coverage_ratio_unpaired_analytics_host_names_the_setting_not_the_credential(
+    monkeypatch, httpserver, tmp_path, status
+):
+    async def refused_by_an_unpaired_host(self, **_):
+        raise ReveniumAPIError(
+            f"HTTP {status}: refused\n\n**To fix:** set REVENIUM_APP_BASE_URL",
+            status_code=status,
+            code=UNPAIRED_ANALYTICS_HOST,
+        )
+
+    monkeypatch.setattr(ReveniumClient, "get_provider_coverage", refused_by_an_unpaired_host)
+
+    result, text = await _call(monkeypatch, httpserver, tmp_path, {"action": "get_coverage_ratio"})
+
+    assert result.is_error is True
+    assert "not from the credential" in text
+    assert "REVENIUM_APP_BASE_URL" in text
+    assert "server's administrator" in text
+    assert "A 403 refuses this credential" not in text
+    assert "get_filter_options" not in text
+    assert "`period` (" not in text
+    assert "start_date/end_date" not in text
+
+
+@pytest.mark.asyncio
+async def test_coverage_ratio_team_membership_refusal_names_the_team(
+    monkeypatch, httpserver, tmp_path
+):
+    monkeypatch.setattr(endpoint_registry, "_resolved_app_base_url", lambda: platform_url(httpserver))
+    httpserver.expect_request(COVERAGE_PATH).respond_with_json(
+        COVERAGE_TEAM_REFUSAL_BODY, status=403
+    )
+
+    result, text = await _call(monkeypatch, httpserver, tmp_path, {"action": "get_coverage_ratio"})
+
+    assert result.is_error is True
+    assert "cannot read team teamCallerA" in text
+    assert "coding-assistant-separation" not in text
 
 
 @pytest.mark.asyncio

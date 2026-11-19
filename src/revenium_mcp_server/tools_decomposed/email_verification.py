@@ -2,6 +2,20 @@
 
 This tool provides email configuration and verification guidance using existing
 validation infrastructure from validators.py and config_cache.py update patterns.
+
+Decision (BACK-5957): the platform's notification email templates
+(/v2/api/notification-templates and its /logo, /{id} and /{id}/test paths) are
+not wrapped by any MCP tool.
+
+Authoring a team's email templates stays in the Revenium app. The list read is
+not side-effect free: it creates any template the team is still missing. The
+test send queues a real email to a person in the tenant, answers 202 and never
+reports a failed delivery. The logo is a base64 image or URL of up to 150000
+characters, which does not belong in a tool call.
+
+What reopens it: users ask to read or edit templates from an assistant, and the
+platform offers a list that does not write and a test send that confirms
+delivery.
 """
 
 from dataclasses import dataclass

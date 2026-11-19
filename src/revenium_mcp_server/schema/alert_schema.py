@@ -22,6 +22,7 @@ from ..alert_operators import (
     FILTER_LIST_OPERATOR,
     FILTER_OPERATORS,
 )
+from ..alerts.update_fidelity import DEPARTMENT_INCLUDE_DESCENDANTS_DEFAULT
 from ..models import MetricType
 from .discovery_engine import BaseSchemaDiscovery
 
@@ -142,13 +143,19 @@ class AlertSchemaDiscovery(BaseSchemaDiscovery):
                 ],
                 "tracking_period": ["DAILY", "WEEKLY", "MONTHLY", "QUARTERLY"],
             },
-            # DEPARTMENT is deliberately absent and must stay absent. The
-            # dimension exists only on the cost-control surface (see
+            # DEPARTMENT takes a single IS row, or a groupBy with no filters, on a
+            # total-cost budget alert only; the platform refuses it anywhere else (see
             # DEPARTMENT_DIMENSION_SCOPE_NOTE in
-            # tools_decomposed/cost_controls_management.py); the anomaly API
-            # throws when an alert is given DEPARTMENT, which BACK-2760 closed as
-            # intended behaviour rather than a gap to fill here.
+            # tools_decomposed/cost_controls_management.py).
             "filter_dimensions": {
+                "DEPARTMENT": {
+                    "description": "Filter by one department; works alone on a total-cost budget alert",
+                    "operators": ["EQUALS"],
+                    "example": (
+                        "4127 (numeric department id; includeDescendants: "
+                        f"{DEPARTMENT_INCLUDE_DESCENDANTS_DEFAULT})"
+                    ),
+                },
                 "ORGANIZATION": {
                     "description": "Filter by customer/business organization",
                     "operators": ["CONTAINS", "EQUALS", "NOT_EQUALS", FILTER_LIST_OPERATOR],

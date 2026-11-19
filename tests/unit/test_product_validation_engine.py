@@ -2,10 +2,12 @@
 
 import pytest
 
+from src.revenium_mcp_server.api_field_mapper import APIFieldMapper
 from src.revenium_mcp_server.product_validation_engine import (
     ValidationError,
     ValidationResult,
     ProductValidationEngine,
+    _more_than_one_unlimited_tier_errors,
 )
 
 
@@ -446,3 +448,152 @@ class TestVersionFormatValidation:
             self._product_with_version("1.0.0-beta")
         )
         assert self._version_errors(result) == []
+
+
+def _tier(name, up_to):
+    return {"name": name, "up_to": up_to, "unit_amount": "0.01"}
+
+
+def _aggregation(tiers):
+    return {
+        "name": "Tokens",
+        "elementDefinitionId": "el-1",
+        "aggregationType": "SUM",
+        "tiers": tiers,
+    }
+
+
+def _product(plan_tiers, aggregations):
+    return {
+        "name": "Usage Product",
+        "description": "Usage-based product",
+        "version": "1.0.0",
+        "paymentSource": "INVOICE_ONLY_NO_PAYMENT",
+        "sourceIds": ["src-1"],
+        "plan": {
+            "type": "SUBSCRIPTION",
+            "name": "Monthly",
+            "currency": "USD",
+            "period": "MONTH",
+            "tiers": plan_tiers,
+            "ratingAggregations": aggregations,
+        },
+    }
+
+
+def _unlimited_tier_errors(product):
+    result = ProductValidationEngine.validate_product_data(product)
+    return [error for error in result.errors if "unlimited" in error.error]
+
+
+class TestOneUnlimitedTierPerTierList:
+    """The platform allows one tier with no upTo in each tier list, not one per product (BACK-952)."""
+
+    def test_one_unlimited_tier_in_the_plan_and_one_in_an_aggregation_is_accepted(self):
+        product = _product(
+            [_tier("Base", 1000), _tier("Overage", None)],
+            [_aggregation([_tier("First", 500), _tier("Rest", None)])],
+        )
+
+        result = ProductValidationEngine.validate_product_data(product)
+
+        assert result.errors == []
+
+    def test_one_unlimited_tier_in_each_of_two_aggregations_is_accepted(self):
+        product = _product(
+            [_tier("Base", None)],
+            [_aggregation([_tier("Input", None)]), _aggregation([_tier("Output", None)])],
+        )
+
+        assert _unlimited_tier_errors(product) == []
+
+    def test_camel_case_tiers_are_counted_per_list_too(self):
+        product = _product(
+            [
+                {"name": "Base", "upTo": 1000, "unitAmount": "1"},
+                {"name": "Over", "upTo": None, "unitAmount": "0.5"},
+            ],
+            [
+                _aggregation(
+                    [
+                        {"name": "First", "upTo": 500, "unitAmount": "0.02"},
+                        {"name": "Rest", "upTo": None, "unitAmount": "0.01"},
+                    ]
+                )
+            ],
+        )
+
+        assert _unlimited_tier_errors(product) == []
+
+    def test_two_camel_case_unlimited_tiers_in_one_list_are_refused(self):
+        product = _product(
+            [{"name": "Base", "upTo": None, "unitAmount": "1"}],
+            [
+                _aggregation(
+                    [
+                        {"name": "A", "upTo": None, "unitAmount": "0.02"},
+                        {"name": "B", "upTo": None, "unitAmount": "0.01"},
+                    ]
+                )
+            ],
+        )
+
+        errors = _unlimited_tier_errors(product)
+
+        assert [error.field for error in errors] == ["plan.ratingAggregations[0].tiers"]
+        assert errors[0].value == 2
+
+    def test_two_unlimited_tiers_in_the_plan_are_refused(self):
+        product = _product([_tier("A", None), _tier("B", None)], [])
+
+        errors = _unlimited_tier_errors(product)
+
+        assert [error.field for error in errors] == ["plan.tiers"]
+        assert "more than one tier where up_to is null" in errors[0].error
+
+    def test_two_unlimited_tiers_in_one_aggregation_are_refused(self):
+        product = _product(
+            [_tier("Base", None)],
+            [_aggregation([_tier("Input", 100)]), _aggregation([_tier("A", None), _tier("B", None)])],
+        )
+
+        errors = _unlimited_tier_errors(product)
+
+        assert [error.field for error in errors] == ["plan.ratingAggregations[1].tiers"]
+        assert errors[0].value == 2
+
+    def test_two_unlimited_tiers_in_an_aggregation_are_refused_without_plan_tiers(self):
+        product = _product([], [_aggregation([_tier("A", None), _tier("B", None)])])
+
+        errors = _unlimited_tier_errors(product)
+
+        assert [error.field for error in errors] == ["plan.ratingAggregations[0].tiers"]
+
+    @pytest.mark.parametrize("aggregation_key", APIFieldMapper.RATING_AGGREGATION_KEYS)
+    def test_an_aggregation_under_either_key_is_checked_for_two_unlimited_tiers(self, aggregation_key):
+        product = _product([_tier("Base", None)], [])
+        del product["plan"]["ratingAggregations"]
+        product["plan"][aggregation_key] = [_aggregation([_tier("A", None), _tier("B", None)])]
+
+        errors = _unlimited_tier_errors(product)
+
+        assert len(errors) == 1
+        assert errors[0].value == 2
+
+    def test_the_count_reads_a_plan_not_yet_normalized(self):
+        raw_plan = {
+            "tiers": [
+                {"name": "Base", "upTo": 1000, "unitAmount": "1"},
+                {"name": "Next", "upTo": 5000, "unitAmount": "0.8"},
+                {"name": "Over", "upTo": None, "unitAmount": "0.5"},
+            ],
+            "rating_aggregations": [
+                _aggregation([_tier("A", None), {"name": "B", "upTo": None, "unitAmount": "0.01"}])
+            ],
+        }
+
+        errors = _more_than_one_unlimited_tier_errors(raw_plan)
+
+        assert [(error.field, error.value) for error in errors] == [
+            ("plan.rating_aggregations[0].tiers", 2)
+        ]

@@ -19,6 +19,12 @@ from ..client import get_shared_http_client
 from ..platform_lockout import lockout_message, platform_lockouts, stated_wait_seconds
 
 DEFAULT_CACHE_TTL_SECONDS = 30
+# Valid keys get codeless 403s in normal use (a missing or foreign id, a feature
+# that is off), so evicting on each one would turn an agent probing ids into one
+# /users/me per tool call, and a /users/me 429 locks the key out. Ten seconds
+# absorbs such a burst yet stays well under DEFAULT_CACHE_TTL_SECONDS, so a
+# revoked key is still dropped long before its cache entry would expire.
+AMBIGUOUS_REFUSAL_EVICTION_INTERVAL_SECONDS = 10
 _CACHE_MAXSIZE = 10_000
 _USERS_ME_PATH = "/profitstream/v2/api/users/me"
 # Single message for every "the platform does not accept this key" outcome, so
@@ -113,6 +119,9 @@ class ApiKeyValidator:
     ) -> None:
         self._base_url = platform_base_url.rstrip("/")
         self._cache: TTLCache = TTLCache(maxsize=_CACHE_MAXSIZE, ttl=ttl_seconds)
+        self._recent_ambiguous_evictions: TTLCache = TTLCache(
+            maxsize=_CACHE_MAXSIZE, ttl=AMBIGUOUS_REFUSAL_EVICTION_INTERVAL_SECONDS
+        )
         # Per-key single-flight: concurrent requests for the SAME cache key
         # share one /users/me call; requests for DIFFERENT keys never block
         # each other. _inflight_guard only protects the short dict lookup.
@@ -122,6 +131,14 @@ class ApiKeyValidator:
     def invalidate(self, token: str) -> None:
         """Drop a cached identity so the next request re-validates."""
         self._cache.pop(_cache_key(_strip_bearer(token)), None)
+
+    def invalidate_after_ambiguous_refusal(self, token: str) -> None:
+        """Drop a cached identity at most once per AMBIGUOUS_REFUSAL_EVICTION_INTERVAL_SECONDS per key."""
+        key = _cache_key(_strip_bearer(token))
+        if key in self._recent_ambiguous_evictions:
+            return
+        self._recent_ambiguous_evictions[key] = True
+        self._cache.pop(key, None)
 
     async def validate(self, token: str) -> ApiKeyIdentity:
         token = _strip_bearer(token)

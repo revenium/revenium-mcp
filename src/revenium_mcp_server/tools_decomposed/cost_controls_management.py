@@ -20,7 +20,7 @@ control fires and the compiled rule set the enforcer evaluates.
 A guardrail can be scoped per department by setting
 ``groupBy`` to DEPARTMENT, which turns one control into one independent budget
 per department; ``preview_department_group`` reports that fan-out before the
-control is written. DEPARTMENT is cost-control-only (see
+control is written. On alerts DEPARTMENT fits only two budget shapes (see
 ``DEPARTMENT_DIMENSION_SCOPE_NOTE``) and is gated per tenant (see
 ``DEPARTMENT_BUDGETS_FEATURE_NOTE``).
 """
@@ -42,6 +42,11 @@ from ..common.change_history import (
     render_change_page,
     render_change_summary,
 )
+from ..alerts.update_fidelity import (
+    DEPARTMENT_ALERT_BUDGET_SHAPE,
+    DEPARTMENT_ALERT_FORMS,
+    DEPARTMENT_ALERT_SWITCHES,
+)
 from ..common.change_reason import (
     COST_CONTROL_CHANGE_REASON,
     CHANGE_REASON_ARGUMENT,
@@ -51,6 +56,14 @@ from ..common.change_reason import (
     checked_change_reason,
     delete_refusal_is_id_or_change_reason,
     id_or_change_reason_refused,
+)
+from ..common.creator_filter import (
+    CREATOR_FILTER_EXAMPLE,
+    CREATOR_FILTER_KEY,
+    CREATOR_FILTER_NOTE,
+    CREATOR_QUERY_PARAMETER,
+    creator_checked_filters,
+    no_rule_by_creator,
 )
 from ..common.department_aliases import (
     deprecated_aliases_note,
@@ -67,7 +80,6 @@ from ..common.formatting import format_page_count_heading
 from ..common.platform_paging import PLATFORM_MAX_PAGE_SIZE
 from ..common.sample_coverage import platform_total
 from ..common.validation import (
-    apply_filter_allowlist,
     is_blank,
     refuse_arguments_the_action_ignores,
     refuse_every_argument_the_read_ignores,
@@ -162,12 +174,16 @@ def _written_control_text(heading: str, control: Any) -> str:
 # re-read 2026-10-28) declares query / teamId / a hidden type plus a Pageable
 # (page, size, sort), and never reads type: dev answered type=BLOCK, NOTIFY and
 # ZZZ_NOT_A_TYPE with the same full list (BACK-5154). teamId and page/size are
-# set by the client, so query and sort are what a caller may set; type is
-# refused in _cost_control_list_filters.
+# set by the client, so query, sort and createdById (in the preview spec,
+# 2026-11-17, checked by creator_checked_filters, BACK-5958) are what a caller
+# may set; type is refused in _cost_control_list_filters.
 _COST_CONTROL_FILTER_MAP: Dict[str, str] = {
     "query": "query",
     "sort": "sort",
+    CREATOR_FILTER_KEY: CREATOR_QUERY_PARAMETER,
 }
+
+_COST_CONTROL_FILTER_KEYS = ", ".join(sorted(_COST_CONTROL_FILTER_MAP))
 
 _COST_CONTROL_TYPE_FILTER_ALTERNATIVE = (
     "List without the type filter and read each control's `action` field, or "
@@ -175,11 +191,14 @@ _COST_CONTROL_TYPE_FILTER_ALTERNATIVE = (
 )
 
 _COST_CONTROL_FILTERS_DESCRIPTION = (
-    "Optional filters for list. Valid keys: query, sort. 'query' is a server-side "
-    "search on the cost control name. type is refused: the platform returns every "
+    f"Optional filters for list. Valid keys: {_COST_CONTROL_FILTER_KEYS}. 'query' is a "
+    "server-side search on the cost control name. "
+    f"{CREATOR_FILTER_NOTE} type is refused: the platform returns every "
     "cost control whatever type is sent. Any other key is rejected rather than "
     "silently ignored."
 )
+
+_CREATOR_LIST_EXAMPLE = f"list(filters={CREATOR_FILTER_EXAMPLE!r})"
 
 _TOP_LEVEL_QUERY_ON_LIST_REFUSAL = (
     "list does not read the top-level query argument; it is the enforcement-event "
@@ -478,14 +497,14 @@ DEPARTMENT_BUDGETS_FEATURE_NOTE = (
     "it is a tenant-configuration state, not a permissions problem with your key."
 )
 
-# Single authoritative statement of the dimension's blast radius. BACK-2760
-# closed with the decision that the alert/anomaly surface does not support
-# DEPARTMENT (the anomaly API throws on it), so an agent that discovers the
-# dimension here must not carry it over to manage_alerts.
+# The platform admits DEPARTMENT on an alert only in the two budget shapes
+# DepartmentAlertGate accepts (BACK-5706), so an agent that discovers the dimension
+# here must not carry a wider use over to manage_alerts.
 DEPARTMENT_DIMENSION_SCOPE_NOTE = (
-    "DEPARTMENT is a cost-control-only dimension: manage_alerts (anomaly "
-    "detection) deliberately does not support it and the anomaly API throws "
-    "when given DEPARTMENT, so never send it as an alert filter or group_by."
+    f"manage_alerts takes DEPARTMENT only on {DEPARTMENT_ALERT_BUDGET_SHAPE}, for a "
+    f"company with {DEPARTMENT_ALERT_SWITCHES}: {DEPARTMENT_ALERT_FORMS}. The platform refuses "
+    "DEPARTMENT on any other alert, so combining it with other filters or another "
+    "grouping is cost-control-only."
 )
 
 # DEPARTMENT ids are raw numbers, not the hashids used for most Revenium
@@ -569,6 +588,96 @@ def _coerce_parent_department_id(raw: Any) -> int:
             ],
         )
     return candidate
+
+
+_BLOCK_ACTION = "BLOCK"
+
+
+def _is_block(action: Any) -> bool:
+    return str(action).strip().upper() == _BLOCK_ACTION
+
+
+def _is_cap(hard_limit: Any) -> bool:
+    """Whether ``hard_limit`` is a limit the enforcer applies.
+
+    The platform refuses a hardLimit of zero or less on create and PATCH
+    (CostControlService.validateThreshold), so only a stored control reaches
+    the comparison: one stored before that rule can still carry such a value,
+    and the enforcer reads it as no cap.
+    """
+    if hard_limit is None or isinstance(hard_limit, bool):
+        return False
+    try:
+        return float(hard_limit) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _refuse_a_blank_name(control_data: Dict[str, Any]) -> None:
+    name = control_data.get("name")
+    if name is None or not is_blank(name):
+        return
+    raise ToolError(
+        message=(
+            "control_data.name cannot be blank: a cost control without a name cannot be found "
+            "by list(filters={'query': ...}). Nothing was sent."
+        ),
+        error_code=ErrorCodes.VALIDATION_ERROR,
+        field="control_data.name",
+        value=name,
+        suggestions=[
+            "Pass a name with visible text, e.g. 'Monthly OpenAI cap'",
+            "Or omit name to keep the current one",
+        ],
+    )
+
+
+def _may_leave_block_without_a_cap(control_data: Dict[str, Any]) -> bool:
+    clears_cap = "hardLimit" in control_data and control_data["hardLimit"] is None
+    if "action" in control_data:
+        return _is_block(control_data["action"]) and (
+            clears_cap or "hardLimit" not in control_data
+        )
+    return clears_cap
+
+
+def _capless_block_refusal(control_id: str) -> ToolError:
+    return ToolError(
+        message=(
+            f"Cost control {control_id!r} would be a BLOCK control with no hardLimit. The "
+            "platform applies BLOCK at the hard limit; without one it applies it at "
+            "warnThreshold, and never when that is unset too. hardLimit null clears the cap "
+            "only on a control that does not block. Nothing was sent."
+        ),
+        error_code=ErrorCodes.VALIDATION_ERROR,
+        field="control_data.hardLimit",
+        value=None,
+        suggestions=[
+            "Pass a hardLimit greater than 0 to keep the control blocking",
+            "To stop blocking and clear the cap, send "
+            "control_data={'action': 'WARN_ONLY', 'hardLimit': None}",
+            "To pause the control instead, send control_data={'enabled': False}",
+        ],
+    )
+
+
+def _unreadable_control_refusal(control_id: str) -> ToolError:
+    return ToolError(
+        message=(
+            f"Cost control {control_id!r} could not be read, and this update needs its stored "
+            "action and hardLimit to tell whether it would leave a BLOCK control with no "
+            "hardLimit, which the platform would store. Nothing was sent."
+        ),
+        error_code=ErrorCodes.API_ERROR,
+        field="control_id",
+        value=control_id,
+        suggestions=[
+            "Retry the update once get(control_id=...) reads the control",
+            "Or send action and hardLimit together so the update alone decides, e.g. "
+            "control_data={'action': 'WARN_ONLY', 'hardLimit': None}, or a hardLimit "
+            "greater than 0",
+        ],
+    )
 
 
 def _rule_names_by_id(result: Any) -> Dict[str, Any]:
@@ -815,7 +924,7 @@ def _cost_control_list_filters(arguments: Dict[str, Any]) -> Dict[str, Any]:
         listing="Cost controls",
         instead=_COST_CONTROL_TYPE_FILTER_ALTERNATIVE,
     )
-    return apply_filter_allowlist(
+    return creator_checked_filters(
         arguments.get("filters"), _COST_CONTROL_FILTER_MAP, action="list_cost_controls"
     )
 
@@ -836,7 +945,7 @@ class CostControlsManager:
         response = await self.client.get_cost_controls(page=page, size=size, **filters)
         controls = self.client._extract_embedded_data(response)
         page_info = self.client._extract_pagination_info(response)
-        return {
+        result = {
             "action": "list",
             "cost_controls": controls,
             "pagination": page_info,
@@ -844,6 +953,11 @@ class CostControlsManager:
             "total_records": platform_total(page_info),
             "page": page,
         }
+        if not controls and platform_total(page_info) in (0, None):
+            note = no_rule_by_creator(filters, "cost control")
+            if note:
+                result["note"] = note
+        return result
 
     @classmethod
     def _raise_control_not_found(cls, control_id: str) -> None:
@@ -933,12 +1047,40 @@ class CostControlsManager:
             control_data = {**control_data, "teamId": self.client.team_id}
         return await self.client.create_cost_control(control_data)
 
+    async def _stored_control(self, control_id: str) -> Dict[str, Any]:
+        try:
+            stored = await self.get_cost_control({"control_id": control_id})
+        except ReveniumAPIError as e:
+            logger.warning(f"Cost control {control_id} unreadable before update ({e.status_code})")
+            raise _unreadable_control_refusal(control_id) from e
+        if not isinstance(stored, dict):
+            raise _unreadable_control_refusal(control_id)
+        return stored
+
+    async def _refuse_a_block_control_without_a_cap(
+        self, control_id: str, control_data: Dict[str, Any]
+    ) -> None:
+        if not _may_leave_block_without_a_cap(control_data):
+            return
+        if {"action", "hardLimit"} <= control_data.keys():
+            raise _capless_block_refusal(control_id)
+        stored = await self._stored_control(control_id)
+        action = control_data.get("action", stored.get("action"))
+        hard_limit = control_data.get("hardLimit", stored.get("hardLimit"))
+        if _is_block(action) and not _is_cap(hard_limit):
+            raise _capless_block_refusal(control_id)
+
     async def update_cost_control(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Update an existing cost control.
 
-        PATCH is a partial update server-side, so the caller's fields are
-        passed through as-is — no fetch-and-merge is needed (unlike the
-        full-replacement PUT resources).
+        PATCH is a partial update server-side, so the body is sent unchanged,
+        never merged with the stored control. It is refused first when it sets a
+        blank name or would leave a BLOCK control without a hardLimit. The stored
+        control is read, through get_cost_control, only when the body alone
+        cannot decide the latter; a read that fails for any other reason than
+        not found refuses the update, since the platform stores a BLOCK control
+        with no hardLimit. A hardLimit of zero or less
+        is sent unread because the platform refuses it with a 400.
         """
         control_id = arguments.get("control_id")
         if not control_id:
@@ -954,6 +1096,9 @@ class CostControlsManager:
                 action="update cost control",
                 examples={"usage": "update(control_id='cc_123', control_data={'hardLimit': 2000})"},
             )
+        if isinstance(control_data, dict):
+            _refuse_a_blank_name(control_data)
+            await self._refuse_a_block_control_without_a_cap(control_id, control_data)
         try:
             return await self.client.update_cost_control(control_id, control_data)
         except ReveniumAPIError as e:
@@ -1022,7 +1167,7 @@ class CostControlsManager:
         return render_change_page(f"Change history of budget {control_id}", response, page)
 
     async def get_changes_summary(self, arguments: Dict[str, Any]) -> str:
-        """Who created a budget and who changed it last, from its own history."""
+        """Who created a budget, who changed it last and why, from its own history."""
         control_id = self._budget_history_id(arguments, "get_changes_summary")
         summary = await read_change_history(
             self.client.get_cost_control_change_summary(control_id),
@@ -1410,7 +1555,10 @@ class CostControlsManagement(ToolBase):
                     "properties": {
                         "name": {
                             "type": "string",
-                            "description": "Human-friendly name for the guardrail (required for create)",
+                            "description": (
+                                "Human-friendly name for the guardrail (required for create). "
+                                "update refuses a blank name."
+                            ),
                         },
                         "description": {
                             "type": "string",
@@ -1429,7 +1577,12 @@ class CostControlsManagement(ToolBase):
                         },
                         "hardLimit": {
                             "type": "number",
-                            "description": "Spend level that triggers the enforcement action (required for create)",
+                            "description": (
+                                "Spend level that triggers the enforcement action (required for "
+                                "create). On update, null clears it, which update refuses when the "
+                                "control would then be a BLOCK control with no hardLimit, including "
+                                "when the update sets action BLOCK on a control that has none."
+                            ),
                         },
                         "windowType": {
                             "type": "string",
@@ -1803,7 +1956,7 @@ class CostControlsManagement(ToolBase):
                     "list": {
                         "page": "int (optional)",
                         "size": "int (optional)",
-                        "filters": "dict (optional). Supports 'query' for server-side search on name",
+                        "filters": _COST_CONTROL_FILTERS_DESCRIPTION,
                     },
                     "get": {"control_id": "str"},
                     "create": {
@@ -1833,6 +1986,7 @@ class CostControlsManagement(ToolBase):
                 examples=[
                     "list(page=0, size=20)",
                     "list(filters={'query': 'monthly'})",
+                    _CREATOR_LIST_EXAMPLE,
                     "create(control_data={'name': 'Monthly Guardrail', 'metricType': 'TOTAL_COST', 'hardLimit': 1000, 'windowType': 'MONTHLY', 'action': 'BLOCK'})",
                     "create(control_data={'name': 'Frontier models cap', 'metricType': 'TOTAL_COST', 'hardLimit': 1000, 'windowType': 'MONTHLY', 'action': 'BLOCK', 'filters': [{'dimension': 'MODEL', 'operator': 'IN', 'values': ['gpt-4', 'claude-sonnet-4-5']}]})",
                     "update(control_id='cc_123', control_data={'hardLimit': 2000})",
@@ -2074,6 +2228,7 @@ class CostControlsManagement(ToolBase):
                     "examples": {
                         "list": {"action": "list", "page": 0, "size": 20},
                         "search": {"action": "list", "filters": {"query": "monthly"}},
+                        "by_creator": {"action": "list", "filters": dict(CREATOR_FILTER_EXAMPLE)},
                         "get": {"action": "get", "control_id": "cc_123"},
                         "create": {
                             "action": "create",
@@ -2267,19 +2422,7 @@ class CostControlsManagement(ToolBase):
 
             if action == "list":
                 result = await manager.list_cost_controls(arguments)
-                return [
-                    TextContent(
-                        type="text",
-                        text=format_page_count_heading(
-                            "cost controls",
-                            len(result["cost_controls"]),
-                            result["pagination"],
-                            result["page"],
-                        )
-                        + "\n\n"
-                        + json.dumps(self._compact_list(result), indent=2),
-                    )
-                ]
+                return [TextContent(type="text", text=self._list_text(result))]
 
             elif action == "get":
                 result = await manager.get_cost_control(arguments)
@@ -2574,6 +2717,16 @@ class CostControlsManagement(ToolBase):
             f"{payload.get('blockedCount')} blocked, {payload.get('warnedCount')} warned, "
             f"{payload.get('underCount')} under. This listing names people or departments:"
         )
+
+    @classmethod
+    def _list_text(cls, result: Dict[str, Any]) -> str:
+        heading = format_page_count_heading(
+            "cost controls", len(result["cost_controls"]), result["pagination"], result["page"]
+        )
+        note = result.get("note")
+        if note:
+            heading = f"{heading}\n{note}"
+        return f"{heading}\n\n{json.dumps(cls._compact_list(result), indent=2)}"
 
     @staticmethod
     def _compact_list(result: Dict[str, Any]) -> Dict[str, Any]:

@@ -45,8 +45,16 @@ from ..alerts.quick_actions import (
     quick_action_threshold,
     refuse_unhonoured_arguments,
 )
-from ..alerts.semantic_processor import refuse_an_undecided_threshold, threshold_in_text
+from ..alerts.semantic_processor import (
+    refuse_a_filter_read_from_text,
+    refuse_an_undecided_threshold,
+    threshold_read_from_text,
+)
 from ..alerts.update_fidelity import (
+    DEPARTMENT_ALERT_BUDGET_SHAPE,
+    DEPARTMENT_ALERT_FORMS,
+    DEPARTMENT_ALERT_SWITCHES,
+    DEPARTMENT_INCLUDE_DESCENDANTS_DEFAULT,
     PROVIDER_ALERT_TYPES,
     PROVIDER_FILTER_DIMENSIONS,
     PROVIDER_METRICS,
@@ -78,12 +86,21 @@ from ..common.error_handling import (
     raise_refusal,
     raise_structured_error,
 )
-from ..common.money import render_plain_amount
+from ..common.creator_filter import (
+    CREATOR_FILTER_EXAMPLE,
+    CREATOR_FILTER_KEY,
+    CREATOR_FILTER_NOTE,
+    CREATOR_QUERY_PARAMETER,
+    creator_checked_filters,
+)
+from ..common.money import is_finite_number, render_plain_amount
+from ..common.one_line import one_line
 from ..common.pagination_performance import validate_pagination_with_performance
 from ..common.thin_tool_defaults import arguments_filled_on_every_call
 from ..common.validation import (
     apply_filter_allowlist,
     refuse_every_argument_the_read_ignores,
+    refuse_ignored_filter,
     validate_pagination_params,
 )
 from ..common.ucm_config import log_ucm_status
@@ -127,14 +144,32 @@ _UNAVAILABLE_ACTIONS: Dict[str, str] = {
     ),
 }
 
-# Verified 2026-08-28 against hypercurrent origin/develop
-# AIAnomalyController.list: @RequestParam query / teamId / type plus a Pageable
-# (page, size, sort). teamId and page/size are set by the client.
+# AIAnomalyController.listByCreator (hypercurrent origin/develop and
+# origin/release/v2.28.0, re-read 2026-11-18) binds query / teamId / a hidden type /
+# createdById plus a Pageable (page, size, sort), and passes type to none of its
+# three reads (find, search, findByCreator). teamId and page/size are set by the
+# client, so query, sort and createdById (checked by creator_checked_filters,
+# BACK-5958) are what a caller may set; type is refused in _rule_search_filters.
 _ANOMALY_FILTER_MAP: Dict[str, str] = {
     "query": "query",
-    "type": "type",
     "sort": "sort",
+    CREATOR_FILTER_KEY: CREATOR_QUERY_PARAMETER,
 }
+
+ANOMALY_FILTER_KEYS = ", ".join(sorted(_ANOMALY_FILTER_MAP))
+
+_RULE_TYPE_FILTER_ALTERNATIVE = (
+    "List without the type filter and read each rule's Type line (its alertType), or "
+    "search by name with filters={'query': '<name>'}."
+)
+
+RULE_LIST_FILTERS_NOTE = (
+    f"accepted keys: {ANOMALY_FILTER_KEYS}; type is refused, because the platform returns "
+    "every rule whatever type is sent, so read each rule's type from the list. "
+    f"{CREATOR_FILTER_NOTE}"
+)
+
+ALERT_RULES_BY_CREATOR_EXAMPLE = f"list(resource_type='anomalies', filters={CREATOR_FILTER_EXAMPLE!r})"
 
 
 # The portfolio's documented groupLimit bounds; the platform answers 400 outside them.
@@ -169,6 +204,28 @@ API_KEY_FILTER_EXAMPLE = (
     '"alertType": "CUMULATIVE_USAGE", "metricType": "TOTAL_COST", '
     '"operatorType": "GREATER_THAN", "threshold": 500, "periodDuration": "MONTHLY", '
     '"filters": [{"dimension": "API_KEY", "operator": "IS", "value": "<id>"}]})'
+)
+
+DEPARTMENT_FILTER_GUIDANCE = (
+    "A DEPARTMENT filter row takes the department's numeric id as its `value` with the IS "
+    "operator (find the id with manage_customers `list_departments`), and "
+    f"`includeDescendants` ({DEPARTMENT_INCLUDE_DESCENDANTS_DEFAULT}). On an alert, which "
+    "notifies and does not stop spend, DEPARTMENT fits only "
+    f"{DEPARTMENT_ALERT_BUDGET_SHAPE}, in one of two forms: {DEPARTMENT_ALERT_FORMS}. "
+    "To combine a Department filter with other filters or a "
+    "grouping, use \"Enforce a hard stop\" in manage_cost_controls instead. The platform "
+    "refuses any other shape, and accepts these only for a company with "
+    f"{DEPARTMENT_ALERT_SWITCHES}. Its "
+    "refusal is a general message that does not say whether the shape or the company "
+    "setting is the cause, and it is shown as is."
+)
+
+DEPARTMENT_FILTER_EXAMPLE = (
+    'create(anomaly_data={"name": "Department budget", "alertType": "CUMULATIVE_USAGE", '
+    '"metricType": "TOTAL_COST", "operatorType": "GREATER_THAN", "threshold": 500, '
+    '"periodDuration": "MONTHLY", '
+    '"filters": [{"dimension": "DEPARTMENT", "operator": "IS", "value": "<department id>", '
+    '"includeDescendants": true}]})'
 )
 
 TEAM_LOG_TOOL_PROFILE_NOTE = (
@@ -208,7 +265,7 @@ def refuse_history_arguments_the_read_ignores(action: str, arguments: Dict[str, 
 
 ALERT_HISTORY_EXAMPLES = """```bash
 list_changes(anomaly_id="anom_123")             # Who changed an alert rule, when, why, and each setting before and after (paged)
-get_changes_summary(anomaly_id="anom_123")      # Who created the alert rule and who changed it last
+get_changes_summary(anomaly_id="anom_123")      # Who created the alert rule, who changed it last and the reason given
 ```"""
 
 # Module-level — must stay in sync with AlertType enum members.
@@ -299,6 +356,17 @@ def _format_budget_usage(entry: Dict[str, Any], share: float) -> str:
     return f"{usage} (over budget)" if _is_over_budget(entry, share) else usage
 
 
+def _spend_outside_every_department(entry: Dict[str, Any]) -> Optional[str]:
+    """The spend a department-grouped budget leaves uncovered, or None when the platform measured none.
+
+    It stays apart from the summed figures because it is not covered by this budget.
+    """
+    spend = entry.get("spendNotInAnyDepartment")
+    if not is_finite_number(spend):
+        return None
+    return f"{render_plain_amount(spend)} outside every department (not covered by this budget)"
+
+
 def _grouped_budget_parts(entry: Dict[str, Any], group_count: int) -> List[str]:
     """Render a grouped budget's figures, leading with the totals' scope.
 
@@ -326,6 +394,112 @@ def _grouped_budget_parts(entry: Dict[str, Any], group_count: int) -> List[str]:
     else:
         parts.append(f"{group_count} groups")
     return parts
+
+
+_DELETED_DEPARTMENT_FIX = "edit the budget to pick another department, or delete the budget."
+
+_BLOCKED_BUDGET_CODES = frozenset({"SPEND_UNAVAILABLE", "DEPARTMENT_DELETED"})
+
+_BLOCKED_BUDGET_ACTIONS = {
+    "SPEND_UNAVAILABLE": ("Retry later", None),
+    "DEPARTMENT_DELETED": ("Not retryable", _DELETED_DEPARTMENT_FIX),
+}
+
+_MARKDOWN_SPECIALS = re.compile(r"[\\`*\[\]<>|]|(?<![A-Za-z0-9])_|_(?![A-Za-z0-9])")
+
+# Department.name is a 256-character column upstream, so a real name, id or code is
+# never cut; a platform sentence gets the bound customer_management gives a warning line.
+_NAME_MAX_LENGTH = 256
+_MESSAGE_MAX_LENGTH = 500
+
+
+def _single_line(text: Any, max_length: int) -> str:
+    """Platform or user text made safe for one markdown bullet: one bounded line, no live markup."""
+    return _MARKDOWN_SPECIALS.sub(lambda m: "\\" + m.group(0), one_line(text, max_length))
+
+
+def _blocked_budget_action(code: Optional[str], reason: str) -> Optional[str]:
+    """What to do about a blocked budget, without repeating advice the reason already gives."""
+    lead, advice = _BLOCKED_BUDGET_ACTIONS.get(code or "", (None, None))
+    if lead is None:
+        return None
+    if advice is None or advice in reason.casefold():
+        return f"{lead}."
+    return f"{lead}: {advice}"
+
+
+def _budget_blocker(entry: Dict[str, Any]) -> Optional[Tuple[Optional[str], Optional[str]]]:
+    """The (code, reason) of a budget the platform could not read, from a portfolio row or a bulk error item.
+
+    A bulk error item is read only for a code in _BLOCKED_BUDGET_CODES; any other error item keeps its earlier rendering.
+    """
+    unavailable = entry.get("unavailable")
+    if isinstance(unavailable, dict) and (unavailable.get("code") or unavailable.get("reason")):
+        return unavailable.get("code"), unavailable.get("reason")
+    error = entry.get("error")
+    if isinstance(error, dict) and (error.get("code") or error.get("type")) in _BLOCKED_BUDGET_CODES:
+        return error.get("code") or error.get("type"), error.get("message")
+    return None
+
+
+def _format_budget_blocker(code: Optional[str], reason: Optional[str]) -> str:
+    code = _single_line(code, _NAME_MAX_LENGTH) if code else None
+    reason = _single_line(reason, _MESSAGE_MAX_LENGTH) if reason else ""
+    text = f"state unavailable ({code})." if code else "state unavailable."
+    if reason:
+        text += f" {reason}"
+    action = _blocked_budget_action(code, reason)
+    return f"{text} {action}" if action else text
+
+
+def _format_budget_department(entry: Dict[str, Any]) -> Optional[str]:
+    department = entry.get("departmentFilter")
+    if not isinstance(department, dict):
+        return None
+    name = department.get("name")
+    department_id = department.get("departmentId")
+    suffix = " (including sub-departments)" if department.get("includeSubDepartments") else ""
+    if name:
+        return f"department {_single_line(name, _NAME_MAX_LENGTH)}{suffix}"
+    unnamed = "an unnamed department"
+    if department_id is not None:
+        unnamed += f" (`{_single_line(department_id, _NAME_MAX_LENGTH)}`)"
+    return unnamed + suffix
+
+
+def _format_budget_notice(entry: Dict[str, Any]) -> Optional[str]:
+    notice = entry.get("notice")
+    text = notice.get("text") if isinstance(notice, dict) else None
+    return f"note: {_single_line(text, _MESSAGE_MAX_LENGTH)}" if text else None
+
+
+def _coded_refusal_details(error: ReveniumAPIError) -> Optional[Tuple[str, str]]:
+    """The (code, message) of any 422 whose body names a ``details.code``, whatever the code is."""
+    data = error.response_data if isinstance(error.response_data, dict) else {}
+    body = data.get("error_data", data)
+    if not isinstance(body, dict):
+        return None
+    details = body.get("details")
+    code = details.get("code") if isinstance(details, dict) else None
+    if not isinstance(code, str) or not code:
+        return None
+    return code, _single_line(body.get("message") or error.platform_message, _MESSAGE_MAX_LENGTH)
+
+
+def _coded_refusal(error: ReveniumAPIError, anomaly_id: Any) -> Optional[ToolError]:
+    refusal = _coded_refusal_details(error)
+    if refusal is None:
+        return None
+    code, message = refusal
+    code = _single_line(code, _NAME_MAX_LENGTH)
+    action = _blocked_budget_action(code, message or "")
+    return ToolError(
+        message=f"{message} ({code})" if message else f"The platform refused this request ({code})",
+        error_code=ErrorCodes.BUSINESS_RULE_VIOLATION,
+        field="anomaly_id",
+        value=str(anomaly_id),
+        suggestions=[action] if action else [],
+    )
 
 
 def _quick_threshold_label(threshold: Any, is_percentage: bool) -> str:
@@ -577,6 +751,8 @@ class AlertManagement(ToolBase, SlackPromptingMixin):
                 description="Create and manage AI-powered anomaly detection rules",
                 parameters={
                     "resource_type": "str (anomalies, alerts)",
+                    "list": {"filters": f"dict - {RULE_LIST_FILTERS_NOTE}"},
+                    "query": {"filters": f"dict - {RULE_LIST_FILTERS_NOTE}"},
                     "create": {"anomaly_data": f"dict. {ANOMALY_DATA_CHANGE_REASON_NOTE}"},
                     "update": {
                         "anomaly_id": "str",
@@ -597,6 +773,7 @@ class AlertManagement(ToolBase, SlackPromptingMixin):
                     "'changeReason': 'Threshold lowered after the October invoice'})",
                     "delete(anomaly_id='anom_123', change_reason='Retired and replaced by a budget')",
                     "clear_all(change_reason='Clean slate before the audit')",
+                    ALERT_RULES_BY_CREATOR_EXAMPLE,
                     "create(resource_type='anomalies', anomaly_data={'name': 'Frontier model spend', "
                     "'alertType': 'THRESHOLD', 'metricType': 'TOTAL_COST', 'operatorType': "
                     "'GREATER_THAN', 'threshold': 500, 'filters': [{'dimension': 'MODEL', "
@@ -681,7 +858,13 @@ class AlertManagement(ToolBase, SlackPromptingMixin):
                         "triggerAfterPersistsDuration": trigger_duration_doc,
                     },
                     "create_from_text": {
-                        "text": "str (required) - Natural language description including metric type",
+                        "text": (
+                            "str (required) - Natural language description including metric type "
+                            "and the threshold number. A text with no number to read as the "
+                            "threshold is refused, never given one; state it in the text or use "
+                            "create. A text the parser reads a filter from is refused; state "
+                            "filters with create"
+                        ),
                         "name": "str (optional) - the alert's name; generated from the text when absent",
                         "email": "str (optional)",
                         "notificationAddresses": "list (optional) - further recipients",
@@ -1535,7 +1718,13 @@ Comprehensive AI anomaly detection and alert management for the Revenium platfor
     @staticmethod
     def _rule_search_filters(arguments: Dict[str, Any], action: str) -> Dict[str, Any]:
         """Filters a rule list or query sends, its top-level query as the platform's name search."""
-        filters = apply_filter_allowlist(
+        refuse_ignored_filter(
+            arguments.get("filters"),
+            "type",
+            listing="Alert rules",
+            instead=_RULE_TYPE_FILTER_ALTERNATIVE,
+        )
+        filters = creator_checked_filters(
             arguments.get("filters"), _ANOMALY_FILTER_MAP, action=action
         )
         query = arguments.get("query")
@@ -1691,6 +1880,7 @@ get(resource_type="alerts", alert_id="evt_123")  # Specific alert event
 ### **Manage Alert Definitions/Rules**
 ```bash
 list(resource_type="anomalies")                 # Alert rules/definitions
+{ALERT_RULES_BY_CREATOR_EXAMPLE}  # Only the rules one person created
 create_cumulative_usage_alert(...)              # Budget tracking rule
 create_threshold_alert(...)                     # Real-time monitoring rule
 reset_budget(anomaly_id="anom_123")             # Restart a budget alert's current-period accumulation (id from list(resource_type="anomalies"))
@@ -1698,6 +1888,7 @@ get_budget_portfolio()                          # Budget-progress snapshot for e
 get_budget_progress(anomaly_id="anom_123")      # Current period spend vs. threshold for one budget alert (or anomaly_ids=[...] for several)
 search_provider_api_keys(query="prod")          # Find a provider API key's id for an API_KEY filter (ids and masked hints only)
 ```
+A rule list or query takes filters with {RULE_LIST_FILTERS_NOTE}
 
 ### **Read Who Changed an Alert Rule**
 {ALERT_HISTORY_EXAMPLES}
@@ -1815,6 +2006,8 @@ search_provider_api_keys(query="prod")          # Find a provider API key's id f
             "`search_provider_api_keys(query=...)`. "
             f"{API_KEY_FILTER_GUIDANCE}\n\n"
             f"```bash\n{API_KEY_FILTER_EXAMPLE}\n```\n"
+            f"\n**DEPARTMENT filters**: {DEPARTMENT_FILTER_GUIDANCE}\n\n"
+            f"```bash\n{DEPARTMENT_FILTER_EXAMPLE}\n```\n"
         )
 
         # Alert Types — same fallback chain. Each enum value carries a short
@@ -2149,6 +2342,8 @@ get_budget_progress(anomaly_id="anom_123")
 # Progress for a specific set of budget alerts in one call.
 get_budget_progress(anomaly_ids=["anom_123", "anom_456"])
 ```
+
+A budget on one department names it (and "including sub-departments" when it covers them). A budget on a deleted department, or whose spend cannot be loaded, prints "state unavailable" with the reason and what to do, never a figure: retry later, or edit the budget to pick another department or delete it. A department nobody is assigned to prints its $0 figures with the note "No one is assigned to this department."
 
 **Pro Tip**: Use metric filtering to create targeted budget alerts that track spending for specific providers, models, customers, or products instead of global budgets!""",
                     )
@@ -2772,7 +2967,7 @@ update(
 - Resets at the beginning of each period
 - Perfect for budget limits and quota management
 - **Supports metric filtering** for provider, model, customer, or product-specific budgets
-- Example: "Alert when monthly OpenAI spending exceeds $2000"
+- Example: "Alert when monthly spending exceeds $2000"
 
 ### **Spike Detection** (THRESHOLD)
 - Triggers immediately when values exceed thresholds
@@ -2780,7 +2975,7 @@ update(
 - Perfect for spike detection and performance monitoring
 - **Supports metric filtering** for provider, model, customer, or product-specific monitoring
 - **Supports persistence-based triggering** with triggerAfterPersistsDuration
-- Example: "Alert when GPT-4 cost per 15 minutes exceeds $200"
+- Example: "Alert when cost per 15 minutes exceeds $200"
 
 ### **Relative Change** (RELATIVE_CHANGE)
 - Detects percentage-based changes over time
@@ -2924,7 +3119,7 @@ create(resource_type="anomalies", anomaly_data={
 })
 
 # Natural language (email optional: defaults to your own email when hosted; locally, the address saved with manage_system_setup update_email, then REVENIUM_DEFAULT_EMAIL)
-create_from_text(text="Alert when monthly OpenAI spending exceeds $2000")
+create_from_text(text="Alert when monthly spending exceeds $2000")
 ```
 
 ## **Best Practices and Common Patterns**
@@ -3540,10 +3735,10 @@ create(resource_type="anomalies", anomaly_data={
                     parameter_name="text",
                     action="create alert from text",
                     examples={
-                        "usage": "create_from_text(text='Alert me when API errors exceed 5% in 10 minutes')",
+                        "usage": "create_from_text(text='Alert when costs exceed $50 per hour')",
                         "valid_format": "Natural language description of the alert condition",
                         "example_descriptions": [
-                            "Alert me when API errors exceed 5% in 10 minutes",
+                            "Alert when costs exceed $50 per hour",
                             "Notify when token usage goes above 10000 per hour",
                             "Send alert if request rate drops below 100 per minute",
                         ],
@@ -3554,6 +3749,7 @@ create(resource_type="anomalies", anomaly_data={
             notification_config = self._notification_config_or_refuse(arguments)
 
             parsed_data = self.semantic_processor.parse_alert_request(text)
+            refuse_a_filter_read_from_text(text, (parsed_data or {}).get("filters") or [])
 
             if parsed_data and parsed_data.get("detection_rules"):
                 parsed_data.pop("notification_addresses", None)
@@ -3597,7 +3793,7 @@ create(resource_type="anomalies", anomaly_data={
                         "create_cumulative_usage_alert()",
                     ],
                     "better_descriptions": [
-                        "Alert when API errors exceed 5% in 10 minutes",
+                        "Alert when costs exceed $50 per hour",
                         "Notify when token usage goes above 10000 per hour",
                     ],
                     "troubleshooting": "Natural language processing may fail with complex or ambiguous descriptions",
@@ -3685,13 +3881,9 @@ create(resource_type="anomalies", anomaly_data={
                 metric_type = metric
                 break
 
-        found = threshold_in_text(text)
-        if found:
-            threshold = found.value
-            is_percentage = found.is_percentage
-        else:
-            threshold = 100.0
-            is_percentage = False
+        found = threshold_read_from_text(text)
+        threshold = found.value
+        is_percentage = found.is_percentage
 
         # Generate name from text
         name = (
@@ -4354,6 +4546,9 @@ create(resource_type="anomalies", anomaly_data={
                     ],
                 )
             if e.status_code == 422:
+                refusal = _coded_refusal(e, anomaly_id)
+                if refusal is not None:
+                    raise refusal
                 raise ToolError(
                     message=(
                         f"Alert {anomaly_id!r} is not a CUMULATIVE_USAGE budget alert — "
@@ -4369,6 +4564,8 @@ create(resource_type="anomalies", anomaly_data={
                 )
             raise
 
+        outside = _spend_outside_every_department(result) if isinstance(result, dict) else None
+        department_gap = f"**Department gap**: {outside}\n\n" if outside else ""
         return [
             TextContent(
                 type="text",
@@ -4377,6 +4574,7 @@ create(resource_type="anomalies", anomaly_data={
                     f"**Alert ID**: `{anomaly_id}`\n"
                     f"**Effect**: current period accumulation restarted; the natural "
                     f"period boundary is unchanged\n\n"
+                    + department_gap
                     + json.dumps(result, indent=2, default=str)
                 ),
             )
@@ -4453,8 +4651,9 @@ create(resource_type="anomalies", anomaly_data={
         """
         # Portfolio/bulk items carry the hashed id under alertId; only the
         # single per-anomaly endpoint returns anomalyId (the numeric internal
-        # id) — live dev evidence. Prefer the caller-usable hashed id.
-        entry_id = entry.get("alertId") or entry.get("anomalyId")
+        # id) — live dev evidence. Prefer the caller-usable hashed id. A failed
+        # bulk item (BudgetProgressItemError) carries it under id.
+        entry_id = entry.get("alertId") or entry.get("anomalyId") or entry.get("id")
         name = entry.get("name")
         label = f"{name} (`{entry_id}`)" if name else f"`{entry_id}`"
 
@@ -4465,17 +4664,31 @@ create(resource_type="anomalies", anomaly_data={
         ahead_behind = entry.get("aheadBehindVsLinear")
         if isinstance(ahead_behind, dict):
             status = ahead_behind.get("status")
+        outside = _spend_outside_every_department(entry)
+
+        department = _format_budget_department(entry)
+        blocker = _budget_blocker(entry)
+        if blocker is not None:
+            blocked = [f"- {label}"]
+            if metric:
+                blocked.append(f"metric {metric}")
+            if department:
+                blocked.append(department)
+            return " · ".join(blocked) + ": " + _format_budget_blocker(*blocker)
 
         # A budget-progress resource is only meaningful with numeric spend vs.
         # threshold — if either is absent/non-numeric, mark the whole entry.
         numeric_ok = isinstance(current, (int, float)) and isinstance(threshold, (int, float))
         if not numeric_ok:
             metric_suffix = f" — {metric}" if metric else ""
-            return f"- {label}{metric_suffix}: state unavailable"
+            unavailable = f"- {label}{metric_suffix}: state unavailable"
+            return f"{unavailable} · {outside}" if outside else unavailable
 
         parts = [f"- {label}"]
         if metric:
             parts.append(f"metric {metric}")
+        if department:
+            parts.append(department)
 
         group_count = entry.get("groupCount")
         if isinstance(group_count, int):
@@ -4486,6 +4699,12 @@ create(resource_type="anomalies", anomaly_data={
             if isinstance(percent, (int, float)):
                 parts.append(_format_budget_usage(entry, percent))
 
+        if outside:
+            parts.append(outside)
+
+        notice = _format_budget_notice(entry)
+        if notice:
+            parts.append(notice)
         if status:
             parts.append(f"vs-linear {status}")
 
@@ -4600,6 +4819,9 @@ create(resource_type="anomalies", anomaly_data={
                         ],
                     )
                 if e.status_code == 422:
+                    refusal = _coded_refusal(e, anomaly_id)
+                    if refusal is not None:
+                        raise refusal
                     raise ToolError(
                         message=(
                             f"Alert {anomaly_id!r} is not a CUMULATIVE_USAGE budget alert — "
@@ -4754,7 +4976,7 @@ create(resource_type="anomalies", anomaly_data={
     async def _handle_get_changes_summary(
         self, client: ReveniumClient, arguments: Dict[str, Any]
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
-        """Who created an alert rule and who changed it last."""
+        """Who created an alert rule, who changed it last and why."""
         anomaly_id = self._history_anomaly_id(arguments, "get_changes_summary")
         summary: List[Union[TextContent, ImageContent, EmbeddedResource]] = (
             await self.anomaly_manager.get_anomaly_change_summary(client, anomaly_id)

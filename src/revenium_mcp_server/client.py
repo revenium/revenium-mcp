@@ -24,6 +24,7 @@ from loguru import logger
 
 from .api_field_mapper import APIFieldMapper
 from .auth import AuthConfig, AuthenticationError, get_auth_config, get_bearer_auth_headers
+from .auth.credential_refusals import note_refused_key
 from .change_reason_contract import CHANGE_REASON_FIELD, normalized_change_reason
 from .config_store import get_config_store, get_config_value
 from .endpoint_registry import (
@@ -34,6 +35,7 @@ from .endpoint_registry import (
     is_production_platform,
     paired_app_base_url,
     pairing_example,
+    requires_new_api_flag,
 )
 from .exceptions import AlertToolsError
 from .log_context import (
@@ -101,6 +103,11 @@ READ_SERVER_ERROR_RETRIES = 1
 
 
 IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
+
+_RECORD_ID_REQUIRED = (
+    "A record id is required: an empty id would address the whole collection "
+    "instead of one record"
+)
 
 # Verified on dev 2026-10-22: the value is case-sensitive (ADVISORY is
 # ignored), and the platform drops the advisory rows whenever ruleId is sent.
@@ -276,6 +283,23 @@ def _json_body_of(response: httpx.Response) -> Any:
 def _code_named_by(body: Any) -> Any:
     """The ``code`` a refusal body names, or None when the body is not a JSON object."""
     return body.get("code") if isinstance(body, dict) else None
+
+
+def _names_a_code(code: Any) -> bool:
+    """Whether a refusal's ``code`` is text that names something; any other value is read as no code."""
+    return isinstance(code, str) and bool(code)
+
+
+def _may_refuse_the_key(status_code: int, body: Any) -> bool:
+    """A 401, or a 403 whose body names no cause of its own, may mean the key itself is refused.
+
+    The legacy API answers a revoked, unknown, suspended or expired key with a
+    403 that names no code, the same shape as some permission refusals; a 403
+    that names a code (``FORBIDDEN`` included) is about this one request.
+    """
+    if status_code == REJECTED_CREDENTIAL_STATUS:
+        return True
+    return status_code == PERMISSION_REFUSAL_STATUS and not _names_a_code(_code_named_by(body))
 
 
 def _names_a_generic_refusal(status_code: Optional[int], code: Any) -> bool:
@@ -1095,7 +1119,8 @@ class ReveniumClient:
 
         body = _json_body_of(response)
         payload = body if isinstance(body, dict) else {}
-        if payload.get("code") not in (None, TEAM_NOT_IN_MEMBERSHIP):
+        code = _code_named_by(body)
+        if _names_a_code(code) and code != TEAM_NOT_IN_MEMBERSHIP:
             return None
         return TeamScopeForbiddenError(
             str(team_id), response_data=redact_secrets(payload, secrets) or None
@@ -1241,7 +1266,7 @@ class ReveniumClient:
 
         A ``code`` that is not text names no handler either.
         """
-        if not isinstance(code, str) or not code:
+        if not _names_a_code(code):
             return True
         return _names_a_generic_refusal(status_code, code)
 
@@ -1420,6 +1445,13 @@ class ReveniumClient:
                     error_data, error_text, echoed_secrets = self._secret_free_error(
                         response, params, json_data
                     )
+                    if not blames_unpaired_host and _may_refuse_the_key(
+                        response.status_code, error_data
+                    ):
+                        note_refused_key(
+                            credential,
+                            ambiguous=response.status_code == PERMISSION_REFUSAL_STATUS,
+                        )
 
                     self._log_error_response(
                         response,
@@ -1739,7 +1771,7 @@ class ReveniumClient:
             Product data
         """
         params = self._add_team_id_to_params()
-        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/products/{product_id}", params=params))
+        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/products/{self._quote_path_segment(product_id)}", params=params))
     async def create_product(self, product_data: Dict[str, Any]) -> Dict[str, Any]:
         """Create a new product with enhanced validation and field mapping.
 
@@ -1848,7 +1880,7 @@ class ReveniumClient:
 
         try:
             result = cast(Dict[str, Any], await self.put(
-                f"/profitstream/v2/api/products/{product_id}", data=mapped_data, params=params
+                f"/profitstream/v2/api/products/{self._quote_path_segment(product_id)}", data=mapped_data, params=params
             ))
             logger.info(f"Product update successful: {product_id}")
             return result
@@ -1866,7 +1898,7 @@ class ReveniumClient:
             Deletion response
         """
         params = self._add_team_id_to_params()
-        return cast(Dict[str, Any], await self.delete(f"/profitstream/v2/api/products/{product_id}", params=params))
+        return cast(Dict[str, Any], await self.delete(f"/profitstream/v2/api/products/{self._quote_path_segment(product_id)}", params=params))
     # Subscriptions API methods
     async def get_subscriptions(self, page: int = 0, size: int = 20, **filters: Any) -> Dict[str, Any]:
         """Get list of subscriptions with pagination.
@@ -1894,7 +1926,7 @@ class ReveniumClient:
         """
         params = self._add_team_id_to_params()
         return cast(Dict[str, Any], await self.get(
-            f"/profitstream/v2/api/subscriptions/{subscription_id}", params=params
+            f"/profitstream/v2/api/subscriptions/{self._quote_path_segment(subscription_id)}", params=params
         ))
 
     async def get_subscription_billed_amount(self, subscription_id: str) -> Dict[str, Any]:
@@ -1908,7 +1940,7 @@ class ReveniumClient:
         """
         params = self._add_team_id_to_params()
         return cast(Dict[str, Any], await self.get(
-            f"/profitstream/v2/api/subscriptions/{subscription_id}/billed-amount",
+            f"/profitstream/v2/api/subscriptions/{self._quote_path_segment(subscription_id)}/billed-amount",
             params=params,
         ))
 
@@ -1923,7 +1955,7 @@ class ReveniumClient:
         """
         params = self._add_team_id_to_params()
         return cast(Dict[str, Any], await self.get(
-            f"/profitstream/v2/api/subscriptions/{subscription_id}/quota-consumed",
+            f"/profitstream/v2/api/subscriptions/{self._quote_path_segment(subscription_id)}/quota-consumed",
             params=params,
         ))
 
@@ -1955,7 +1987,7 @@ class ReveniumClient:
         """
         params = self._add_team_id_to_params()
         return cast(Dict[str, Any], await self.put(
-            f"/profitstream/v2/api/subscriptions/{subscription_id}",
+            f"/profitstream/v2/api/subscriptions/{self._quote_path_segment(subscription_id)}",
             data=subscription_data,
             params=params,
         ))
@@ -1971,7 +2003,7 @@ class ReveniumClient:
         """
         params = self._add_team_id_to_params()
         return cast(Dict[str, Any], await self.delete(
-            f"/profitstream/v2/api/subscriptions/{subscription_id}", params=params
+            f"/profitstream/v2/api/subscriptions/{self._quote_path_segment(subscription_id)}", params=params
         ))
 
     # Sources API methods
@@ -2000,7 +2032,7 @@ class ReveniumClient:
             Source data
         """
         params = self._add_team_id_to_params()
-        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/sources/{source_id}", params=params))
+        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/sources/{self._quote_path_segment(source_id)}", params=params))
     async def create_source(self, source_data: Dict[str, Any]) -> Dict[str, Any]:
         """Create a new source.
 
@@ -2024,7 +2056,7 @@ class ReveniumClient:
         """
         params = self._add_team_id_to_params()
         return cast(Dict[str, Any], await self.put(
-            f"/profitstream/v2/api/sources/{source_id}", data=source_data, params=params
+            f"/profitstream/v2/api/sources/{self._quote_path_segment(source_id)}", data=source_data, params=params
         ))
 
     async def delete_source(self, source_id: str) -> Dict[str, Any]:
@@ -2037,7 +2069,7 @@ class ReveniumClient:
             Deletion response
         """
         params = self._add_team_id_to_params()
-        return cast(Dict[str, Any], await self.delete(f"/profitstream/v2/api/sources/{source_id}", params=params))
+        return cast(Dict[str, Any], await self.delete(f"/profitstream/v2/api/sources/{self._quote_path_segment(source_id)}", params=params))
 
     # Agents API methods
     async def get_agents(self, page: int = 0, size: int = 20, **filters: Any) -> Dict[str, Any]:
@@ -2067,7 +2099,7 @@ class ReveniumClient:
             Agent data
         """
         params = self._add_team_id_to_params()
-        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/agents/{agent_id}", params=params))
+        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/agents/{self._quote_path_segment(agent_id)}", params=params))
 
     async def create_agent(self, agent_data: Dict[str, Any]) -> Dict[str, Any]:
         """Register a new agent.
@@ -2100,7 +2132,7 @@ class ReveniumClient:
         """
         params = self._add_team_id_to_params()
         return cast(Dict[str, Any], await self.put(
-            f"/profitstream/v2/api/agents/{agent_id}", data=agent_data, params=params
+            f"/profitstream/v2/api/agents/{self._quote_path_segment(agent_id)}", data=agent_data, params=params
         ))
 
     async def delete_agent(self, agent_id: str) -> Dict[str, Any]:
@@ -2113,7 +2145,7 @@ class ReveniumClient:
             Deletion response
         """
         params = self._add_team_id_to_params()
-        return cast(Dict[str, Any], await self.delete(f"/profitstream/v2/api/agents/{agent_id}", params=params))
+        return cast(Dict[str, Any], await self.delete(f"/profitstream/v2/api/agents/{self._quote_path_segment(agent_id)}", params=params))
 
     async def get_discovered_agents(
         self, period: str, page: int = 0, size: int = 20, **filters: Any
@@ -2167,7 +2199,7 @@ class ReveniumClient:
             Cost control data
         """
         params = self._add_team_id_to_params()
-        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/ai/cost-controls/{control_id}", params=params))
+        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/ai/cost-controls/{self._quote_path_segment(control_id)}", params=params))
 
     async def get_cost_control_changes(
         self, control_id: str, page: int = 0, size: int = 20
@@ -2199,7 +2231,9 @@ class ReveniumClient:
             control_id: The cost control ID
 
         Returns:
-            ``{"createdAt", "createdBy", "lastChangedAt", "lastChangedBy", "historyStartsAt"}``
+            ``{"createdAt", "createdBy", "lastChangedAt", "lastChangedBy", "lastChangeReason",
+            "historyStartsAt"}``; ``lastChangeReason`` is null when nothing changed since
+            history began or the change was saved without a reason
         """
         params = self._add_team_id_to_params()
         return cast(Dict[str, Any], await self.get(
@@ -2304,7 +2338,7 @@ class ReveniumClient:
         """
         params = self._add_team_id_to_params()
         return cast(Dict[str, Any], await self.patch(
-            f"/profitstream/v2/api/ai/cost-controls/{control_id}", data=control_data, params=params
+            f"/profitstream/v2/api/ai/cost-controls/{self._quote_path_segment(control_id)}", data=control_data, params=params
         ))
 
     async def delete_cost_control(
@@ -2320,7 +2354,7 @@ class ReveniumClient:
             Deletion response
         """
         params = self._with_change_reason(self._add_team_id_to_params(), change_reason)
-        return cast(Dict[str, Any], await self.delete(f"/profitstream/v2/api/ai/cost-controls/{control_id}", params=params))
+        return cast(Dict[str, Any], await self.delete(f"/profitstream/v2/api/ai/cost-controls/{self._quote_path_segment(control_id)}", params=params))
 
     async def get_enforcement_events(self, page: int = 0, size: int = 20, **filters: Any) -> Dict[str, Any]:
         """List cost-control enforcement events with pagination.
@@ -2439,7 +2473,7 @@ class ReveniumClient:
         if include_advisory:
             params["include"] = ENFORCEMENT_RULES_ADVISORY_INCLUDE
         return cast(Dict[str, Any], await self.get(
-            f"/profitstream/v2/api/ai/enforcement-rules/{self.team_id}", params=params
+            f"/profitstream/v2/api/ai/enforcement-rules/{self._quote_path_segment(self.team_id)}", params=params
         ))
 
     async def get_enforcement_rule_roster(
@@ -2478,7 +2512,7 @@ class ReveniumClient:
             if value is not None:
                 params[name] = value
         return cast(Dict[str, Any], await self.get(
-            f"/profitstream/v2/api/ai/enforcement-rules/{self.team_id}/roster", params=params
+            f"/profitstream/v2/api/ai/enforcement-rules/{self._quote_path_segment(self.team_id)}/roster", params=params
         ))
 
     # Invoices API methods
@@ -2674,7 +2708,7 @@ class ReveniumClient:
         params: Dict[str, Any] = {**filters}
         params = self._add_team_id_to_params(params)
         return cast(Dict[str, Any], await self.get(
-            f"/profitstream/v2/api/skills/{skill_id}", params=params
+            f"/profitstream/v2/api/skills/{self._quote_path_segment(skill_id)}", params=params
         ))
 
     # Developer PR-health report API methods
@@ -3034,63 +3068,68 @@ class ReveniumClient:
         provider: Optional[str] = None,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
-        team_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Get the provider metering-coverage report (metered vs. provider-billed spend).
 
-        Required upstream: ``teamId`` (supplied by ``_add_team_id_to_params``
-        unless overridden) and ``period`` — the endpoint binds it as a
-        non-nullable field, so a request without one fails during argument
-        resolution before the service runs. The documented values are ``24h``,
-        ``7d``, ``30d``, ``90d`` and ``custom`` (compared lowercased); the value
-        is sent verbatim rather than gated on a local enum so a new period the
-        platform adds is immediately usable. ``custom`` requires ``startDate``
-        and ``endDate`` as ISO instants, of which the platform keeps the UTC
-        calendar day, end day included; the other periods ignore them. The
-        handler turns calendar dates into those instants
-        (``utc_instant_bounds`` in ``analytics_window``).
-        ``provider`` optionally narrows the report to one provider. The bound
-        search object also carries usageType/minCost/maxCost and, since the
-        BACK-2877 drift of 2026-09-03, ``apiKey`` — but the coverage service
-        reads none of them, so none are exposed here. ``apiKey`` is the one
-        worth naming, because the spec's own description promises that a value
-        matching nothing returns an empty result rather than the organization
-        total. Live dev 2026-09-03 says otherwise: ``?apiKey=3BygmAQ`` (a real
-        credential id) and ``?apiKey=zzz-nonexistent-key-id`` both returned the
-        byte-identical organization-wide report. Forwarding it would hand the
-        caller an unfiltered answer that reads as filtered, so it stays out
-        until the service honours it (BACK-2958).
+        Read from the analytics host's ``billing_coverage`` route (BACK-4916),
+        resolved through ``endpoint_registry``. That route reads the metered
+        half from ClickHouse and hands it to the platform's coverage service,
+        which computes the report; the platform's own GET, which scans Postgres
+        for the metered half and takes seconds or times out on a large team, is
+        never called. The body is the platform's coverage report, passed through
+        unparsed, so it has the shape the platform GET returned.
+
+        ``teamId`` is the resolved team: the route answers a user token for the
+        user's default team without it. ``period`` takes ``24h``, ``7d``,
+        ``30d``, ``90d`` or ``custom``, and is sent lower-cased because the
+        route matches the names exactly where the platform compared them
+        lower-cased. It is not gated on a local enum: the route refuses any
+        other value with a 400 that lists the accepted ones. ``custom`` requires
+        ``startDate`` and ``endDate`` as ISO instants, of which the platform
+        keeps the UTC calendar day, end day included; the other periods ignore
+        them. The handler turns calendar dates into those instants
+        (``utc_instant_bounds`` in ``analytics_window``). ``provider``
+        optionally narrows the report to one provider.
+
+        The route takes no ``apiKey``. The platform GET declares one and ignores
+        it (BACK-2959): a real credential id and a nonsense one returned the
+        same organization-wide report on dev, so no per-key coverage exists to
+        offer.
 
         The response is a flat coverage report (state, aggregateRatio,
         hiddenSpend, trend, confidence, byProvider[]) with no HAL ``_embedded``
-        envelope and no pagination. ``codingAssistantUsagePresent`` is a
-        non-nullable boolean upstream and is serialized on every 200; tenants
-        without the coding-assistant-separation feature flag do not get a
-        response without the field — they get a 403, because the whole endpoint
-        is gated on that flag.
+        envelope and no pagination, so it is read with
+        ``unwrap_hal_embedded=False``.
 
         Args:
-            period: Comparison window (required upstream; default ``30d``)
+            period: Comparison window (default ``30d``)
             provider: Optional provider filter (e.g. ``anthropic``); omit for all providers
             start_date: First instant of a ``custom`` period (ISO-8601)
             end_date: Last instant of a ``custom`` period (ISO-8601)
-            team_id: Optional explicit team override; defaults to the auth context's team
 
         Returns:
             Flat coverage-report payload, returned unchanged
         """
-        params: Dict[str, Any] = self._add_team_id_to_params()
-        if team_id is not None:
-            params["teamId"] = team_id
-        params["period"] = period
+        params: Dict[str, Any] = {**self._resolved_team_param(), "period": period.lower()}
         if provider is not None:
             params["provider"] = provider
         if start_date is not None:
             params["startDate"] = start_date
         if end_date is not None:
             params["endDate"] = end_date
+        route = get_endpoint_config("billing_coverage")
+        if route.new_path is None:
+            raise RuntimeError("the billing_coverage registry entry names no analytics route")
+        if requires_new_api_flag("billing_coverage"):
+            raise RuntimeError(
+                "the billing_coverage registry entry does not route to the configured analytics host"
+            )
         return cast(Dict[str, Any], await self.get(
-            "/profitstream/v2/api/billing/coverage", params=params
+            route.new_path,
+            params=params,
+            base_url=route.new_base_url,
+            use_bearer=True,
+            unwrap_hal_embedded=False,
         ))
 
     # Tenant ingestion diagnostics API methods
@@ -3129,7 +3168,7 @@ class ReveniumClient:
         params = {"page": page, "size": size}
         params.update(filters)
         return cast(Dict[str, Any], await self.get(
-            f"/profitstream/v2/api/tenants/{tenant_id}/ingestion-failures", params=params
+            f"/profitstream/v2/api/tenants/{self._quote_path_segment(tenant_id)}/ingestion-failures", params=params
         ))
 
     async def set_strict_ingestion_mode(
@@ -3161,7 +3200,7 @@ class ReveniumClient:
         if allow_ticket_jobs is not None:
             body["allowTicketJobs"] = allow_ticket_jobs
         return cast(Dict[str, Any], await self.patch(
-            f"/profitstream/v2/api/tenants/{tenant_id}/strict-ingestion-mode",
+            f"/profitstream/v2/api/tenants/{self._quote_path_segment(tenant_id)}/strict-ingestion-mode",
             data=body,
         ))
 
@@ -3192,7 +3231,7 @@ class ReveniumClient:
         """
         tenant_id = self._require_tenant_id()
         return cast(Dict[str, Any], await self.patch(
-            f"/profitstream/v2/api/tenants/{tenant_id}/attribution-detail-text",
+            f"/profitstream/v2/api/tenants/{self._quote_path_segment(tenant_id)}/attribution-detail-text",
             data={"attributionDetailTextEnabled": enabled},
         ))
 
@@ -3223,7 +3262,7 @@ class ReveniumClient:
         """
         tenant_id = self._require_tenant_id()
         return cast(Dict[str, Any], await self.patch(
-            f"/profitstream/v2/api/tenants/{tenant_id}/usage-billing",
+            f"/profitstream/v2/api/tenants/{self._quote_path_segment(tenant_id)}/usage-billing",
             data={"usageBillingEnabled": enabled},
         ))
 
@@ -3296,7 +3335,7 @@ class ReveniumClient:
         params.update(filters)
         params = self._add_team_id_to_params(params)
         return cast(Dict[str, Any], await self.get(
-            f"/profitstream/v2/api/squads/entities/{squad_id}/executions", params=params
+            f"/profitstream/v2/api/squads/entities/{self._quote_path_segment(squad_id)}/executions", params=params
         ))
 
     async def get_squad_detail(self, squad_id: str, **filters: Any) -> Dict[str, Any]:
@@ -3311,7 +3350,7 @@ class ReveniumClient:
         """
         params = dict(filters)
         params = self._add_team_id_to_params(params)
-        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/squads/{squad_id}", params=params))
+        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/squads/{self._quote_path_segment(squad_id)}", params=params))
 
     async def get_squad_timeline(self, squad_id: str, **filters: Any) -> Dict[str, Any]:
         """Get the execution timeline for a single squad.
@@ -3326,7 +3365,7 @@ class ReveniumClient:
         params = dict(filters)
         params = self._add_team_id_to_params(params)
         return cast(Dict[str, Any], await self.get(
-            f"/profitstream/v2/api/squads/{squad_id}/timeline", params=params
+            f"/profitstream/v2/api/squads/{self._quote_path_segment(squad_id)}/timeline", params=params
         ))
 
     # Customer Management API methods
@@ -3358,7 +3397,7 @@ class ReveniumClient:
             User data
         """
         params = self._add_team_id_to_params()
-        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/users/{user_id}", params=params))
+        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/users/{self._quote_path_segment(user_id)}", params=params))
     async def get_user_by_email(self, email: str) -> Dict[str, Any]:
         """Get a user by email address through the lookup-by-email endpoint.
 
@@ -3407,7 +3446,7 @@ class ReveniumClient:
         """
         params = self._add_team_id_to_params()
         return cast(Dict[str, Any], await self.put(
-            f"/profitstream/v2/api/users/{user_id}", data=user_data, params=params
+            f"/profitstream/v2/api/users/{self._quote_path_segment(user_id)}", data=user_data, params=params
         ))
 
     async def delete_user(self, user_id: str) -> Dict[str, Any]:
@@ -3420,7 +3459,7 @@ class ReveniumClient:
             Deletion response
         """
         params = self._add_team_id_to_params()
-        return cast(Dict[str, Any], await self.delete(f"/profitstream/v2/api/users/{user_id}", params=params))
+        return cast(Dict[str, Any], await self.delete(f"/profitstream/v2/api/users/{self._quote_path_segment(user_id)}", params=params))
     async def get_current_user(self) -> Dict[str, Any]:
         """Get the user associated with the current security context.
 
@@ -3456,7 +3495,7 @@ class ReveniumClient:
             Subscriber data
         """
         params = self._add_team_id_to_params()
-        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/subscribers/{subscriber_id}", params=params))
+        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/subscribers/{self._quote_path_segment(subscriber_id)}", params=params))
     async def get_subscriber_by_email(self, email: str) -> Dict[str, Any]:
         """Get a subscriber by email address through the lookup-by-email endpoint.
 
@@ -3510,7 +3549,7 @@ class ReveniumClient:
         """
         params = self._add_team_id_to_params()
         return cast(Dict[str, Any], await self.put(
-            f"/profitstream/v2/api/subscribers/{subscriber_id}", data=subscriber_data, params=params
+            f"/profitstream/v2/api/subscribers/{self._quote_path_segment(subscriber_id)}", data=subscriber_data, params=params
         ))
 
     async def delete_subscriber(self, subscriber_id: str) -> Dict[str, Any]:
@@ -3523,7 +3562,7 @@ class ReveniumClient:
             Deletion response
         """
         params = self._add_team_id_to_params()
-        return cast(Dict[str, Any], await self.delete(f"/profitstream/v2/api/subscribers/{subscriber_id}", params=params))
+        return cast(Dict[str, Any], await self.delete(f"/profitstream/v2/api/subscribers/{self._quote_path_segment(subscriber_id)}", params=params))
     # Credentials API methods
     async def get_credentials(self, page: int = 0, size: int = 20, **filters: Any) -> Dict[str, Any]:
         """Get list of credentials with pagination.
@@ -3584,7 +3623,7 @@ class ReveniumClient:
         params: Dict[str, Any] = {"page": page, "size": size}
         params.update(filters)
         return cast(Dict[str, Any], await self.get(
-            f"/profitstream/v2/api/credentials/by-organization/{organization_id}", params=params
+            f"/profitstream/v2/api/credentials/by-organization/{self._quote_path_segment(organization_id)}", params=params
         ))
 
     async def get_credential_by_id(self, credential_id: str) -> Dict[str, Any]:
@@ -3597,7 +3636,7 @@ class ReveniumClient:
             Credential data
         """
         params = self._add_team_id_to_params()
-        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/credentials/{credential_id}", params=params))
+        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/credentials/{self._quote_path_segment(credential_id)}", params=params))
     async def create_credential(self, credential_data: Dict[str, Any]) -> Dict[str, Any]:
         """Create a new subscriber credential.
 
@@ -3638,7 +3677,7 @@ class ReveniumClient:
             credential_data["teamId"] = self.team_id
 
         return cast(Dict[str, Any], await self.put(
-            f"/profitstream/v2/api/credentials/{credential_id}", data=credential_data
+            f"/profitstream/v2/api/credentials/{self._quote_path_segment(credential_id)}", data=credential_data
         ))
 
     async def delete_credential(self, credential_id: str) -> Dict[str, Any]:
@@ -3650,7 +3689,7 @@ class ReveniumClient:
         Returns:
             Deletion confirmation
         """
-        return cast(Dict[str, Any], await self.delete(f"/profitstream/v2/api/credentials/{credential_id}"))
+        return cast(Dict[str, Any], await self.delete(f"/profitstream/v2/api/credentials/{self._quote_path_segment(credential_id)}"))
     # Helper methods for credential management
     async def resolve_subscriber_email_to_id(self, email: str) -> Optional[str]:
         """Resolve a subscriber email to the subscriber's id.
@@ -3760,7 +3799,7 @@ class ReveniumClient:
         """
         params = self._add_tenant_id_to_params()
         return cast(Dict[str, Any], await self.get(
-            f"/profitstream/v2/api/organizations/{organization_id}", params=params
+            f"/profitstream/v2/api/organizations/{self._quote_path_segment(organization_id)}", params=params
         ))
 
     async def create_organization(self, organization_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -3791,7 +3830,7 @@ class ReveniumClient:
         """
         params = self._add_tenant_id_to_params()
         return cast(Dict[str, Any], await self.put(
-            f"/profitstream/v2/api/organizations/{organization_id}",
+            f"/profitstream/v2/api/organizations/{self._quote_path_segment(organization_id)}",
             data=organization_data,
             params=params,
         ))
@@ -3807,7 +3846,7 @@ class ReveniumClient:
         """
         params = self._add_tenant_id_to_params()
         return cast(Dict[str, Any], await self.delete(
-            f"/profitstream/v2/api/organizations/{organization_id}", params=params
+            f"/profitstream/v2/api/organizations/{self._quote_path_segment(organization_id)}", params=params
         ))
 
     async def get_organization_tags(self, organization_id: str) -> Dict[str, Any]:
@@ -3821,7 +3860,7 @@ class ReveniumClient:
         """
         params = self._add_tenant_id_to_params()
         return cast(Dict[str, Any], await self.get(
-            f"/profitstream/v2/api/organizations/{organization_id}/tags", params=params
+            f"/profitstream/v2/api/organizations/{self._quote_path_segment(organization_id)}/tags", params=params
         ))
 
     # Teams API methods
@@ -3851,7 +3890,7 @@ class ReveniumClient:
             Team data
         """
         params = self._add_tenant_id_to_params()
-        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/teams/{team_id}", params=params))
+        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/teams/{self._quote_path_segment(team_id)}", params=params))
     async def create_team(self, team_data: Dict[str, Any]) -> Dict[str, Any]:
         """Create a new team.
 
@@ -3875,7 +3914,7 @@ class ReveniumClient:
         """
         params = self._add_tenant_id_to_params()
         return cast(Dict[str, Any], await self.put(
-            f"/profitstream/v2/api/teams/{team_id}", data=team_data, params=params
+            f"/profitstream/v2/api/teams/{self._quote_path_segment(team_id)}", data=team_data, params=params
         ))
 
     async def delete_team(self, team_id: str) -> Dict[str, Any]:
@@ -3888,7 +3927,7 @@ class ReveniumClient:
             Deletion response
         """
         params = self._add_tenant_id_to_params()
-        return cast(Dict[str, Any], await self.delete(f"/profitstream/v2/api/teams/{team_id}", params=params))
+        return cast(Dict[str, Any], await self.delete(f"/profitstream/v2/api/teams/{self._quote_path_segment(team_id)}", params=params))
     async def get_team_tags(self, team_id: str) -> Dict[str, Any]:
         """Get all tags associated with a team.
 
@@ -3899,7 +3938,7 @@ class ReveniumClient:
             Team tags data
         """
         params = self._add_tenant_id_to_params()
-        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/teams/{team_id}/tags", params=params))
+        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/teams/{self._quote_path_segment(team_id)}/tags", params=params))
 
     async def get_team_marketplace_settings(self, team_id: str) -> Dict[str, Any]:
         """Get the team's internal (company-owned) plugin marketplace settings.
@@ -3912,7 +3951,7 @@ class ReveniumClient:
         """
         params = self._add_tenant_id_to_params()
         return cast(Dict[str, Any], await self.get(
-            f"/profitstream/v2/api/teams/{team_id}/settings/marketplaces", params=params
+            f"/profitstream/v2/api/teams/{self._quote_path_segment(team_id)}/settings/marketplaces", params=params
         ))
 
     async def update_team_marketplace_settings(
@@ -3937,7 +3976,7 @@ class ReveniumClient:
         """
         params = self._add_tenant_id_to_params()
         return cast(Dict[str, Any], await self.put(
-            f"/profitstream/v2/api/teams/{team_id}/settings/marketplaces",
+            f"/profitstream/v2/api/teams/{self._quote_path_segment(team_id)}/settings/marketplaces",
             data=settings,
             params=params,
         ))
@@ -3962,7 +4001,7 @@ class ReveniumClient:
         """
         params = self._add_tenant_id_to_params()
         return cast(Dict[str, Any], await self.get(
-            f"/profitstream/v2/api/teams/{team_id}/settings/pr-health", params=params
+            f"/profitstream/v2/api/teams/{self._quote_path_segment(team_id)}/settings/pr-health", params=params
         ))
 
     async def update_team_pr_health_settings(
@@ -4002,7 +4041,7 @@ class ReveniumClient:
         """
         params = self._add_tenant_id_to_params()
         return cast(Dict[str, Any], await self.put(
-            f"/profitstream/v2/api/teams/{team_id}/settings/pr-health",
+            f"/profitstream/v2/api/teams/{self._quote_path_segment(team_id)}/settings/pr-health",
             data=dict(settings),
             params=params,
         ))
@@ -4032,7 +4071,7 @@ class ReveniumClient:
         """
         params = self._add_tenant_id_to_params()
         return cast(Dict[str, Any], await self.get(
-            f"/profitstream/v2/api/teams/{team_id}/settings/pr-health/digest", params=params
+            f"/profitstream/v2/api/teams/{self._quote_path_segment(team_id)}/settings/pr-health/digest", params=params
         ))
 
     async def update_team_pr_health_digest_settings(
@@ -4065,7 +4104,7 @@ class ReveniumClient:
         """
         params = self._add_tenant_id_to_params()
         return cast(Dict[str, Any], await self.put(
-            f"/profitstream/v2/api/teams/{team_id}/settings/pr-health/digest",
+            f"/profitstream/v2/api/teams/{self._quote_path_segment(team_id)}/settings/pr-health/digest",
             data=dict(settings),
             params=params,
         ))
@@ -4093,7 +4132,7 @@ class ReveniumClient:
         """
         params = self._add_tenant_id_to_params()
         return cast(Dict[str, Any], await self.get(
-            f"/profitstream/v2/api/teams/{team_id}/settings/coding-assistant-filter",
+            f"/profitstream/v2/api/teams/{self._quote_path_segment(team_id)}/settings/coding-assistant-filter",
             params=params,
         ))
 
@@ -4118,7 +4157,7 @@ class ReveniumClient:
         """
         params = self._add_tenant_id_to_params()
         return cast(Dict[str, Any], await self.get(
-            f"/profitstream/v2/api/teams/{team_id}/settings/attribution-identity-policy",
+            f"/profitstream/v2/api/teams/{self._quote_path_segment(team_id)}/settings/attribution-identity-policy",
             params=params,
         ))
 
@@ -4147,7 +4186,7 @@ class ReveniumClient:
         """
         params = self._add_tenant_id_to_params()
         return cast(Dict[str, Any], await self.put(
-            f"/profitstream/v2/api/teams/{team_id}/settings/attribution-identity-policy",
+            f"/profitstream/v2/api/teams/{self._quote_path_segment(team_id)}/settings/attribution-identity-policy",
             data={"policy": policy},
             params=params,
         ))
@@ -4173,7 +4212,7 @@ class ReveniumClient:
         return cast(
             List[Dict[str, Any]],
             await self.get(
-                f"/profitstream/v2/api/teams/{team_id}/settings/verified-domains",
+                f"/profitstream/v2/api/teams/{self._quote_path_segment(team_id)}/settings/verified-domains",
                 params=params,
             ),
         )
@@ -4202,7 +4241,7 @@ class ReveniumClient:
         """
         params = self._add_tenant_id_to_params()
         return cast(Dict[str, Any], await self.put(
-            f"/profitstream/v2/api/teams/{team_id}/settings/verified-domains",
+            f"/profitstream/v2/api/teams/{self._quote_path_segment(team_id)}/settings/verified-domains",
             data={"domain": domain},
             params=params,
         ))
@@ -4225,7 +4264,7 @@ class ReveniumClient:
         """
         params = self._add_tenant_id_to_params({"domain": domain})
         return cast(Dict[str, Any], await self.delete(
-            f"/profitstream/v2/api/teams/{team_id}/settings/verified-domains",
+            f"/profitstream/v2/api/teams/{self._quote_path_segment(team_id)}/settings/verified-domains",
             params=params,
         ))
 
@@ -4320,7 +4359,7 @@ class ReveniumClient:
         return cast(
             Dict[str, Any],
             await self.delete(
-                f"/profitstream/v2/api/departments/persons/{person_id}",
+                f"/profitstream/v2/api/departments/persons/{self._quote_path_segment(person_id)}",
                 params=self._department_team_params(team_id),
                 use_retry=False,
             ),
@@ -4427,7 +4466,7 @@ class ReveniumClient:
         """
         params = self._add_team_id_to_params()
         return cast(Dict[str, Any], await self.get(
-            f"/profitstream/v2/api/sources/ai/anomaly/{anomaly_id}", params=params
+            f"/profitstream/v2/api/sources/ai/anomaly/{self._quote_path_segment(anomaly_id)}", params=params
         ))
 
     async def get_anomaly_changes(
@@ -4456,7 +4495,9 @@ class ReveniumClient:
             anomaly_id: The anomaly ID
 
         Returns:
-            ``{"createdAt", "createdBy", "lastChangedAt", "lastChangedBy", "historyStartsAt"}``
+            ``{"createdAt", "createdBy", "lastChangedAt", "lastChangedBy", "lastChangeReason",
+            "historyStartsAt"}``; ``lastChangeReason`` is null when nothing changed since
+            history began or the change was saved without a reason
         """
         params = self._add_team_id_to_params()
         return cast(Dict[str, Any], await self.get(
@@ -4491,7 +4532,7 @@ class ReveniumClient:
         """
         params = self._add_team_id_to_params()
         return cast(Dict[str, Any], await self.put(
-            f"/profitstream/v2/api/sources/ai/anomaly/{anomaly_id}",
+            f"/profitstream/v2/api/sources/ai/anomaly/{self._quote_path_segment(anomaly_id)}",
             data=anomaly_data,
             params=params,
         ))
@@ -4510,7 +4551,7 @@ class ReveniumClient:
         """
         params = self._with_change_reason(self._add_team_id_to_params(), change_reason)
         return cast(Dict[str, Any], await self.delete(
-            f"/profitstream/v2/api/sources/ai/anomaly/{anomaly_id}", params=params
+            f"/profitstream/v2/api/sources/ai/anomaly/{self._quote_path_segment(anomaly_id)}", params=params
         ))
 
     async def clear_all_anomalies(self) -> Dict[str, Any]:
@@ -4542,7 +4583,7 @@ class ReveniumClient:
             The updated budget progress resource
         """
         return cast(Dict[str, Any], await self.post(
-            f"/profitstream/v2/api/ai/alerts/{anomaly_id}/budget/reset",
+            f"/profitstream/v2/api/ai/alerts/{self._quote_path_segment(anomaly_id)}/budget/reset",
             use_retry=False,
         ))
 
@@ -4614,7 +4655,7 @@ class ReveniumClient:
         """
         params: Dict[str, Any] = dict(filters)
         return cast(Dict[str, Any], await self.get(
-            f"/profitstream/v2/api/ai/alerts/{anomaly_id}/budget/progress",
+            f"/profitstream/v2/api/ai/alerts/{self._quote_path_segment(anomaly_id)}/budget/progress",
             params=params,
         ))
 
@@ -4733,7 +4774,7 @@ class ReveniumClient:
             Alert data
         """
         params = self._add_team_id_to_params()
-        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/sources/ai/alert/{alert_id}", params=params))
+        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/sources/ai/alert/{self._quote_path_segment(alert_id)}", params=params))
     async def update_alert(self, alert_id: str, update_data: Dict[str, Any]) -> Dict[str, Any]:
         """Update a specific AI alert by ID.
 
@@ -4746,7 +4787,7 @@ class ReveniumClient:
         """
         params = self._add_team_id_to_params()
         return cast(Dict[str, Any], await self.put(
-            f"/profitstream/v2/api/sources/ai/alert/{alert_id}", data=update_data, params=params
+            f"/profitstream/v2/api/sources/ai/alert/{self._quote_path_segment(alert_id)}", data=update_data, params=params
         ))
 
     async def delete_alert(self, alert_id: str) -> Dict[str, Any]:
@@ -4759,7 +4800,7 @@ class ReveniumClient:
             Deletion response
         """
         params = self._add_team_id_to_params()
-        return cast(Dict[str, Any], await self.delete(f"/profitstream/v2/api/sources/ai/alert/{alert_id}", params=params))
+        return cast(Dict[str, Any], await self.delete(f"/profitstream/v2/api/sources/ai/alert/{self._quote_path_segment(alert_id)}", params=params))
     # AI Models API methods
     async def get_ai_models(self, page: int = 0, size: int = 20, **filters: Any) -> Dict[str, Any]:
         """Get list of AI models with pagination.
@@ -4844,7 +4885,7 @@ class ReveniumClient:
         Returns:
             Metering element definition data
         """
-        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/metering-element-definitions/{element_id}"))
+        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/metering-element-definitions/{self._quote_path_segment(element_id)}"))
     async def create_metering_element_definition(
         self, element_data: Dict[str, Any]
     ) -> Dict[str, Any]:
@@ -4906,7 +4947,7 @@ class ReveniumClient:
 
         try:
             result = cast(Dict[str, Any], await self.put(
-                f"/profitstream/v2/api/metering-element-definitions/{element_id}", data=element_data
+                f"/profitstream/v2/api/metering-element-definitions/{self._quote_path_segment(element_id)}", data=element_data
             ))
             logger.info(f"Metering element definition update successful: {element_id}")
             return result
@@ -4927,7 +4968,7 @@ class ReveniumClient:
 
         try:
             result = cast(Dict[str, Any], await self.delete(
-                f"/profitstream/v2/api/metering-element-definitions/{element_id}"
+                f"/profitstream/v2/api/metering-element-definitions/{self._quote_path_segment(element_id)}"
             ))
             logger.info(f"Metering element definition deletion successful: {element_id}")
             return result
@@ -4996,7 +5037,7 @@ class ReveniumClient:
         Returns:
             Slack configuration data
         """
-        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/configurations/slack/{config_id}"))
+        return cast(Dict[str, Any], await self.get(f"/profitstream/v2/api/configurations/slack/{self._quote_path_segment(config_id)}"))
     # Jobs & Outcomes API methods (/profitstream/v2/api/jobs)
 
     async def get_jobs(self, page: int = 0, size: int = 20, **filters: Any) -> Dict[str, Any]:
@@ -5167,8 +5208,13 @@ class ReveniumClient:
         return cast(Dict[str, Any], await self.patch(f"/profitstream/v2/api/jobs/{self._quote_path_segment(job_id)}/outcome", data=outcome_data, params=params, use_retry=False))
 
     @staticmethod
-    def _quote_path_segment(value: str) -> str:
+    def _quote_path_segment(value: Optional[Union[str, int]]) -> str:
         """Percent-encode a caller-supplied value so it stays ONE path segment.
+
+        Every value interpolated into a request path in this module goes
+        through here (BACK-4665): an id of ``../users/U1`` joined in as is
+        turned a credential delete into a user delete.
+        ``tests/unit/test_client_path_segments.py`` fails on a path that skips it.
 
         ``quote(value, safe="")`` is not enough on its own. It escapes the
         slash, but ``.`` is an unreserved character and survives, so a value of
@@ -5186,8 +5232,20 @@ class ReveniumClient:
         not a dot-segment (``x..y`` resolves to itself). ``JobManager`` refuses
         these two values before a request is built; this is the transport-level
         guarantee for callers that reach the client directly.
+
+        A missing (``None``) or empty id raises ``ValueError`` rather than
+        addressing the collection or a record literally named ``None``. An
+        ``int`` id is sent as its decimal text; a ``bool`` is not an id and
+        raises ``TypeError``.
         """
-        quoted = quote(value, safe="")
+        if value is None:
+            raise ValueError(_RECORD_ID_REQUIRED)
+        if isinstance(value, bool):
+            raise TypeError("A record id is text or an integer, not a bool")
+        text = str(value) if isinstance(value, int) else value
+        quoted = quote(text, safe="")
+        if not quoted:
+            raise ValueError(_RECORD_ID_REQUIRED)
         if quoted in (".", ".."):
             return quoted.replace(".", "%2E")
         return quoted
@@ -5454,7 +5512,7 @@ class ReveniumClient:
             Updated tool data
         """
         params = self._add_team_id_to_params()
-        return cast(Dict[str, Any], await self.put(f"/profitstream/v2/api/tools/{tool_id}", data=tool_data, params=params))
+        return cast(Dict[str, Any], await self.put(f"/profitstream/v2/api/tools/{self._quote_path_segment(tool_id)}", data=tool_data, params=params))
     async def delete_tool(self, tool_id: str) -> Dict[str, Any]:
         """Delete a tool.
 
@@ -5465,7 +5523,7 @@ class ReveniumClient:
             Deletion response
         """
         params = self._add_team_id_to_params()
-        return cast(Dict[str, Any], await self.delete(f"/profitstream/v2/api/tools/{tool_id}", params=params))
+        return cast(Dict[str, Any], await self.delete(f"/profitstream/v2/api/tools/{self._quote_path_segment(tool_id)}", params=params))
     async def search_tools(self, query: str, page: int = 0, size: int = 20) -> Dict[str, Any]:  # noqa: E501
         """Search tools by text query.
 
@@ -5831,7 +5889,7 @@ class ReveniumClient:
         params: Dict[str, Any] = {"slim": "true"} if slim else {}
         params.update(self._resolved_team_param())
         result = await self.get(
-            f"/api/v2/insights/runs/{run_id}", params=params,
+            f"/api/v2/insights/runs/{self._quote_path_segment(run_id)}", params=params,
             base_url=self._get_app_base_url(),
             use_bearer=True,
             unwrap_hal_embedded=False,
@@ -5950,7 +6008,7 @@ class ReveniumClient:
             params["cursor"] = cursor
         params.update(self._resolved_team_param())
         result = await self.get(
-            f"/api/v2/insights/runs/{run_id}/feedback",
+            f"/api/v2/insights/runs/{self._quote_path_segment(run_id)}/feedback",
             params=params,
             base_url=self._get_app_base_url(),
             use_bearer=True,

@@ -197,6 +197,38 @@ def normalize_filter_operator(operator: object) -> str:
     return FILTER_OPERATOR_ALIASES.get(raw, raw)
 
 
+INCLUDE_DESCENDANTS_WIRE_NAME = "includeDescendants"
+INCLUDE_DESCENDANTS_SNAKE_ALIAS = "include_descendants"
+INCLUDE_DESCENDANTS_SPELLINGS: Tuple[str, str] = (
+    INCLUDE_DESCENDANTS_WIRE_NAME,
+    INCLUDE_DESCENDANTS_SNAKE_ALIAS,
+)
+
+
+def _with_wire_include_descendants(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Send ``include_descendants`` as the ``includeDescendants`` the platform reads.
+
+    The platform ignores a key it does not know and then counts sub-departments,
+    so a snake_case spelling left as is widens the budget without a word.
+    """
+    wire_name, snake_name = INCLUDE_DESCENDANTS_WIRE_NAME, INCLUDE_DESCENDANTS_SNAKE_ALIAS
+    if snake_name not in row:
+        return row
+    if wire_name in row:
+        raise ValidationError(
+            message=(
+                f"Filter names {wire_name} twice, as '{wire_name}' and as '{snake_name}'. "
+                "Refusing to guess which value you meant"
+            ),
+            field="filters",
+            value=row,
+            expected=f"Pass {wire_name} once, in either spelling",
+        )
+    normalized = {key: value for key, value in row.items() if key != snake_name}
+    normalized[wire_name] = row[snake_name]
+    return normalized
+
+
 def validate_filter_rows(filters: List[Any]) -> List[Dict[str, Any]]:
     """Normalize API-format anomaly filter rows and refuse the shapes the platform will.
 
@@ -206,18 +238,20 @@ def validate_filter_rows(filters: List[Any]) -> List[Dict[str, Any]]:
     upstream — an ``IN`` row with no ``values`` matches nothing rather than
     erroring — so it is refused here, naming the field that is missing.
 
-    This lives beside the vocabulary rather than in either caller because BOTH
-    filter shapes have to end up here: the API-format rows
-    ``AnomalyManager`` validates on create and update, and the rows
-    ``InputValidator._convert_filters_to_api_format`` builds from the
-    user-friendly ``field``/``operator``/``value`` shape. A rule enforced on one
-    path and skipped on its sibling is the same bug in a different doorway.
+    This lives beside the vocabulary because BOTH filter shapes have to end up
+    here: the rows a caller writes in the API's shape and the rows
+    ``InputValidator.convert_filters_to_api_format`` builds from the
+    user-friendly ``field``/``operator``/``value`` shape. That conversion is the
+    one caller: every alert write sends its rows through it, and it ends here. A
+    rule enforced on one path and skipped on its sibling is the same bug in a
+    different doorway.
 
     ``values`` entries must already be strings: the published contract says so,
     and coercing would turn ``[null, 42]`` into the model names ``"None"`` and
     ``"42"`` — an alert scoped to something the caller never asked for. A row
-    without ``dimension`` is the user-friendly shape on its way to conversion and
-    is passed through untouched. Keys this build does not know are carried
+    without ``dimension`` is refused: the conversion has already turned every
+    ``field`` row into one with a dimension, so such a row would reach the
+    platform scoped to nothing. Keys this build does not know are carried
     through rather than dropped, so a field the platform adds is not silently
     swallowed on the way out.
 
@@ -237,8 +271,12 @@ def validate_filter_rows(filters: List[Any]) -> List[Dict[str, Any]]:
             )
 
         if "dimension" not in filter_item:
-            validated.append(filter_item)
-            continue
+            raise ValidationError(
+                message="Filter missing required field: dimension",
+                field="filters",
+                value=filter_item,
+                expected="Dictionary with dimension, operator and value (or values for IN)",
+            )
 
         if "operator" not in filter_item:
             raise ValidationError(
@@ -258,7 +296,7 @@ def validate_filter_rows(filters: List[Any]) -> List[Dict[str, Any]]:
                 suggestion=FILTER_IN_OPERATOR_NOTE,
             )
 
-        row = dict(filter_item)
+        row = _with_wire_include_descendants(dict(filter_item))
         row["dimension"] = str(filter_item["dimension"]).upper()
         row["operator"] = operator
         raw_values = filter_item.get("values")

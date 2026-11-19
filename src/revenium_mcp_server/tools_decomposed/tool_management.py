@@ -51,6 +51,7 @@ from ..introspection.metadata import (
     ToolCapability,
     ToolType,
 )
+from ..validators import InputValidator
 from ..tool_analytics_reports import (
     AGENT_TOOL_BREAKDOWN,
     COST_BY_TOOL,
@@ -466,6 +467,31 @@ def _refuse_unregistered_tool(tool_id: str, lookup: _EventToolLookup) -> NoRetur
     )
 
 
+def _refuse_a_transaction_id_the_event_log_cannot_find(event_data: Dict[str, Any]) -> None:
+    # The metering ingest accepts any text here, but the line item it writes
+    # keys on a UUID: LineItemProcessor (hypercurrent transaction-engine)
+    # replaces a non-UUID id with one derived from it, and the list_events
+    # transactionId filter accepts only a UUID.
+    transaction_id = event_data.get("transactionId")
+    if transaction_id is None:
+        return
+    if isinstance(transaction_id, str) and InputValidator.UUID_PATTERN.fullmatch(transaction_id):
+        return
+    raise create_structured_validation_error(
+        message=(
+            f"event_data.transactionId {transaction_id!r} is not a UUID. The platform would "
+            "meter the event under a different id it derives from this one, so neither this id "
+            "nor list_events(filters={'transaction_id': ...}) would find it. Nothing was sent."
+        ),
+        field="event_data.transactionId",
+        value=transaction_id,
+        suggestions=[
+            "Pass a UUID in the 8-4-4-4-12 form, e.g. '123e4567-e89b-12d3-a456-426614174000'",
+            "Or omit transactionId and the platform assigns a UUID",
+        ],
+    )
+
+
 def _refuse_unresolvable_tool_id(tool_id: str, lookup: _EventToolLookup) -> NoReturn:
     raise ToolError(
         message=(
@@ -720,6 +746,7 @@ class ToolManager:
                 action="meter tool event",
                 examples={"usage": "meter_event(event_data={'toolId': 'tool_123', ...})"},
             )
+        _refuse_a_transaction_id_the_event_log_cannot_find(event_data)
         return await self.client.meter_tool_event(event_data)
 
     async def list_events(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -794,6 +821,7 @@ class ToolManager:
                     "usage": "record_event(tool_id='X5oon5', event_data={'type': 'invocation', 'durationMs': 150})"
                 },
             )
+        _refuse_a_transaction_id_the_event_log_cannot_find(event_data)
         registered = await self._registered_tool_id(tool_id, _RECORD_LOOKUP)
         return await self.client.record_tool_event(registered, event_data)
 
@@ -1234,15 +1262,25 @@ class ToolManagement(ToolBase):
                         "operation": {"type": "string", "description": "Operation name (optional)"},
                         "costUsd": {"type": "number", "description": "Pre-calculated cost in USD (optional)"},
                         "agent": {"type": "string", "description": "Agent identifier (optional)"},
-                        "transactionId": {"type": "string", "description": "Transaction ID for correlation (optional)"},
-                        # Declared for discoverability only: the payload stays a
-                        # pass-through and this path is synchronous, so a value the
+                        "transactionId": {
+                            "type": "string",
+                            "description": (
+                                "Transaction ID for correlation (optional): a UUID in the "
+                                "8-4-4-4-12 form. meter_event and record_event refuse any other "
+                                "value, which the platform would replace with an id derived from "
+                                "it. Omit it and the platform assigns one."
+                            ),
+                        },
+                        # agenticJobId is declared for discoverability only and stays a
+                        # pass-through: this path is synchronous, so a value the
                         # server rejects (HTTP 400) reaches the calling agent as a
                         # structured validation error carrying the server's message
                         # (standardized_tool_execution formats ReveniumAPIError via
                         # _format_api_validation_error rather than re-raising it).
-                        # No "pattern" keyword and no client-side check — gating
-                        # here would reject values the server accepts.
+                        # No "pattern" keyword and no client-side check, since gating
+                        # here would reject values the server accepts. transactionId
+                        # is the exception: the ingest accepts a bad one with success
+                        # and stores the event under a different id.
                         "agenticJobId": {
                             "type": "string",
                             "description": (

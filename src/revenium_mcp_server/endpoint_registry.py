@@ -383,6 +383,23 @@ _ENDPOINT_REGISTRY: Dict[str, EndpointConfig] = {
         mapping_status="NEW_API_ONLY",
         force_new=True,
     ),
+    # ── Provider billing coverage (BACK-4916) ─────────────────────────────
+    # Replaces the platform GET /profitstream/v2/api/billing/coverage, which
+    # scans Postgres for the metered half and takes seconds or times out on a
+    # large team. The analytics route reads that half from ClickHouse and POSTs
+    # it to the same platform service, so the body is the platform's coverage
+    # report, unchanged. The platform GET is no longer called, so the entry is
+    # NEW_API_ONLY and old_path is the usual never-routed placeholder, keeping
+    # it out of the consumed-operations allowlist; force_new keeps hosted
+    # deployments (which do not set REVENIUM_USE_NEW_ANALYTICS_API) reaching
+    # the route, and is also what gives the entry the configured analytics host
+    # rather than the production default.
+    "billing_coverage": EndpointConfig(
+        old_path="/api/v2/analytics/billing-coverage",  # placeholder; never used (force_new)
+        new_path="/api/v2/analytics/billing-coverage",
+        mapping_status="NEW_API_ONLY",
+        force_new=True,
+    ),
     # ── Status / connectivity endpoint ────────────────────────────────────
     # Old: /profitstream/v2/api/sources/metrics/ai/data-connected
     # New: /api/v2/status/connection  (BACK-718 swap #14)

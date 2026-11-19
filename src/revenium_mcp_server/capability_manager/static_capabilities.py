@@ -24,6 +24,12 @@ STATIC_CAPABILITIES_NOTE = (
     "service, so it answers from its built-in table."
 )
 
+STATIC_CAPABILITIES_HEALTH_DETAIL = (
+    "UCM dynamic capabilities are unavailable by design in Clerk/OAuth and api_key modes, "
+    "so tools use static capabilities: every get_capabilities action answers from the "
+    "built-in table, and refresh_capabilities has nothing to refresh."
+)
+
 
 def require_supported_resource_type(
     resource_type: str, supported: AbstractSet[str] = SUPPORTED_RESOURCE_TYPES
@@ -78,3 +84,20 @@ def checkable_capability_names(capabilities: Dict[str, Any], resource_type: str)
         for name in capabilities
         if _listed_values(capabilities, resource_type, name) is not None
     )
+
+
+async def verify_against_static_table(resource_type: str, capability_name: str, value: str) -> bool:
+    """Check a value against the built-in table, refusing a capability it lists no values for."""
+    capabilities = await static_capabilities(resource_type)
+    verdict = static_verdict(capabilities, resource_type, capability_name, value)
+    if verdict is None:
+        raise ValidationError(
+            message=(
+                f"Capability '{capability_name}' is not in the static capability "
+                f"set for {resource_type}"
+            ),
+            field="capability_name",
+            value=capability_name,
+            expected=f"One of: {', '.join(checkable_capability_names(capabilities, resource_type))}",
+        )
+    return verdict

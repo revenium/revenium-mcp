@@ -26,6 +26,7 @@ from ..common.change_reason import (
     id_or_change_reason_refused,
 )
 from ..common.slack_configuration_lookup import slack_configuration_absent
+from ..common.creator_filter import no_rule_by_creator
 from ..common.error_handling import (
     ToolError,
     ErrorCodes,
@@ -47,7 +48,6 @@ from ..alert_operators import (
     is_rejected_operator,
     rejected_operator_message,
     threshold_is_percentage,
-    validate_filter_rows,
 )
 from .alert_manager import format_alert_value
 from ..validators import InputValidator
@@ -349,12 +349,6 @@ class AnomalyManager:
             if addresses and isinstance(addresses, list):
                 validated_data["notification_addresses"] = addresses
 
-        # Handle filters
-        if "filters" in anomaly_data:
-            filters = anomaly_data["filters"]
-            if filters and isinstance(filters, list):
-                validated_data["filters"] = validate_filter_rows(filters)
-
         # Handle alert type
         if "alert_type" in anomaly_data:
             validated_data["alert_type"] = str(anomaly_data["alert_type"])
@@ -396,11 +390,11 @@ class AnomalyManager:
             current_page = page + 1
 
             if total_elements == 0:
-                # No anomalies exist in the system
+                why = no_rule_by_creator(filters or {}, "alert rule")
                 return [
                     TextContent(
                         type="text",
-                        text="📋 **No AI anomalies found**\n\nNo anomalies match your criteria.",
+                        text=f"📋 **No AI anomalies found**\n\n{why or 'No anomalies match your criteria.'}",
                     )
                 ]
             elif current_page > total_pages:
@@ -624,7 +618,7 @@ class AnomalyManager:
     async def get_anomaly_change_summary(
         self, client: ReveniumClient, anomaly_id: str
     ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
-        """Who created an alert and who changed it last, from its change history."""
+        """Who created an alert, who changed it last and why, from its change history."""
         anomaly_id = validate_anomaly_id(anomaly_id)
         summary = await read_change_history(
             client.get_anomaly_change_summary(anomaly_id),
@@ -684,6 +678,7 @@ class AnomalyManager:
             ]
             validated_data.update(self._detection_rules_flags(anomaly_data))
             validated_data.update(self._detection_rules_notification_targets(anomaly_data))
+            validated_data.update(self._detection_rules_filters(anomaly_data))
         elif self._has_direct_api_format(anomaly_data):
             # User provided direct API format - validate and use as-is
             validated_data.update(self._validate_direct_api_format(anomaly_data))
@@ -742,6 +737,21 @@ class AnomalyManager:
             targets["slackConfigurations"] = list(dict.fromkeys(slack_configurations))
         return targets
 
+    @staticmethod
+    def _detection_rules_filters(anomaly_data: Dict[str, Any]) -> Dict[str, Any]:
+        """The filter rows a detection_rules payload names, as written: convert_to_api_format converts them."""
+        filters = anomaly_data.get("filters")
+        if filters is None:
+            return {}
+        if not isinstance(filters, list):
+            raise ValidationError(
+                message="Filters must be a list or null",
+                field="filters",
+                value=type(filters).__name__,
+                expected="List of filter dictionaries, or null for no filters",
+            )
+        return {"filters": filters}
+
     @classmethod
     def _detection_rules_flags(cls, anomaly_data: Dict[str, Any]) -> Dict[str, Any]:
         """The percent flag and persist wait a detection_rules payload names, in either spelling."""
@@ -788,7 +798,10 @@ class AnomalyManager:
         if "detection_rules" in validated_data:
             try:
                 api_data = InputValidator.convert_to_api_format(validated_data)
-            except ToolError:
+            except (ValidationError, ToolError):
+                # The checks inside the conversion (filter rows, a rule's operator or
+                # metric) already name the field at fault, as on update; the wrap below
+                # is for a conversion that breaks.
                 raise
             except Exception as e:
                 raise ValidationError(
@@ -799,11 +812,6 @@ class AnomalyManager:
         else:
             # Direct API format - use validated data as-is, just add required fields
             api_data = validated_data.copy()
-
-            # Operator aliases, the IN/values exclusivity and the row shape are all
-            # resolved by validate_filter_rows during payload validation.
-            if "filters" in api_data and isinstance(api_data["filters"], list):
-                api_data["filters"] = validate_filter_rows(api_data["filters"])
 
             # Ensure required API fields are present
             if "label" not in api_data and "name" in validated_data:
@@ -1001,25 +1009,14 @@ class AnomalyManager:
                     # Allow clearing filters
                     converted_updates["filters"] = []
                 elif isinstance(value, list):
-                    # Validate and convert filters to API format
                     try:
-                        from ..validators import InputValidator
-
-                        # Check if filters are already in API format (have 'dimension' field)
-                        if value and isinstance(value[0], dict) and "dimension" in value[0]:
-                            # Already in API format: the same row check the create
-                            # path runs, so an IN row keeps its values list here
-                            # instead of being rebuilt as a value-only row.
-                            converted_updates["filters"] = validate_filter_rows(value)
-                        else:
-                            # User-friendly format, convert to API format
-                            converted_updates["filters"] = (
-                                InputValidator._convert_filters_to_api_format(value)
-                            )
-                    except ValidationError:
-                        # validate_filter_rows already names the offending field
-                        # (values, operator, filters); re-wrapping it here would
-                        # bury that behind a generic "Invalid filter format".
+                        converted_updates["filters"] = (
+                            InputValidator.convert_filters_to_api_format(value)
+                        )
+                    except (ValidationError, ToolError):
+                        # validate_filter_rows and the row-shape refusal already name
+                        # the offending field and the accepted shapes; re-wrapping
+                        # them here would bury that behind a generic "Invalid filter format".
                         raise
                     except Exception as e:
                         raise ValidationError(
@@ -1653,10 +1650,7 @@ class AnomalyManager:
                     )
 
                 if field == "filters" and isinstance(value, list):
-                    # Row shape is checked here as well as in
-                    # _process_advanced_configuration: both write filters into the
-                    # payload, and validate_filter_rows is idempotent.
-                    value = validate_filter_rows(value)
+                    value = InputValidator.convert_filters_to_api_format(value)
 
                 validated_data[field] = value
 

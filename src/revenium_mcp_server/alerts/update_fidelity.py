@@ -64,12 +64,28 @@ TRACKING_PERIODS = (
     "TWELVE_HOURS", "TWENTY_FOUR_HOURS", "SEVEN_DAYS", "THIRTY_DAYS", "DAILY", "WEEKLY",
     "MONTHLY", "QUARTERLY",
 )
-# Dimension in Dimension.kt. groupBy takes any of them; parseFilters refuses DEPARTMENT.
+# Dimension in Dimension.kt. groupBy and filters take any of them; whether a DEPARTMENT
+# filter fits the rest of the alert is the platform's call, and its refusal passes through.
 GROUP_BY_DIMENSIONS = (
     "ORGANIZATION", "CREDENTIAL", "PRODUCT", "MODEL", "PROVIDER", "AGENT", "SUBSCRIBER",
     "TASK_TYPE", "WORKSPACE", "API_KEY", "DEPARTMENT",
 )
-ALERT_FILTER_DIMENSIONS = tuple(name for name in GROUP_BY_DIMENSIONS if name != "DEPARTMENT")
+ALERT_FILTER_DIMENSIONS = GROUP_BY_DIMENSIONS
+# What DepartmentAlertGate (hypercurrent) admits, written once for every text that teaches it.
+DEPARTMENT_ALERT_BUDGET_SHAPE = (
+    "a TOTAL_COST CUMULATIVE_USAGE budget on metered data (dataSource SDK, not PROVIDER) "
+    "with a budget period and operatorType GREATER_THAN or GREATER_THAN_OR_EQUAL_TO"
+)
+DEPARTMENT_ALERT_FORMS = (
+    "either one DEPARTMENT filter and nothing else, or groupBy DEPARTMENT with no filters"
+)
+DEPARTMENT_ALERT_SWITCHES = (
+    "department attribution, department budgets and department alert budgets all turned on"
+)
+DEPARTMENT_INCLUDE_DESCENDANTS_DEFAULT = (
+    "true counts its sub-departments, false only the department itself; if you leave it "
+    "out, it counts as true, so sub-departments are included"
+)
 # FilterValueValidation.MAX_VALUES.
 FILTER_MAX_VALUES = 50
 
@@ -592,7 +608,7 @@ PLATFORM_ALERT_RULES: Tuple[PlatformRule, ...] = (
         "provider metric", f"{_REGISTRY} PROVIDER_METRICS",
         frozenset({"metricType", "dataSource"}), _check_provider_metric,
     ),
-    PlatformRule("filter dimension is known", f"{_FILTERS} (DEPARTMENT refused)", _FILTER_FIELDS, _check_filter_dimensions),
+    PlatformRule("filter dimension is known", _FILTERS, _FILTER_FIELDS, _check_filter_dimensions),
     PlatformRule(
         "provider filter dimension", f"{_REGISTRY} filter types",
         frozenset({"filters", "dataSource"}), _check_provider_filter_dimensions,

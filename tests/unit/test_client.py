@@ -3,6 +3,7 @@
 import inspect
 
 import os
+from dataclasses import replace
 import pytest
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 import httpx
@@ -14,6 +15,7 @@ from src.revenium_mcp_server.client import (
     ReveniumClient,
 )
 from src.revenium_mcp_server.auth import AuthConfig
+from src.revenium_mcp_server.endpoint_registry import _ENDPOINT_REGISTRY, get_endpoint_config
 
 
 class TestReveniumClient:
@@ -932,7 +934,7 @@ class TestGetProviderCoverage:
     """get_provider_coverage — the team-scoped provider metering-coverage report read."""
 
     @pytest.mark.asyncio
-    async def test_targets_the_billing_coverage_path(self, mock_env_vars):
+    async def test_reads_the_billing_coverage_route_on_the_analytics_host(self, mock_env_vars):
         client = ReveniumClient()
 
         with patch.object(
@@ -941,12 +943,23 @@ class TestGetProviderCoverage:
             result = await client.get_provider_coverage()
 
         assert result == {"state": "OK"}
-        assert mock_get.call_args[0][0] == "/profitstream/v2/api/billing/coverage"
+        assert mock_get.call_args[0][0] == "/api/v2/analytics/billing-coverage"
+        assert mock_get.call_args[1]["base_url"] == "https://app.revenium.invalid"
+        assert mock_get.call_args[1]["use_bearer"] is True
 
     @pytest.mark.asyncio
-    async def test_defaults_the_required_period_and_sends_the_team_id(self, mock_env_vars):
-        """period is a non-nullable binding upstream: a request without one fails
-        during argument resolution, so the client always sends it (default 30d)."""
+    async def test_keeps_the_flat_report_whole(self, mock_env_vars):
+        """The report has no _embedded member, so the bearer-call unwrap would empty it."""
+        client = ReveniumClient()
+
+        with patch.object(client, "get", new_callable=AsyncMock, return_value={}) as mock_get:
+            await client.get_provider_coverage()
+
+        assert mock_get.call_args[1]["unwrap_hal_embedded"] is False
+
+    @pytest.mark.asyncio
+    async def test_defaults_the_period_and_sends_the_resolved_team(self, mock_env_vars):
+        """Without teamId a user token is answered for the user's default team."""
         client = ReveniumClient()
 
         with patch.object(
@@ -958,16 +971,61 @@ class TestGetProviderCoverage:
         assert params == {"teamId": "test_team_id_456", "period": "30d"}
 
     @pytest.mark.asyncio
-    async def test_period_value_is_sent_verbatim(self, mock_env_vars):
-        """No local enum gate: a period the platform adds later must pass through."""
+    async def test_no_team_is_sent_when_none_is_resolved(self, mock_env_vars):
+        client = ReveniumClient()
+
+        with patch.object(
+            ReveniumClient, "team_id", new_callable=PropertyMock, return_value=None
+        ), patch.object(client, "get", new_callable=AsyncMock, return_value={}) as mock_get:
+            await client.get_provider_coverage()
+
+        assert mock_get.call_args[1]["params"] == {"period": "30d"}
+
+    @pytest.mark.asyncio
+    async def test_period_value_is_sent_without_a_local_enum_gate(self, mock_env_vars):
+        """No local enum gate: the analytics route's own refusal names what it accepts."""
         client = ReveniumClient()
 
         with patch.object(
             client, "get", new_callable=AsyncMock, return_value={}
         ) as mock_get:
-            await client.get_provider_coverage(period="90d")
+            await client.get_provider_coverage(period="1y")
+
+        assert mock_get.call_args[1]["params"]["period"] == "1y"
+
+    @pytest.mark.asyncio
+    async def test_period_is_sent_in_lower_case(self, mock_env_vars):
+        """The platform compared period names lower-cased; the analytics route matches them exactly."""
+        client = ReveniumClient()
+
+        with patch.object(client, "get", new_callable=AsyncMock, return_value={}) as mock_get:
+            await client.get_provider_coverage(period="90D")
 
         assert mock_get.call_args[1]["params"]["period"] == "90d"
+
+    @pytest.mark.asyncio
+    async def test_a_clerk_session_reads_the_analytics_route_with_its_own_token(self, mock_env_vars):
+        """BACK-4916: the slow platform read is never sent, and the report arrives whole."""
+        jwt = "eyJhbGciOiJSUzI1NiJ9.coverage-payload.signature"
+        client = ReveniumClient(auth_config=AuthConfig(clerk_jwt=jwt, team_id="jR2kmLs"))
+        report = {"state": "VALID", "aggregateRatio": 0.82, "byProvider": []}
+        answered = httpx.Response(
+            200, json=report, request=httpx.Request("GET", "https://app.revenium.invalid")
+        )
+
+        with patch.object(
+            client.client, "request", new_callable=AsyncMock, return_value=answered
+        ) as sent:
+            result = await client.get_provider_coverage(period="7d")
+
+        assert result == report
+        assert sent.await_count == 1
+        request = sent.await_args.kwargs
+        assert request["method"] == "GET"
+        assert request["url"] == "https://app.revenium.invalid/api/v2/analytics/billing-coverage"
+        assert request["params"] == {"teamId": "jR2kmLs", "period": "7d"}
+        assert request["headers"]["Authorization"] == f"Bearer {jwt}"
+        assert "billing/coverage" not in request["url"]
 
     @pytest.mark.asyncio
     async def test_custom_period_carries_its_dates(self, mock_env_vars):
@@ -1004,17 +1062,6 @@ class TestGetProviderCoverage:
         }
 
     @pytest.mark.asyncio
-    async def test_explicit_team_id_overrides_the_auth_context_team(self, mock_env_vars):
-        client = ReveniumClient()
-
-        with patch.object(
-            client, "get", new_callable=AsyncMock, return_value={}
-        ) as mock_get:
-            await client.get_provider_coverage(team_id="jR2kmLs")
-
-        assert mock_get.call_args[1]["params"] == {"teamId": "jR2kmLs", "period": "30d"}
-
-    @pytest.mark.asyncio
     async def test_returns_the_response_unchanged(self, mock_env_vars):
         """No reshaping here: the tool layer owns rendering, the client owns transport."""
         client = ReveniumClient()
@@ -1045,6 +1092,40 @@ class TestGetProviderCoverage:
                 await client.get_provider_coverage()
 
         assert exc_info.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_a_registry_entry_without_an_analytics_route_is_a_broken_invariant(
+        self, mock_env_vars
+    ):
+        client = ReveniumClient()
+        routeless = replace(get_endpoint_config("billing_coverage"), new_path=None)
+
+        with patch(
+            "src.revenium_mcp_server.client.get_endpoint_config", return_value=routeless
+        ), patch.object(client, "get", new_callable=AsyncMock) as mock_get:
+            with pytest.raises(RuntimeError, match="^the billing_coverage registry entry names no analytics route$"):
+                await client.get_provider_coverage()
+
+        mock_get.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_entry_this_deployment_would_not_route_is_refused_before_sending(
+        self, mock_env_vars, monkeypatch
+    ):
+        monkeypatch.delenv("REVENIUM_USE_NEW_ANALYTICS_API", raising=False)
+        client = ReveniumClient()
+        unforced = replace(_ENDPOINT_REGISTRY["billing_coverage"], force_new=False)
+
+        with patch.dict(_ENDPOINT_REGISTRY, {"billing_coverage": unforced}), patch.object(
+            client, "get", new_callable=AsyncMock
+        ) as mock_get:
+            with pytest.raises(
+                RuntimeError,
+                match="^the billing_coverage registry entry does not route to the configured analytics host$",
+            ):
+                await client.get_provider_coverage()
+
+        mock_get.assert_not_awaited()
 
 
 class TestGetAiModelProviders:
@@ -1704,7 +1785,11 @@ class TestTeamScopeRefusal:
         assert exc_info.value.platform_message == "Forbidden"
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("content_type, body", CODELESS_FORBIDDEN, ids=["problem+json", "json"])
+    @pytest.mark.parametrize(
+        "content_type, body",
+        [*CODELESS_FORBIDDEN, ("application/json", {"code": "", "message": "Forbidden"})],
+        ids=["problem+json", "json", "empty code"],
+    )
     async def test_a_codeless_403_on_a_paired_host_is_still_read_as_the_team_sent(
         self, mock_env_vars, monkeypatch, content_type, body
     ):

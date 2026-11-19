@@ -21,8 +21,8 @@ Not imported by any runtime module: see
 
 from __future__ import annotations
 
-from enum import StrEnum
-from typing import Any, Optional, Union
+from enum import Enum, StrEnum
+from typing import Any, Dict, Optional, Union
 from uuid import UUID
 
 from pydantic import (
@@ -985,6 +985,12 @@ class Links(BaseModel):
 
 
 class Metric(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -1135,6 +1141,401 @@ class ApiV2AnalyticsAvgTimeByAgentGetResponse6(BaseModel):
     type: str
 
 
+class Period6(StrEnum):
+    """
+    The period to compare, ending today in UTC: 24h, 7d, 30d, 90d, or custom with startDate and endDate. Defaults to 30d.
+    """
+
+    field_24h = '24h'
+    field_7d = '7d'
+    field_30d = '30d'
+    field_90d = '90d'
+    custom = 'custom'
+
+
+class ApiV2AnalyticsBillingCoverageGetParametersQuery(BaseModel):
+    period: Optional[Period6] = Field(
+        '30d',
+        description='The period to compare, ending today in UTC: 24h, 7d, 30d, 90d, or custom with startDate and endDate. Defaults to 30d.',
+    )
+    startDate: Optional[str] = Field(
+        None,
+        description='First day of a custom period, ISO 8601 in UTC, for example 2026-09-01T00:00:00Z. Only its UTC day is used. Required when period is custom, ignored otherwise.',
+    )
+    endDate: Optional[str] = Field(
+        None,
+        description='Last day of a custom period, included, ISO 8601 in UTC. At most 366 days after startDate and not in the future. Required when period is custom, ignored otherwise.',
+    )
+    provider: Optional[str] = Field(
+        None,
+        description='Narrow the comparison to one provider, for example anthropic. Omit it for every provider.',
+    )
+    teamId: Optional[str] = Field(
+        None,
+        description="Hashed id of the team to answer for. Optional. With a user token it may be any team the user belongs to; without it the user's default team answers. An API key always answers for its own team, and naming any other team is refused with 403.",
+    )
+
+
+class AggregateRatioUnavailableReason(StrEnum):
+    """
+    Why the aggregate ratio cannot be calculated: no billing credential, no provider with overlapping records, a compared billed total that is not positive, or no spend in the period. Absent when the ratio is available.
+    """
+
+    NO_BILLING_CREDENTIAL = 'NO_BILLING_CREDENTIAL'
+    NO_COMPARABLE_PROVIDERS = 'NO_COMPARABLE_PROVIDERS'
+    NON_POSITIVE_BILLING_TOTAL = 'NON_POSITIVE_BILLING_TOTAL'
+    ZERO_SPEND_PERIOD = 'ZERO_SPEND_PERIOD'
+
+
+class CodingAssistantPricingMode(StrEnum):
+    """
+    How the coding assistants counted under this provider are priced: pay-as-you-go, seat-plan, or unset. GitHub Copilot always reports pay-as-you-go here; other assistants follow the team's pricing setting. Absent when no assistant is counted under this provider.
+    """
+
+    pay_as_you_go = 'pay-as-you-go'
+    seat_plan = 'seat-plan'
+    unset = 'unset'
+
+
+class ComparisonState(StrEnum):
+    """
+    Whether this row compares the full requested period, a shorter period both datasets share, or no overlapping records.
+    """
+
+    full_window = 'full-window'
+    partial_window = 'partial-window'
+    no_overlap = 'no-overlap'
+
+
+class UsageTypeBreakdownItem(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
+    billing: float = Field(
+        ...,
+        description="Billed amount in USD for this charge type over the row's comparison window.",
+    )
+    usageType: str = Field(
+        ...,
+        description="The charge type as recorded from the provider's bill, such as web_search. The set of values is open, so treat an unknown value as unclassified.",
+    )
+
+
+class ByProviderItem(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
+    assistantsWithUsageNamedHere: Optional[list[str]] = Field(
+        None,
+        description='The coding assistants this row may name that produced metered usage for the team in the period, such as ClaudeCode or CodexCli, sorted. Absent when the row names no assistant; empty when it names some and none produced usage. It never claims the assistant is billed on this provider.',
+    )
+    billedSeats: Optional[int] = Field(
+        None,
+        description='The number of people this provider invoiced over the requested period. Absent for providers billed per token, where absent does not mean zero.',
+    )
+    billing: float = Field(
+        ..., description='Billed cost in USD for this provider in the period.'
+    )
+    billingCredentialConnected: bool = Field(
+        ...,
+        description='True when a billing credential for this provider is connected. When false, the row has no billing figure or ratio and is left out of aggregateRatio and hiddenSpend.',
+    )
+    codingAssistantPricingMode: Optional[CodingAssistantPricingMode] = Field(
+        None,
+        description="How the coding assistants counted under this provider are priced: pay-as-you-go, seat-plan, or unset. GitHub Copilot always reports pay-as-you-go here; other assistants follow the team's pricing setting. Absent when no assistant is counted under this provider.",
+    )
+    codingAssistantUsagePresent: bool = Field(
+        ...,
+        description="True when the period has coding-assistant usage that this provider's invoice covers, such as Claude Code for Claude Enterprise. It says nothing about spend.",
+    )
+    codingAssistantUsageUnknown: bool = Field(
+        ...,
+        description='True when the coding-assistant checks for this provider could not finish. The coding-assistant fields of this row then have no answer rather than meaning none.',
+    )
+    comparisonEndDate: Optional[str] = Field(
+        ...,
+        description="Last day of this row's comparison, or null when the datasets do not overlap.",
+    )
+    comparisonStartDate: Optional[str] = Field(
+        ...,
+        description="First day of this row's comparison, or null when the datasets do not overlap.",
+    )
+    comparisonState: ComparisonState = Field(
+        ...,
+        description='Whether this row compares the full requested period, a shorter period both datasets share, or no overlapping records.',
+    )
+    credentialNames: list[str] = Field(
+        ...,
+        description='Names of the connected billing credentials whose billing this row reports, sorted. Empty when no billing credential is connected for this row.',
+    )
+    earliestBilledOn: Optional[str] = Field(
+        ...,
+        description='First day with provider billing, or null when billing has not arrived.',
+    )
+    earliestMeteredOn: Optional[str] = Field(
+        ...,
+        description="The first day with metered usage for this provider, or null when none was found. It may be earlier than this provider's own first usage, so null does not prove the provider was never metered.",
+    )
+    label: Optional[str] = Field(
+        None,
+        description='Which of the provider\'s billing keys this row reports, where the provider name alone does not say, for example Claude Enterprise. Usage that belongs to a key with no billing credential connected says so, for example "Anthropic API usage, no Console key". Absent for providers with one kind of billing key.',
+    )
+    metered: float = Field(
+        ..., description='Metered cost in USD for this provider in the period.'
+    )
+    previousWindowPredatesTelemetry: bool = Field(
+        ...,
+        description='True when the previous period ends before the first metered day, so its metered figure is zero because nothing was being metered yet. When true for a compared row, the overall trend is not reported.',
+    )
+    provider: str = Field(..., description='Provider name, for example anthropic.')
+    ratio: Optional[float] = Field(
+        ...,
+        description="This provider's metered cost divided by its billed cost. Null when its billed cost is not positive.",
+    )
+    revisionWindowStart: Optional[str] = Field(
+        None,
+        description="The first day for which this provider may still revise its figures. Absent when the provider's figures are final when published.",
+    )
+    state: str = Field(
+        ...,
+        description='active when the provider has billed or metered cost in the period, no-data otherwise.',
+    )
+    usageTypeBreakdown: Optional[list[UsageTypeBreakdownItem]] = Field(
+        None,
+        description='Billed amount in USD per charge type for this provider, over the same period as billing. Absent when no reliable breakdown exists, and never an empty list.',
+    )
+
+
+class Confidence(Enum):
+    """
+    HIGH when every provider compares the full requested period, adjusted when any provider compares a shorter period or none.
+    """
+
+    HIGH = 'HIGH'
+    adjusted = 'adjusted'
+    NoneType_None = None
+
+
+class MeteredBasis(BaseModel):
+    """
+    The period behind the metered figures and any adjustment made to them.
+    """
+
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
+    transform: str = Field(
+        ...,
+        description="none when each metered figure is the plain sum of that provider's metered usage; otherwise a comma-separated list of adjustments: narrowed-window or zeroed-no-overlap.",
+    )
+    windowEnd: str = Field(..., description='Last day of the requested period.')
+    windowStart: str = Field(..., description='First day of the requested period.')
+
+
+class State(StrEnum):
+    """
+    VALID when providers could be compared; NO_INTEGRATION when no billing credential is connected; ZERO_SPEND_PERIOD when the period has neither billed nor metered cost.
+    """
+
+    VALID = 'VALID'
+    NO_INTEGRATION = 'NO_INTEGRATION'
+    ZERO_SPEND_PERIOD = 'ZERO_SPEND_PERIOD'
+
+
+class ApiV2AnalyticsBillingCoverageGetResponse(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
+    aggregateRatio: Optional[float] = Field(
+        None,
+        description='Metered cost divided by billed cost across the providers with a billing credential. It is 0 or more and can be above 1. Null when aggregateRatioAvailable is false.',
+    )
+    aggregateRatioAvailable: Optional[bool] = Field(
+        ...,
+        description='True when at least one provider can be compared and their combined billed cost is positive.',
+    )
+    aggregateRatioUnavailableProviders: Optional[list[str]] = Field(
+        None,
+        description='The providers behind an unavailable aggregate ratio. Absent when there are none or the ratio is available.',
+    )
+    aggregateRatioUnavailableReason: Optional[AggregateRatioUnavailableReason] = Field(
+        None,
+        description='Why the aggregate ratio cannot be calculated: no billing credential, no provider with overlapping records, a compared billed total that is not positive, or no spend in the period. Absent when the ratio is available.',
+    )
+    byProvider: Optional[list[ByProviderItem]] = Field(
+        None,
+        description='One row per provider for the period. Absent or null on states that carry no provider list.',
+    )
+    codingAssistantUsagePresent: bool = Field(
+        ...,
+        description='True when the team had any coding-assistant usage in the period. It says nothing about spend and is not used in aggregateRatio or hiddenSpend.',
+    )
+    codingAssistantUsageUnknown: bool = Field(
+        ...,
+        description='True when the team-wide coding-assistant check could not finish. codingAssistantUsagePresent then has no answer rather than meaning none.',
+    )
+    confidence: Optional[Confidence] = Field(
+        None,
+        description='HIGH when every provider compares the full requested period, adjusted when any provider compares a shorter period or none.',
+    )
+    earliestMeteredAt: Optional[str] = Field(
+        ...,
+        description='First metered usage for the team, ISO 8601 in UTC, or null when none has arrived.',
+    )
+    hiddenSpend: Optional[float] = Field(
+        None,
+        description='Billed cost that was not metered, in USD: total billed minus total metered across the providers with a billing credential, never below 0.',
+    )
+    meteredBasis: Optional[MeteredBasis] = Field(
+        None,
+        description='The period behind the metered figures and any adjustment made to them.',
+    )
+    meteredTotalInComparison: Optional[float] = Field(
+        None,
+        description='Metered cost in USD for the providers with a billing credential: the amount aggregateRatio and hiddenSpend were calculated from.',
+    )
+    meteredTotalOutsideComparison: Optional[float] = Field(
+        None,
+        description='Metered cost in USD for providers with no billing credential, left out of aggregateRatio and hiddenSpend. Zero when every provider has a billing credential.',
+    )
+    state: State = Field(
+        ...,
+        description='VALID when providers could be compared; NO_INTEGRATION when no billing credential is connected; ZERO_SPEND_PERIOD when the period has neither billed nor metered cost.',
+    )
+    trend: Optional[float] = Field(
+        None,
+        description='Change in aggregateRatio from the previous period of the same length, as a difference in ratio (0.05 means 5 points higher). Null when there is no usable previous period.',
+    )
+
+
+class Code21(StrEnum):
+    INVALID_TEAM_ID = 'INVALID_TEAM_ID'
+
+
+class ApiV2AnalyticsBillingCoverageGetResponse1(BaseModel):
+    code: Code21
+    message: str
+
+
+class Code22(StrEnum):
+    INVALID_INPUT = 'INVALID_INPUT'
+    VALIDATION_ERROR = 'VALIDATION_ERROR'
+
+
+class ApiV2AnalyticsBillingCoverageGetResponse2(BaseModel):
+    code: Code22
+    detail: str
+    instance: Optional[str] = None
+    status: float
+    title: str
+    type: str
+
+
+class Code23(StrEnum):
+    UNAUTHORIZED = 'UNAUTHORIZED'
+
+
+class ApiV2AnalyticsBillingCoverageGetResponse3(BaseModel):
+    code: Code23
+    message: str
+
+
+class Code24(StrEnum):
+    FORBIDDEN = 'FORBIDDEN'
+    TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
+
+
+class ApiV2AnalyticsBillingCoverageGetResponse4(BaseModel):
+    code: Code24
+    message: str
+
+
+class Code25(StrEnum):
+    FORBIDDEN = 'FORBIDDEN'
+
+
+class ApiV2AnalyticsBillingCoverageGetResponse5(BaseModel):
+    code: Code25
+    detail: str
+    instance: Optional[str] = None
+    status: float
+    title: str
+    type: str
+
+
+class Code26(StrEnum):
+    NOT_FOUND = 'NOT_FOUND'
+
+
+class ApiV2AnalyticsBillingCoverageGetResponse6(BaseModel):
+    code: Code26
+    detail: str
+    instance: Optional[str] = None
+    status: float
+    title: str
+    type: str
+
+
+class Code27(StrEnum):
+    RATE_LIMITED = 'RATE_LIMITED'
+
+
+class ApiV2AnalyticsBillingCoverageGetResponse7(BaseModel):
+    code: Code27
+    detail: str
+    instance: Optional[str] = None
+    status: float
+    title: str
+    type: str
+
+
+class Code28(StrEnum):
+    INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
+
+
+class ApiV2AnalyticsBillingCoverageGetResponse8(BaseModel):
+    code: Code28
+    message: str
+
+
+class Code29(StrEnum):
+    INTERNAL_ERROR = 'INTERNAL_ERROR'
+
+
+class ApiV2AnalyticsBillingCoverageGetResponse9(BaseModel):
+    code: Code29
+    detail: str
+    instance: Optional[str] = None
+    status: float
+    title: str
+    type: str
+
+
+class Code30(StrEnum):
+    COVERAGE_UNAVAILABLE = 'COVERAGE_UNAVAILABLE'
+
+
+class ApiV2AnalyticsBillingCoverageGetResponse10(BaseModel):
+    code: Code30
+    detail: str
+    instance: Optional[str] = None
+    status: float
+    title: str
+    type: str
+
+
 class MetricType2(StrEnum):
     """
     How the values in each group are combined: sum, avg, max, min, count, median, or the percentile p50, p90, p95 or p99. Defaults to sum.
@@ -1194,6 +1595,12 @@ class ApiV2AnalyticsCostByAgentGetParametersQuery(BaseModel):
 
 
 class Metric1(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -1241,6 +1648,19 @@ class FieldEmbedded3(BaseModel):
     )
 
 
+class Period7(BaseModel):
+    """
+    The date range the response covers.
+    """
+
+    end: AwareDatetime = Field(
+        ..., description='End of the date range, ISO 8601 in UTC.'
+    )
+    start: AwareDatetime = Field(
+        ..., description='Start of the date range, ISO 8601 in UTC.'
+    )
+
+
 class ApiV2AnalyticsCostByAgentGetResponse(BaseModel):
     field_embedded: FieldEmbedded3 = Field(..., alias='_embedded')
     field_links: dict[str, FieldLinks1] = Field(
@@ -1258,28 +1678,28 @@ class ApiV2AnalyticsCostByAgentGetResponse(BaseModel):
     page: Optional[Page2] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period5 = Field(..., description='The date range the response covers.')
+    period: Period7 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code21(StrEnum):
+class Code31(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsCostByAgentGetResponse1(BaseModel):
-    code: Code21
+    code: Code31
     message: str
 
 
-class Code22(StrEnum):
+class Code32(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsCostByAgentGetResponse2(BaseModel):
-    code: Code22
+    code: Code32
     detail: str
     instance: Optional[str] = None
     status: float
@@ -1287,40 +1707,40 @@ class ApiV2AnalyticsCostByAgentGetResponse2(BaseModel):
     type: str
 
 
-class Code23(StrEnum):
+class Code33(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsCostByAgentGetResponse3(BaseModel):
-    code: Code23
+    code: Code33
     message: str
 
 
-class Code24(StrEnum):
+class Code34(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsCostByAgentGetResponse4(BaseModel):
-    code: Code24
+    code: Code34
     message: str
 
 
-class Code25(StrEnum):
+class Code35(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsCostByAgentGetResponse5(BaseModel):
-    code: Code25
+    code: Code35
     message: str
 
 
-class Code26(StrEnum):
+class Code36(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsCostByAgentGetResponse6(BaseModel):
-    code: Code26
+    code: Code36
     detail: str
     instance: Optional[str] = None
     status: float
@@ -1357,6 +1777,12 @@ class ApiV2AnalyticsCostByApiKeyGetParametersQuery(BaseModel):
 
 
 class Metric2(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -1421,28 +1847,28 @@ class ApiV2AnalyticsCostByApiKeyGetResponse(BaseModel):
     page: Optional[Page2] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period5 = Field(..., description='The date range the response covers.')
+    period: Period7 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code27(StrEnum):
+class Code37(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsCostByApiKeyGetResponse1(BaseModel):
-    code: Code27
+    code: Code37
     message: str
 
 
-class Code28(StrEnum):
+class Code38(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsCostByApiKeyGetResponse2(BaseModel):
-    code: Code28
+    code: Code38
     detail: str
     instance: Optional[str] = None
     status: float
@@ -1450,40 +1876,40 @@ class ApiV2AnalyticsCostByApiKeyGetResponse2(BaseModel):
     type: str
 
 
-class Code29(StrEnum):
+class Code39(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsCostByApiKeyGetResponse3(BaseModel):
-    code: Code29
+    code: Code39
     message: str
 
 
-class Code30(StrEnum):
+class Code40(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsCostByApiKeyGetResponse4(BaseModel):
-    code: Code30
+    code: Code40
     message: str
 
 
-class Code31(StrEnum):
+class Code41(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsCostByApiKeyGetResponse5(BaseModel):
-    code: Code31
+    code: Code41
     message: str
 
 
-class Code32(StrEnum):
+class Code42(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsCostByApiKeyGetResponse6(BaseModel):
-    code: Code32
+    code: Code42
     detail: str
     instance: Optional[str] = None
     status: float
@@ -1546,6 +1972,12 @@ class ApiV2AnalyticsCostByDepartmentAggregatedGetParametersQuery(BaseModel):
 
 
 class Metric3(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -1607,28 +2039,28 @@ class ApiV2AnalyticsCostByDepartmentAggregatedGetResponse(BaseModel):
     page: Optional[Page2] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period5 = Field(..., description='The date range the response covers.')
+    period: Period7 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code33(StrEnum):
+class Code43(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsCostByDepartmentAggregatedGetResponse1(BaseModel):
-    code: Code33
+    code: Code43
     message: str
 
 
-class Code34(StrEnum):
+class Code44(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsCostByDepartmentAggregatedGetResponse2(BaseModel):
-    code: Code34
+    code: Code44
     detail: str
     instance: Optional[str] = None
     status: float
@@ -1636,40 +2068,40 @@ class ApiV2AnalyticsCostByDepartmentAggregatedGetResponse2(BaseModel):
     type: str
 
 
-class Code35(StrEnum):
+class Code45(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsCostByDepartmentAggregatedGetResponse3(BaseModel):
-    code: Code35
+    code: Code45
     message: str
 
 
-class Code36(StrEnum):
+class Code46(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsCostByDepartmentAggregatedGetResponse4(BaseModel):
-    code: Code36
+    code: Code46
     message: str
 
 
-class Code37(StrEnum):
+class Code47(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsCostByDepartmentAggregatedGetResponse5(BaseModel):
-    code: Code37
+    code: Code47
     message: str
 
 
-class Code38(StrEnum):
+class Code48(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsCostByDepartmentAggregatedGetResponse6(BaseModel):
-    code: Code38
+    code: Code48
     detail: str
     instance: Optional[str] = None
     status: float
@@ -1719,6 +2151,12 @@ class ApiV2AnalyticsCostByModelGetParametersQuery(BaseModel):
 
 
 class Metric4(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -1783,28 +2221,28 @@ class ApiV2AnalyticsCostByModelGetResponse(BaseModel):
     page: Optional[Page2] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period5 = Field(..., description='The date range the response covers.')
+    period: Period7 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code39(StrEnum):
+class Code49(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsCostByModelGetResponse1(BaseModel):
-    code: Code39
+    code: Code49
     message: str
 
 
-class Code40(StrEnum):
+class Code50(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsCostByModelGetResponse2(BaseModel):
-    code: Code40
+    code: Code50
     detail: str
     instance: Optional[str] = None
     status: float
@@ -1812,40 +2250,40 @@ class ApiV2AnalyticsCostByModelGetResponse2(BaseModel):
     type: str
 
 
-class Code41(StrEnum):
+class Code51(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsCostByModelGetResponse3(BaseModel):
-    code: Code41
+    code: Code51
     message: str
 
 
-class Code42(StrEnum):
+class Code52(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsCostByModelGetResponse4(BaseModel):
-    code: Code42
+    code: Code52
     message: str
 
 
-class Code43(StrEnum):
+class Code53(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsCostByModelGetResponse5(BaseModel):
-    code: Code43
+    code: Code53
     message: str
 
 
-class Code44(StrEnum):
+class Code54(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsCostByModelGetResponse6(BaseModel):
-    code: Code44
+    code: Code54
     detail: str
     instance: Optional[str] = None
     status: float
@@ -1882,6 +2320,12 @@ class ApiV2AnalyticsCostByModelAggregatedGetParametersQuery(BaseModel):
 
 
 class Metric5(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -1934,28 +2378,28 @@ class ApiV2AnalyticsCostByModelAggregatedGetResponse(BaseModel):
     page: Optional[Page2] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period5 = Field(..., description='The date range the response covers.')
+    period: Period7 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code45(StrEnum):
+class Code55(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsCostByModelAggregatedGetResponse1(BaseModel):
-    code: Code45
+    code: Code55
     message: str
 
 
-class Code46(StrEnum):
+class Code56(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsCostByModelAggregatedGetResponse2(BaseModel):
-    code: Code46
+    code: Code56
     detail: str
     instance: Optional[str] = None
     status: float
@@ -1963,40 +2407,40 @@ class ApiV2AnalyticsCostByModelAggregatedGetResponse2(BaseModel):
     type: str
 
 
-class Code47(StrEnum):
+class Code57(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsCostByModelAggregatedGetResponse3(BaseModel):
-    code: Code47
+    code: Code57
     message: str
 
 
-class Code48(StrEnum):
+class Code58(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsCostByModelAggregatedGetResponse4(BaseModel):
-    code: Code48
+    code: Code58
     message: str
 
 
-class Code49(StrEnum):
+class Code59(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsCostByModelAggregatedGetResponse5(BaseModel):
-    code: Code49
+    code: Code59
     message: str
 
 
-class Code50(StrEnum):
+class Code60(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsCostByModelAggregatedGetResponse6(BaseModel):
-    code: Code50
+    code: Code60
     detail: str
     instance: Optional[str] = None
     status: float
@@ -2033,6 +2477,12 @@ class ApiV2AnalyticsCostByOrganizationGetParametersQuery(BaseModel):
 
 
 class Metric6(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -2097,28 +2547,28 @@ class ApiV2AnalyticsCostByOrganizationGetResponse(BaseModel):
     page: Optional[Page2] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period5 = Field(..., description='The date range the response covers.')
+    period: Period7 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code51(StrEnum):
+class Code61(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsCostByOrganizationGetResponse1(BaseModel):
-    code: Code51
+    code: Code61
     message: str
 
 
-class Code52(StrEnum):
+class Code62(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsCostByOrganizationGetResponse2(BaseModel):
-    code: Code52
+    code: Code62
     detail: str
     instance: Optional[str] = None
     status: float
@@ -2126,40 +2576,40 @@ class ApiV2AnalyticsCostByOrganizationGetResponse2(BaseModel):
     type: str
 
 
-class Code53(StrEnum):
+class Code63(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsCostByOrganizationGetResponse3(BaseModel):
-    code: Code53
+    code: Code63
     message: str
 
 
-class Code54(StrEnum):
+class Code64(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsCostByOrganizationGetResponse4(BaseModel):
-    code: Code54
+    code: Code64
     message: str
 
 
-class Code55(StrEnum):
+class Code65(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsCostByOrganizationGetResponse5(BaseModel):
-    code: Code55
+    code: Code65
     message: str
 
 
-class Code56(StrEnum):
+class Code66(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsCostByOrganizationGetResponse6(BaseModel):
-    code: Code56
+    code: Code66
     detail: str
     instance: Optional[str] = None
     status: float
@@ -2196,6 +2646,12 @@ class ApiV2AnalyticsCostByOrganizationAggregatedGetParametersQuery(BaseModel):
 
 
 class Metric7(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -2248,28 +2704,28 @@ class ApiV2AnalyticsCostByOrganizationAggregatedGetResponse(BaseModel):
     page: Optional[Page2] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period5 = Field(..., description='The date range the response covers.')
+    period: Period7 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code57(StrEnum):
+class Code67(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsCostByOrganizationAggregatedGetResponse1(BaseModel):
-    code: Code57
+    code: Code67
     message: str
 
 
-class Code58(StrEnum):
+class Code68(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsCostByOrganizationAggregatedGetResponse2(BaseModel):
-    code: Code58
+    code: Code68
     detail: str
     instance: Optional[str] = None
     status: float
@@ -2277,40 +2733,40 @@ class ApiV2AnalyticsCostByOrganizationAggregatedGetResponse2(BaseModel):
     type: str
 
 
-class Code59(StrEnum):
+class Code69(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsCostByOrganizationAggregatedGetResponse3(BaseModel):
-    code: Code59
+    code: Code69
     message: str
 
 
-class Code60(StrEnum):
+class Code70(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsCostByOrganizationAggregatedGetResponse4(BaseModel):
-    code: Code60
+    code: Code70
     message: str
 
 
-class Code61(StrEnum):
+class Code71(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsCostByOrganizationAggregatedGetResponse5(BaseModel):
-    code: Code61
+    code: Code71
     message: str
 
 
-class Code62(StrEnum):
+class Code72(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsCostByOrganizationAggregatedGetResponse6(BaseModel):
-    code: Code62
+    code: Code72
     detail: str
     instance: Optional[str] = None
     status: float
@@ -2355,6 +2811,12 @@ class ApiV2AnalyticsCostByProductGetParametersQuery(BaseModel):
 
 
 class Metric8(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -2419,28 +2881,28 @@ class ApiV2AnalyticsCostByProductGetResponse(BaseModel):
     page: Optional[Page2] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period5 = Field(..., description='The date range the response covers.')
+    period: Period7 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code63(StrEnum):
+class Code73(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsCostByProductGetResponse1(BaseModel):
-    code: Code63
+    code: Code73
     message: str
 
 
-class Code64(StrEnum):
+class Code74(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsCostByProductGetResponse2(BaseModel):
-    code: Code64
+    code: Code74
     detail: str
     instance: Optional[str] = None
     status: float
@@ -2448,40 +2910,40 @@ class ApiV2AnalyticsCostByProductGetResponse2(BaseModel):
     type: str
 
 
-class Code65(StrEnum):
+class Code75(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsCostByProductGetResponse3(BaseModel):
-    code: Code65
+    code: Code75
     message: str
 
 
-class Code66(StrEnum):
+class Code76(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsCostByProductGetResponse4(BaseModel):
-    code: Code66
+    code: Code76
     message: str
 
 
-class Code67(StrEnum):
+class Code77(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsCostByProductGetResponse5(BaseModel):
-    code: Code67
+    code: Code77
     message: str
 
 
-class Code68(StrEnum):
+class Code78(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsCostByProductGetResponse6(BaseModel):
-    code: Code68
+    code: Code78
     detail: str
     instance: Optional[str] = None
     status: float
@@ -2522,6 +2984,12 @@ class ApiV2AnalyticsCostByProductAggregatedGetParametersQuery(BaseModel):
 
 
 class Metric9(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -2574,28 +3042,28 @@ class ApiV2AnalyticsCostByProductAggregatedGetResponse(BaseModel):
     page: Optional[Page2] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period5 = Field(..., description='The date range the response covers.')
+    period: Period7 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code69(StrEnum):
+class Code79(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsCostByProductAggregatedGetResponse1(BaseModel):
-    code: Code69
+    code: Code79
     message: str
 
 
-class Code70(StrEnum):
+class Code80(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsCostByProductAggregatedGetResponse2(BaseModel):
-    code: Code70
+    code: Code80
     detail: str
     instance: Optional[str] = None
     status: float
@@ -2603,40 +3071,40 @@ class ApiV2AnalyticsCostByProductAggregatedGetResponse2(BaseModel):
     type: str
 
 
-class Code71(StrEnum):
+class Code81(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsCostByProductAggregatedGetResponse3(BaseModel):
-    code: Code71
+    code: Code81
     message: str
 
 
-class Code72(StrEnum):
+class Code82(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsCostByProductAggregatedGetResponse4(BaseModel):
-    code: Code72
+    code: Code82
     message: str
 
 
-class Code73(StrEnum):
+class Code83(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsCostByProductAggregatedGetResponse5(BaseModel):
-    code: Code73
+    code: Code83
     message: str
 
 
-class Code74(StrEnum):
+class Code84(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsCostByProductAggregatedGetResponse6(BaseModel):
-    code: Code74
+    code: Code84
     detail: str
     instance: Optional[str] = None
     status: float
@@ -2678,6 +3146,12 @@ class ApiV2AnalyticsCostByProviderGetParametersQuery(BaseModel):
 
 
 class Metric10(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -2742,28 +3216,28 @@ class ApiV2AnalyticsCostByProviderGetResponse(BaseModel):
     page: Optional[Page2] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period5 = Field(..., description='The date range the response covers.')
+    period: Period7 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code75(StrEnum):
+class Code85(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsCostByProviderGetResponse1(BaseModel):
-    code: Code75
+    code: Code85
     message: str
 
 
-class Code76(StrEnum):
+class Code86(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsCostByProviderGetResponse2(BaseModel):
-    code: Code76
+    code: Code86
     detail: str
     instance: Optional[str] = None
     status: float
@@ -2771,40 +3245,40 @@ class ApiV2AnalyticsCostByProviderGetResponse2(BaseModel):
     type: str
 
 
-class Code77(StrEnum):
+class Code87(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsCostByProviderGetResponse3(BaseModel):
-    code: Code77
+    code: Code87
     message: str
 
 
-class Code78(StrEnum):
+class Code88(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsCostByProviderGetResponse4(BaseModel):
-    code: Code78
+    code: Code88
     message: str
 
 
-class Code79(StrEnum):
+class Code89(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsCostByProviderGetResponse5(BaseModel):
-    code: Code79
+    code: Code89
     message: str
 
 
-class Code80(StrEnum):
+class Code90(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsCostByProviderGetResponse6(BaseModel):
-    code: Code80
+    code: Code90
     detail: str
     instance: Optional[str] = None
     status: float
@@ -2841,6 +3315,12 @@ class ApiV2AnalyticsCostByProviderAggregatedGetParametersQuery(BaseModel):
 
 
 class Metric11(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -2893,28 +3373,28 @@ class ApiV2AnalyticsCostByProviderAggregatedGetResponse(BaseModel):
     page: Optional[Page2] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period5 = Field(..., description='The date range the response covers.')
+    period: Period7 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code81(StrEnum):
+class Code91(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsCostByProviderAggregatedGetResponse1(BaseModel):
-    code: Code81
+    code: Code91
     message: str
 
 
-class Code82(StrEnum):
+class Code92(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsCostByProviderAggregatedGetResponse2(BaseModel):
-    code: Code82
+    code: Code92
     detail: str
     instance: Optional[str] = None
     status: float
@@ -2922,40 +3402,40 @@ class ApiV2AnalyticsCostByProviderAggregatedGetResponse2(BaseModel):
     type: str
 
 
-class Code83(StrEnum):
+class Code93(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsCostByProviderAggregatedGetResponse3(BaseModel):
-    code: Code83
+    code: Code93
     message: str
 
 
-class Code84(StrEnum):
+class Code94(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsCostByProviderAggregatedGetResponse4(BaseModel):
-    code: Code84
+    code: Code94
     message: str
 
 
-class Code85(StrEnum):
+class Code95(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsCostByProviderAggregatedGetResponse5(BaseModel):
-    code: Code85
+    code: Code95
     message: str
 
 
-class Code86(StrEnum):
+class Code96(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsCostByProviderAggregatedGetResponse6(BaseModel):
-    code: Code86
+    code: Code96
     detail: str
     instance: Optional[str] = None
     status: float
@@ -2996,6 +3476,12 @@ class ApiV2AnalyticsCostByTaskGetParametersQuery(BaseModel):
 
 
 class Metric12(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -3060,28 +3546,28 @@ class ApiV2AnalyticsCostByTaskGetResponse(BaseModel):
     page: Optional[Page2] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period5 = Field(..., description='The date range the response covers.')
+    period: Period7 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code87(StrEnum):
+class Code97(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsCostByTaskGetResponse1(BaseModel):
-    code: Code87
+    code: Code97
     message: str
 
 
-class Code88(StrEnum):
+class Code98(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsCostByTaskGetResponse2(BaseModel):
-    code: Code88
+    code: Code98
     detail: str
     instance: Optional[str] = None
     status: float
@@ -3089,40 +3575,40 @@ class ApiV2AnalyticsCostByTaskGetResponse2(BaseModel):
     type: str
 
 
-class Code89(StrEnum):
+class Code99(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsCostByTaskGetResponse3(BaseModel):
-    code: Code89
+    code: Code99
     message: str
 
 
-class Code90(StrEnum):
+class Code100(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsCostByTaskGetResponse4(BaseModel):
-    code: Code90
+    code: Code100
     message: str
 
 
-class Code91(StrEnum):
+class Code101(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsCostByTaskGetResponse5(BaseModel):
-    code: Code91
+    code: Code101
     message: str
 
 
-class Code92(StrEnum):
+class Code102(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsCostByTaskGetResponse6(BaseModel):
-    code: Code92
+    code: Code102
     detail: str
     instance: Optional[str] = None
     status: float
@@ -3163,6 +3649,12 @@ class ApiV2AnalyticsCostByTaskAggregatedGetParametersQuery(BaseModel):
 
 
 class Metric13(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -3215,28 +3707,28 @@ class ApiV2AnalyticsCostByTaskAggregatedGetResponse(BaseModel):
     page: Optional[Page2] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period5 = Field(..., description='The date range the response covers.')
+    period: Period7 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code93(StrEnum):
+class Code103(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsCostByTaskAggregatedGetResponse1(BaseModel):
-    code: Code93
+    code: Code103
     message: str
 
 
-class Code94(StrEnum):
+class Code104(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsCostByTaskAggregatedGetResponse2(BaseModel):
-    code: Code94
+    code: Code104
     detail: str
     instance: Optional[str] = None
     status: float
@@ -3244,40 +3736,40 @@ class ApiV2AnalyticsCostByTaskAggregatedGetResponse2(BaseModel):
     type: str
 
 
-class Code95(StrEnum):
+class Code105(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsCostByTaskAggregatedGetResponse3(BaseModel):
-    code: Code95
+    code: Code105
     message: str
 
 
-class Code96(StrEnum):
+class Code106(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsCostByTaskAggregatedGetResponse4(BaseModel):
-    code: Code96
+    code: Code106
     message: str
 
 
-class Code97(StrEnum):
+class Code107(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsCostByTaskAggregatedGetResponse5(BaseModel):
-    code: Code97
+    code: Code107
     message: str
 
 
-class Code98(StrEnum):
+class Code108(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsCostByTaskAggregatedGetResponse6(BaseModel):
-    code: Code98
+    code: Code108
     detail: str
     instance: Optional[str] = None
     status: float
@@ -3314,6 +3806,12 @@ class ApiV2AnalyticsCostByTeamGetParametersQuery(BaseModel):
 
 
 class Metric14(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -3378,28 +3876,28 @@ class ApiV2AnalyticsCostByTeamGetResponse(BaseModel):
     page: Optional[Page2] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period5 = Field(..., description='The date range the response covers.')
+    period: Period7 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code99(StrEnum):
+class Code109(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsCostByTeamGetResponse1(BaseModel):
-    code: Code99
+    code: Code109
     message: str
 
 
-class Code100(StrEnum):
+class Code110(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsCostByTeamGetResponse2(BaseModel):
-    code: Code100
+    code: Code110
     detail: str
     instance: Optional[str] = None
     status: float
@@ -3407,40 +3905,40 @@ class ApiV2AnalyticsCostByTeamGetResponse2(BaseModel):
     type: str
 
 
-class Code101(StrEnum):
+class Code111(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsCostByTeamGetResponse3(BaseModel):
-    code: Code101
+    code: Code111
     message: str
 
 
-class Code102(StrEnum):
+class Code112(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsCostByTeamGetResponse4(BaseModel):
-    code: Code102
+    code: Code112
     message: str
 
 
-class Code103(StrEnum):
+class Code113(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsCostByTeamGetResponse5(BaseModel):
-    code: Code103
+    code: Code113
     message: str
 
 
-class Code104(StrEnum):
+class Code114(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsCostByTeamGetResponse6(BaseModel):
-    code: Code104
+    code: Code114
     detail: str
     instance: Optional[str] = None
     status: float
@@ -3497,6 +3995,12 @@ class ApiV2AnalyticsCostByToolGetParametersQuery(BaseModel):
 
 
 class Metric15(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -3558,28 +4062,28 @@ class ApiV2AnalyticsCostByToolGetResponse(BaseModel):
     page: Optional[Page2] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period5 = Field(..., description='The date range the response covers.')
+    period: Period7 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code105(StrEnum):
+class Code115(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsCostByToolGetResponse1(BaseModel):
-    code: Code105
+    code: Code115
     message: str
 
 
-class Code106(StrEnum):
+class Code116(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsCostByToolGetResponse2(BaseModel):
-    code: Code106
+    code: Code116
     detail: str
     instance: Optional[str] = None
     status: float
@@ -3587,40 +4091,40 @@ class ApiV2AnalyticsCostByToolGetResponse2(BaseModel):
     type: str
 
 
-class Code107(StrEnum):
+class Code117(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsCostByToolGetResponse3(BaseModel):
-    code: Code107
+    code: Code117
     message: str
 
 
-class Code108(StrEnum):
+class Code118(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsCostByToolGetResponse4(BaseModel):
-    code: Code108
+    code: Code118
     message: str
 
 
-class Code109(StrEnum):
+class Code119(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsCostByToolGetResponse5(BaseModel):
-    code: Code109
+    code: Code119
     message: str
 
 
-class Code110(StrEnum):
+class Code120(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsCostByToolGetResponse6(BaseModel):
-    code: Code110
+    code: Code120
     detail: str
     instance: Optional[str] = None
     status: float
@@ -3656,6 +4160,12 @@ class ApiV2AnalyticsCostByToolAgentGetParametersQuery(BaseModel):
 
 
 class Metric16(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -3705,28 +4215,28 @@ class ApiV2AnalyticsCostByToolAgentGetResponse(BaseModel):
     page: Optional[Page2] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period5 = Field(..., description='The date range the response covers.')
+    period: Period7 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code111(StrEnum):
+class Code121(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsCostByToolAgentGetResponse1(BaseModel):
-    code: Code111
+    code: Code121
     message: str
 
 
-class Code112(StrEnum):
+class Code122(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsCostByToolAgentGetResponse2(BaseModel):
-    code: Code112
+    code: Code122
     detail: str
     instance: Optional[str] = None
     status: float
@@ -3734,40 +4244,40 @@ class ApiV2AnalyticsCostByToolAgentGetResponse2(BaseModel):
     type: str
 
 
-class Code113(StrEnum):
+class Code123(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsCostByToolAgentGetResponse3(BaseModel):
-    code: Code113
+    code: Code123
     message: str
 
 
-class Code114(StrEnum):
+class Code124(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsCostByToolAgentGetResponse4(BaseModel):
-    code: Code114
+    code: Code124
     message: str
 
 
-class Code115(StrEnum):
+class Code125(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsCostByToolAgentGetResponse5(BaseModel):
-    code: Code115
+    code: Code125
     message: str
 
 
-class Code116(StrEnum):
+class Code126(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsCostByToolAgentGetResponse6(BaseModel):
-    code: Code116
+    code: Code126
     detail: str
     instance: Optional[str] = None
     status: float
@@ -3803,6 +4313,12 @@ class ApiV2AnalyticsCostByToolAggregatedGetParametersQuery(BaseModel):
 
 
 class Metric17(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -3852,28 +4368,28 @@ class ApiV2AnalyticsCostByToolAggregatedGetResponse(BaseModel):
     page: Optional[Page2] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period5 = Field(..., description='The date range the response covers.')
+    period: Period7 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code117(StrEnum):
+class Code127(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsCostByToolAggregatedGetResponse1(BaseModel):
-    code: Code117
+    code: Code127
     message: str
 
 
-class Code118(StrEnum):
+class Code128(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsCostByToolAggregatedGetResponse2(BaseModel):
-    code: Code118
+    code: Code128
     detail: str
     instance: Optional[str] = None
     status: float
@@ -3881,40 +4397,40 @@ class ApiV2AnalyticsCostByToolAggregatedGetResponse2(BaseModel):
     type: str
 
 
-class Code119(StrEnum):
+class Code129(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsCostByToolAggregatedGetResponse3(BaseModel):
-    code: Code119
+    code: Code129
     message: str
 
 
-class Code120(StrEnum):
+class Code130(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsCostByToolAggregatedGetResponse4(BaseModel):
-    code: Code120
+    code: Code130
     message: str
 
 
-class Code121(StrEnum):
+class Code131(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsCostByToolAggregatedGetResponse5(BaseModel):
-    code: Code121
+    code: Code131
     message: str
 
 
-class Code122(StrEnum):
+class Code132(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsCostByToolAggregatedGetResponse6(BaseModel):
-    code: Code122
+    code: Code132
     detail: str
     instance: Optional[str] = None
     status: float
@@ -3954,6 +4470,12 @@ class ApiV2AnalyticsCostByToolProviderGetParametersQuery(BaseModel):
 
 
 class Metric18(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -4015,28 +4537,28 @@ class ApiV2AnalyticsCostByToolProviderGetResponse(BaseModel):
     page: Optional[Page2] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period5 = Field(..., description='The date range the response covers.')
+    period: Period7 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code123(StrEnum):
+class Code133(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsCostByToolProviderGetResponse1(BaseModel):
-    code: Code123
+    code: Code133
     message: str
 
 
-class Code124(StrEnum):
+class Code134(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsCostByToolProviderGetResponse2(BaseModel):
-    code: Code124
+    code: Code134
     detail: str
     instance: Optional[str] = None
     status: float
@@ -4044,40 +4566,40 @@ class ApiV2AnalyticsCostByToolProviderGetResponse2(BaseModel):
     type: str
 
 
-class Code125(StrEnum):
+class Code135(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsCostByToolProviderGetResponse3(BaseModel):
-    code: Code125
+    code: Code135
     message: str
 
 
-class Code126(StrEnum):
+class Code136(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsCostByToolProviderGetResponse4(BaseModel):
-    code: Code126
+    code: Code136
     message: str
 
 
-class Code127(StrEnum):
+class Code137(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsCostByToolProviderGetResponse5(BaseModel):
-    code: Code127
+    code: Code137
     message: str
 
 
-class Code128(StrEnum):
+class Code138(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsCostByToolProviderGetResponse6(BaseModel):
-    code: Code128
+    code: Code138
     detail: str
     instance: Optional[str] = None
     status: float
@@ -4113,6 +4635,12 @@ class ApiV2AnalyticsCostByToolProviderAggregatedGetParametersQuery(BaseModel):
 
 
 class Metric19(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -4162,28 +4690,28 @@ class ApiV2AnalyticsCostByToolProviderAggregatedGetResponse(BaseModel):
     page: Optional[Page2] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period5 = Field(..., description='The date range the response covers.')
+    period: Period7 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code129(StrEnum):
+class Code139(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsCostByToolProviderAggregatedGetResponse1(BaseModel):
-    code: Code129
+    code: Code139
     message: str
 
 
-class Code130(StrEnum):
+class Code140(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsCostByToolProviderAggregatedGetResponse2(BaseModel):
-    code: Code130
+    code: Code140
     detail: str
     instance: Optional[str] = None
     status: float
@@ -4191,40 +4719,40 @@ class ApiV2AnalyticsCostByToolProviderAggregatedGetResponse2(BaseModel):
     type: str
 
 
-class Code131(StrEnum):
+class Code141(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsCostByToolProviderAggregatedGetResponse3(BaseModel):
-    code: Code131
+    code: Code141
     message: str
 
 
-class Code132(StrEnum):
+class Code142(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsCostByToolProviderAggregatedGetResponse4(BaseModel):
-    code: Code132
+    code: Code142
     message: str
 
 
-class Code133(StrEnum):
+class Code143(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsCostByToolProviderAggregatedGetResponse5(BaseModel):
-    code: Code133
+    code: Code143
     message: str
 
 
-class Code134(StrEnum):
+class Code144(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsCostByToolProviderAggregatedGetResponse6(BaseModel):
-    code: Code134
+    code: Code144
     detail: str
     instance: Optional[str] = None
     status: float
@@ -4284,6 +4812,12 @@ class ApiV2AnalyticsCostByUserAggregatedGetParametersQuery(BaseModel):
 
 
 class Metric20(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -4354,28 +4888,28 @@ class ApiV2AnalyticsCostByUserAggregatedGetResponse(BaseModel):
     page: Optional[Page2] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period5 = Field(..., description='The date range the response covers.')
+    period: Period7 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code135(StrEnum):
+class Code145(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsCostByUserAggregatedGetResponse1(BaseModel):
-    code: Code135
+    code: Code145
     message: str
 
 
-class Code136(StrEnum):
+class Code146(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsCostByUserAggregatedGetResponse2(BaseModel):
-    code: Code136
+    code: Code146
     detail: str
     instance: Optional[str] = None
     status: float
@@ -4383,40 +4917,40 @@ class ApiV2AnalyticsCostByUserAggregatedGetResponse2(BaseModel):
     type: str
 
 
-class Code137(StrEnum):
+class Code147(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsCostByUserAggregatedGetResponse3(BaseModel):
-    code: Code137
+    code: Code147
     message: str
 
 
-class Code138(StrEnum):
+class Code148(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsCostByUserAggregatedGetResponse4(BaseModel):
-    code: Code138
+    code: Code148
     message: str
 
 
-class Code139(StrEnum):
+class Code149(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsCostByUserAggregatedGetResponse5(BaseModel):
-    code: Code139
+    code: Code149
     message: str
 
 
-class Code140(StrEnum):
+class Code150(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsCostByUserAggregatedGetResponse6(BaseModel):
-    code: Code140
+    code: Code150
     detail: str
     instance: Optional[str] = None
     status: float
@@ -4470,6 +5004,12 @@ class ApiV2AnalyticsCostByVendorGetParametersQuery(BaseModel):
 
 
 class Metric21(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -4522,28 +5062,28 @@ class ApiV2AnalyticsCostByVendorGetResponse(BaseModel):
     page: Optional[Page2] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period5 = Field(..., description='The date range the response covers.')
+    period: Period7 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code141(StrEnum):
+class Code151(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsCostByVendorGetResponse1(BaseModel):
-    code: Code141
+    code: Code151
     message: str
 
 
-class Code142(StrEnum):
+class Code152(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsCostByVendorGetResponse2(BaseModel):
-    code: Code142
+    code: Code152
     detail: str
     instance: Optional[str] = None
     status: float
@@ -4551,40 +5091,40 @@ class ApiV2AnalyticsCostByVendorGetResponse2(BaseModel):
     type: str
 
 
-class Code143(StrEnum):
+class Code153(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsCostByVendorGetResponse3(BaseModel):
-    code: Code143
+    code: Code153
     message: str
 
 
-class Code144(StrEnum):
+class Code154(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsCostByVendorGetResponse4(BaseModel):
-    code: Code144
+    code: Code154
     message: str
 
 
-class Code145(StrEnum):
+class Code155(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsCostByVendorGetResponse5(BaseModel):
-    code: Code145
+    code: Code155
     message: str
 
 
-class Code146(StrEnum):
+class Code156(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsCostByVendorGetResponse6(BaseModel):
-    code: Code146
+    code: Code156
     detail: str
     instance: Optional[str] = None
     status: float
@@ -4658,28 +5198,28 @@ class ApiV2AnalyticsFilterOptionsToolsGetResponse(BaseModel):
     page: Optional[Page2] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period5 = Field(..., description='The date range the response covers.')
+    period: Period7 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code147(StrEnum):
+class Code157(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsFilterOptionsToolsGetResponse1(BaseModel):
-    code: Code147
+    code: Code157
     message: str
 
 
-class Code148(StrEnum):
+class Code158(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsFilterOptionsToolsGetResponse2(BaseModel):
-    code: Code148
+    code: Code158
     detail: str
     instance: Optional[str] = None
     status: float
@@ -4687,40 +5227,40 @@ class ApiV2AnalyticsFilterOptionsToolsGetResponse2(BaseModel):
     type: str
 
 
-class Code149(StrEnum):
+class Code159(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsFilterOptionsToolsGetResponse3(BaseModel):
-    code: Code149
+    code: Code159
     message: str
 
 
-class Code150(StrEnum):
+class Code160(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsFilterOptionsToolsGetResponse4(BaseModel):
-    code: Code150
+    code: Code160
     message: str
 
 
-class Code151(StrEnum):
+class Code161(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsFilterOptionsToolsGetResponse5(BaseModel):
-    code: Code151
+    code: Code161
     message: str
 
 
-class Code152(StrEnum):
+class Code162(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsFilterOptionsToolsGetResponse6(BaseModel):
-    code: Code152
+    code: Code162
     detail: str
     instance: Optional[str] = None
     status: float
@@ -4828,7 +5368,7 @@ class ByJobTypeItem(BaseModel):
     )
 
 
-class Period28(BaseModel):
+class Period29(BaseModel):
     """
     The date range the response covers.
     """
@@ -4865,26 +5405,26 @@ class ApiV2AnalyticsJobsRoiSummaryGetResponse(BaseModel):
         ..., description='Identifier of the response type, the same on every call.'
     )
     label: str = Field(..., description='Human-readable name of the figure returned.')
-    period: Period28 = Field(..., description='The date range the response covers.')
+    period: Period29 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(..., description='Kind of response.')
     summary: Summary = Field(..., description='Totals across all job types.')
 
 
-class Code153(StrEnum):
+class Code163(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsJobsRoiSummaryGetResponse1(BaseModel):
-    code: Code153
+    code: Code163
     message: str
 
 
-class Code154(StrEnum):
+class Code164(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsJobsRoiSummaryGetResponse2(BaseModel):
-    code: Code154
+    code: Code164
     detail: str
     instance: Optional[str] = None
     status: float
@@ -4892,40 +5432,40 @@ class ApiV2AnalyticsJobsRoiSummaryGetResponse2(BaseModel):
     type: str
 
 
-class Code155(StrEnum):
+class Code165(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsJobsRoiSummaryGetResponse3(BaseModel):
-    code: Code155
+    code: Code165
     message: str
 
 
-class Code156(StrEnum):
+class Code166(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsJobsRoiSummaryGetResponse4(BaseModel):
-    code: Code156
+    code: Code166
     message: str
 
 
-class Code157(StrEnum):
+class Code167(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsJobsRoiSummaryGetResponse5(BaseModel):
-    code: Code157
+    code: Code167
     message: str
 
 
-class Code158(StrEnum):
+class Code168(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsJobsRoiSummaryGetResponse6(BaseModel):
-    code: Code158
+    code: Code168
     detail: str
     instance: Optional[str] = None
     status: float
@@ -4961,6 +5501,12 @@ class ApiV2AnalyticsProfitMarginPerCustomerGetParametersQuery(BaseModel):
 
 
 class Metric22(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -5000,7 +5546,7 @@ class FieldLinks25(BaseModel):
     href: str = Field(..., description='URL of the related request.')
 
 
-class Period29(BaseModel):
+class Period30(BaseModel):
     """
     The date range the response covers.
     """
@@ -5030,28 +5576,28 @@ class ApiV2AnalyticsProfitMarginPerCustomerGetResponse(BaseModel):
     page: Optional[Page2] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period29 = Field(..., description='The date range the response covers.')
+    period: Period30 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code159(StrEnum):
+class Code169(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsProfitMarginPerCustomerGetResponse1(BaseModel):
-    code: Code159
+    code: Code169
     message: str
 
 
-class Code160(StrEnum):
+class Code170(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsProfitMarginPerCustomerGetResponse2(BaseModel):
-    code: Code160
+    code: Code170
     detail: str
     instance: Optional[str] = None
     status: float
@@ -5059,40 +5605,40 @@ class ApiV2AnalyticsProfitMarginPerCustomerGetResponse2(BaseModel):
     type: str
 
 
-class Code161(StrEnum):
+class Code171(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsProfitMarginPerCustomerGetResponse3(BaseModel):
-    code: Code161
+    code: Code171
     message: str
 
 
-class Code162(StrEnum):
+class Code172(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsProfitMarginPerCustomerGetResponse4(BaseModel):
-    code: Code162
+    code: Code172
     message: str
 
 
-class Code163(StrEnum):
+class Code173(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsProfitMarginPerCustomerGetResponse5(BaseModel):
-    code: Code163
+    code: Code173
     message: str
 
 
-class Code164(StrEnum):
+class Code174(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsProfitMarginPerCustomerGetResponse6(BaseModel):
-    code: Code164
+    code: Code174
     detail: str
     instance: Optional[str] = None
     status: float
@@ -5128,6 +5674,12 @@ class ApiV2AnalyticsProfitMarginPerProductGetParametersQuery(BaseModel):
 
 
 class Metric23(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -5180,28 +5732,28 @@ class ApiV2AnalyticsProfitMarginPerProductGetResponse(BaseModel):
     page: Optional[Page2] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period29 = Field(..., description='The date range the response covers.')
+    period: Period30 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code165(StrEnum):
+class Code175(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsProfitMarginPerProductGetResponse1(BaseModel):
-    code: Code165
+    code: Code175
     message: str
 
 
-class Code166(StrEnum):
+class Code176(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsProfitMarginPerProductGetResponse2(BaseModel):
-    code: Code166
+    code: Code176
     detail: str
     instance: Optional[str] = None
     status: float
@@ -5209,40 +5761,40 @@ class ApiV2AnalyticsProfitMarginPerProductGetResponse2(BaseModel):
     type: str
 
 
-class Code167(StrEnum):
+class Code177(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsProfitMarginPerProductGetResponse3(BaseModel):
-    code: Code167
+    code: Code177
     message: str
 
 
-class Code168(StrEnum):
+class Code178(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsProfitMarginPerProductGetResponse4(BaseModel):
-    code: Code168
+    code: Code178
     message: str
 
 
-class Code169(StrEnum):
+class Code179(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsProfitMarginPerProductGetResponse5(BaseModel):
-    code: Code169
+    code: Code179
     message: str
 
 
-class Code170(StrEnum):
+class Code180(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsProfitMarginPerProductGetResponse6(BaseModel):
-    code: Code170
+    code: Code180
     detail: str
     instance: Optional[str] = None
     status: float
@@ -5296,6 +5848,12 @@ class ApiV2AnalyticsResponseTimeByModelGetParametersQuery(BaseModel):
 
 
 class Metric24(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -5348,28 +5906,28 @@ class ApiV2AnalyticsResponseTimeByModelGetResponse(BaseModel):
     page: Optional[Page2] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period29 = Field(..., description='The date range the response covers.')
+    period: Period30 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code171(StrEnum):
+class Code181(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsResponseTimeByModelGetResponse1(BaseModel):
-    code: Code171
+    code: Code181
     message: str
 
 
-class Code172(StrEnum):
+class Code182(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsResponseTimeByModelGetResponse2(BaseModel):
-    code: Code172
+    code: Code182
     detail: str
     instance: Optional[str] = None
     status: float
@@ -5377,40 +5935,40 @@ class ApiV2AnalyticsResponseTimeByModelGetResponse2(BaseModel):
     type: str
 
 
-class Code173(StrEnum):
+class Code183(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsResponseTimeByModelGetResponse3(BaseModel):
-    code: Code173
+    code: Code183
     message: str
 
 
-class Code174(StrEnum):
+class Code184(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsResponseTimeByModelGetResponse4(BaseModel):
-    code: Code174
+    code: Code184
     message: str
 
 
-class Code175(StrEnum):
+class Code185(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsResponseTimeByModelGetResponse5(BaseModel):
-    code: Code175
+    code: Code185
     message: str
 
 
-class Code176(StrEnum):
+class Code186(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsResponseTimeByModelGetResponse6(BaseModel):
-    code: Code176
+    code: Code186
     detail: str
     instance: Optional[str] = None
     status: float
@@ -5447,6 +6005,12 @@ class ApiV2AnalyticsResponseTimeByVendorGetParametersQuery(BaseModel):
 
 
 class Metric25(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -5499,28 +6063,28 @@ class ApiV2AnalyticsResponseTimeByVendorGetResponse(BaseModel):
     page: Optional[Page2] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period29 = Field(..., description='The date range the response covers.')
+    period: Period30 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code177(StrEnum):
+class Code187(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsResponseTimeByVendorGetResponse1(BaseModel):
-    code: Code177
+    code: Code187
     message: str
 
 
-class Code178(StrEnum):
+class Code188(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsResponseTimeByVendorGetResponse2(BaseModel):
-    code: Code178
+    code: Code188
     detail: str
     instance: Optional[str] = None
     status: float
@@ -5528,40 +6092,40 @@ class ApiV2AnalyticsResponseTimeByVendorGetResponse2(BaseModel):
     type: str
 
 
-class Code179(StrEnum):
+class Code189(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsResponseTimeByVendorGetResponse3(BaseModel):
-    code: Code179
+    code: Code189
     message: str
 
 
-class Code180(StrEnum):
+class Code190(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsResponseTimeByVendorGetResponse4(BaseModel):
-    code: Code180
+    code: Code190
     message: str
 
 
-class Code181(StrEnum):
+class Code191(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsResponseTimeByVendorGetResponse5(BaseModel):
-    code: Code181
+    code: Code191
     message: str
 
 
-class Code182(StrEnum):
+class Code192(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsResponseTimeByVendorGetResponse6(BaseModel):
-    code: Code182
+    code: Code192
     detail: str
     instance: Optional[str] = None
     status: float
@@ -5615,6 +6179,12 @@ class ApiV2AnalyticsRevenuePerCustomerGetParametersQuery(BaseModel):
 
 
 class Metric26(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -5666,28 +6236,28 @@ class ApiV2AnalyticsRevenuePerCustomerGetResponse(BaseModel):
     page: Optional[Page2] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period29 = Field(..., description='The date range the response covers.')
+    period: Period30 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code183(StrEnum):
+class Code193(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsRevenuePerCustomerGetResponse1(BaseModel):
-    code: Code183
+    code: Code193
     message: str
 
 
-class Code184(StrEnum):
+class Code194(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsRevenuePerCustomerGetResponse2(BaseModel):
-    code: Code184
+    code: Code194
     detail: str
     instance: Optional[str] = None
     status: float
@@ -5695,40 +6265,40 @@ class ApiV2AnalyticsRevenuePerCustomerGetResponse2(BaseModel):
     type: str
 
 
-class Code185(StrEnum):
+class Code195(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsRevenuePerCustomerGetResponse3(BaseModel):
-    code: Code185
+    code: Code195
     message: str
 
 
-class Code186(StrEnum):
+class Code196(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsRevenuePerCustomerGetResponse4(BaseModel):
-    code: Code186
+    code: Code196
     message: str
 
 
-class Code187(StrEnum):
+class Code197(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsRevenuePerCustomerGetResponse5(BaseModel):
-    code: Code187
+    code: Code197
     message: str
 
 
-class Code188(StrEnum):
+class Code198(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsRevenuePerCustomerGetResponse6(BaseModel):
-    code: Code188
+    code: Code198
     detail: str
     instance: Optional[str] = None
     status: float
@@ -5765,6 +6335,12 @@ class ApiV2AnalyticsRevenuePerProductGetParametersQuery(BaseModel):
 
 
 class Metric27(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -5816,28 +6392,28 @@ class ApiV2AnalyticsRevenuePerProductGetResponse(BaseModel):
     page: Optional[Page2] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period29 = Field(..., description='The date range the response covers.')
+    period: Period30 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code189(StrEnum):
+class Code199(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsRevenuePerProductGetResponse1(BaseModel):
-    code: Code189
+    code: Code199
     message: str
 
 
-class Code190(StrEnum):
+class Code200(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsRevenuePerProductGetResponse2(BaseModel):
-    code: Code190
+    code: Code200
     detail: str
     instance: Optional[str] = None
     status: float
@@ -5845,40 +6421,40 @@ class ApiV2AnalyticsRevenuePerProductGetResponse2(BaseModel):
     type: str
 
 
-class Code191(StrEnum):
+class Code201(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsRevenuePerProductGetResponse3(BaseModel):
-    code: Code191
+    code: Code201
     message: str
 
 
-class Code192(StrEnum):
+class Code202(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsRevenuePerProductGetResponse4(BaseModel):
-    code: Code192
+    code: Code202
     message: str
 
 
-class Code193(StrEnum):
+class Code203(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsRevenuePerProductGetResponse5(BaseModel):
-    code: Code193
+    code: Code203
     message: str
 
 
-class Code194(StrEnum):
+class Code204(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsRevenuePerProductGetResponse6(BaseModel):
-    code: Code194
+    code: Code204
     detail: str
     instance: Optional[str] = None
     status: float
@@ -5935,6 +6511,12 @@ class ApiV2AnalyticsTaskCompletionGetParametersQuery(BaseModel):
 
 
 class Metric28(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -5998,28 +6580,28 @@ class ApiV2AnalyticsTaskCompletionGetResponse(BaseModel):
     page: Optional[Page2] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period29 = Field(..., description='The date range the response covers.')
+    period: Period30 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code195(StrEnum):
+class Code205(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsTaskCompletionGetResponse1(BaseModel):
-    code: Code195
+    code: Code205
     message: str
 
 
-class Code196(StrEnum):
+class Code206(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsTaskCompletionGetResponse2(BaseModel):
-    code: Code196
+    code: Code206
     detail: str
     instance: Optional[str] = None
     status: float
@@ -6027,40 +6609,40 @@ class ApiV2AnalyticsTaskCompletionGetResponse2(BaseModel):
     type: str
 
 
-class Code197(StrEnum):
+class Code207(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsTaskCompletionGetResponse3(BaseModel):
-    code: Code197
+    code: Code207
     message: str
 
 
-class Code198(StrEnum):
+class Code208(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsTaskCompletionGetResponse4(BaseModel):
-    code: Code198
+    code: Code208
     message: str
 
 
-class Code199(StrEnum):
+class Code209(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsTaskCompletionGetResponse5(BaseModel):
-    code: Code199
+    code: Code209
     message: str
 
 
-class Code200(StrEnum):
+class Code210(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsTaskCompletionGetResponse6(BaseModel):
-    code: Code200
+    code: Code210
     detail: str
     instance: Optional[str] = None
     status: float
@@ -6100,6 +6682,12 @@ class ApiV2AnalyticsTaskCompletionAggregatedGetParametersQuery(BaseModel):
 
 
 class Metric29(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -6149,28 +6737,28 @@ class ApiV2AnalyticsTaskCompletionAggregatedGetResponse(BaseModel):
     page: Optional[Page2] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period29 = Field(..., description='The date range the response covers.')
+    period: Period30 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code201(StrEnum):
+class Code211(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsTaskCompletionAggregatedGetResponse1(BaseModel):
-    code: Code201
+    code: Code211
     message: str
 
 
-class Code202(StrEnum):
+class Code212(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsTaskCompletionAggregatedGetResponse2(BaseModel):
-    code: Code202
+    code: Code212
     detail: str
     instance: Optional[str] = None
     status: float
@@ -6178,40 +6766,40 @@ class ApiV2AnalyticsTaskCompletionAggregatedGetResponse2(BaseModel):
     type: str
 
 
-class Code203(StrEnum):
+class Code213(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsTaskCompletionAggregatedGetResponse3(BaseModel):
-    code: Code203
+    code: Code213
     message: str
 
 
-class Code204(StrEnum):
+class Code214(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsTaskCompletionAggregatedGetResponse4(BaseModel):
-    code: Code204
+    code: Code214
     message: str
 
 
-class Code205(StrEnum):
+class Code215(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsTaskCompletionAggregatedGetResponse5(BaseModel):
-    code: Code205
+    code: Code215
     message: str
 
 
-class Code206(StrEnum):
+class Code216(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsTaskCompletionAggregatedGetResponse6(BaseModel):
-    code: Code206
+    code: Code216
     detail: str
     instance: Optional[str] = None
     status: float
@@ -6265,6 +6853,12 @@ class ApiV2AnalyticsTaskPerformanceByAgentGetParametersQuery(BaseModel):
 
 
 class Metric30(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -6317,28 +6911,28 @@ class ApiV2AnalyticsTaskPerformanceByAgentGetResponse(BaseModel):
     page: Optional[Page2] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period29 = Field(..., description='The date range the response covers.')
+    period: Period30 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code207(StrEnum):
+class Code217(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsTaskPerformanceByAgentGetResponse1(BaseModel):
-    code: Code207
+    code: Code217
     message: str
 
 
-class Code208(StrEnum):
+class Code218(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsTaskPerformanceByAgentGetResponse2(BaseModel):
-    code: Code208
+    code: Code218
     detail: str
     instance: Optional[str] = None
     status: float
@@ -6346,40 +6940,40 @@ class ApiV2AnalyticsTaskPerformanceByAgentGetResponse2(BaseModel):
     type: str
 
 
-class Code209(StrEnum):
+class Code219(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsTaskPerformanceByAgentGetResponse3(BaseModel):
-    code: Code209
+    code: Code219
     message: str
 
 
-class Code210(StrEnum):
+class Code220(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsTaskPerformanceByAgentGetResponse4(BaseModel):
-    code: Code210
+    code: Code220
     message: str
 
 
-class Code211(StrEnum):
+class Code221(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsTaskPerformanceByAgentGetResponse5(BaseModel):
-    code: Code211
+    code: Code221
     message: str
 
 
-class Code212(StrEnum):
+class Code222(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsTaskPerformanceByAgentGetResponse6(BaseModel):
-    code: Code212
+    code: Code222
     detail: str
     instance: Optional[str] = None
     status: float
@@ -6432,6 +7026,12 @@ class ApiV2AnalyticsTasksCompletedByAgentGetParametersQuery(BaseModel):
 
 
 class Metric31(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -6483,28 +7083,28 @@ class ApiV2AnalyticsTasksCompletedByAgentGetResponse(BaseModel):
     page: Optional[Page2] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period29 = Field(..., description='The date range the response covers.')
+    period: Period30 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code213(StrEnum):
+class Code223(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsTasksCompletedByAgentGetResponse1(BaseModel):
-    code: Code213
+    code: Code223
     message: str
 
 
-class Code214(StrEnum):
+class Code224(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsTasksCompletedByAgentGetResponse2(BaseModel):
-    code: Code214
+    code: Code224
     detail: str
     instance: Optional[str] = None
     status: float
@@ -6512,40 +7112,40 @@ class ApiV2AnalyticsTasksCompletedByAgentGetResponse2(BaseModel):
     type: str
 
 
-class Code215(StrEnum):
+class Code225(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsTasksCompletedByAgentGetResponse3(BaseModel):
-    code: Code215
+    code: Code225
     message: str
 
 
-class Code216(StrEnum):
+class Code226(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsTasksCompletedByAgentGetResponse4(BaseModel):
-    code: Code216
+    code: Code226
     message: str
 
 
-class Code217(StrEnum):
+class Code227(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsTasksCompletedByAgentGetResponse5(BaseModel):
-    code: Code217
+    code: Code227
     message: str
 
 
-class Code218(StrEnum):
+class Code228(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsTasksCompletedByAgentGetResponse6(BaseModel):
-    code: Code218
+    code: Code228
     detail: str
     instance: Optional[str] = None
     status: float
@@ -6554,11 +7154,11 @@ class ApiV2AnalyticsTasksCompletedByAgentGetResponse6(BaseModel):
 
 
 class ApiV2AnalyticsTokenBreakdownByTypeGetParametersQuery(BaseModel):
-    startDate: Optional[str] = Field(
+    startDate: Optional[AwareDatetime] = Field(
         None,
         description='Start of the date range, ISO 8601 in UTC, for example 2026-01-01T00:00:00Z. Defaults to 24 hours before endDate.',
     )
-    endDate: Optional[str] = Field(
+    endDate: Optional[AwareDatetime] = Field(
         None, description='End of the date range, ISO 8601 in UTC. Defaults to now.'
     )
     providers: Optional[list[str]] = Field(
@@ -6584,6 +7184,12 @@ class ApiV2AnalyticsTokenBreakdownByTypeGetParametersQuery(BaseModel):
 
 
 class Metric32(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -6645,28 +7251,28 @@ class ApiV2AnalyticsTokenBreakdownByTypeGetResponse(BaseModel):
     page: Optional[Page2] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period29 = Field(..., description='The date range the response covers.')
+    period: Period30 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code219(StrEnum):
+class Code229(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsTokenBreakdownByTypeGetResponse1(BaseModel):
-    code: Code219
+    code: Code229
     message: str
 
 
-class Code220(StrEnum):
+class Code230(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsTokenBreakdownByTypeGetResponse2(BaseModel):
-    code: Code220
+    code: Code230
     detail: str
     instance: Optional[str] = None
     status: float
@@ -6674,40 +7280,40 @@ class ApiV2AnalyticsTokenBreakdownByTypeGetResponse2(BaseModel):
     type: str
 
 
-class Code221(StrEnum):
+class Code231(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsTokenBreakdownByTypeGetResponse3(BaseModel):
-    code: Code221
+    code: Code231
     message: str
 
 
-class Code222(StrEnum):
+class Code232(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsTokenBreakdownByTypeGetResponse4(BaseModel):
-    code: Code222
+    code: Code232
     message: str
 
 
-class Code223(StrEnum):
+class Code233(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsTokenBreakdownByTypeGetResponse5(BaseModel):
-    code: Code223
+    code: Code233
     message: str
 
 
-class Code224(StrEnum):
+class Code234(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsTokenBreakdownByTypeGetResponse6(BaseModel):
-    code: Code224
+    code: Code234
     detail: str
     instance: Optional[str] = None
     status: float
@@ -6743,6 +7349,12 @@ class ApiV2AnalyticsTokenVsToolCostGetParametersQuery(BaseModel):
 
 
 class Metric33(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -6807,28 +7419,28 @@ class ApiV2AnalyticsTokenVsToolCostGetResponse(BaseModel):
     page: Optional[Page2] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period29 = Field(..., description='The date range the response covers.')
+    period: Period30 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code225(StrEnum):
+class Code235(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsTokenVsToolCostGetResponse1(BaseModel):
-    code: Code225
+    code: Code235
     message: str
 
 
-class Code226(StrEnum):
+class Code236(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsTokenVsToolCostGetResponse2(BaseModel):
-    code: Code226
+    code: Code236
     detail: str
     instance: Optional[str] = None
     status: float
@@ -6836,40 +7448,40 @@ class ApiV2AnalyticsTokenVsToolCostGetResponse2(BaseModel):
     type: str
 
 
-class Code227(StrEnum):
+class Code237(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsTokenVsToolCostGetResponse3(BaseModel):
-    code: Code227
+    code: Code237
     message: str
 
 
-class Code228(StrEnum):
+class Code238(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsTokenVsToolCostGetResponse4(BaseModel):
-    code: Code228
+    code: Code238
     message: str
 
 
-class Code229(StrEnum):
+class Code239(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsTokenVsToolCostGetResponse5(BaseModel):
-    code: Code229
+    code: Code239
     message: str
 
 
-class Code230(StrEnum):
+class Code240(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsTokenVsToolCostGetResponse6(BaseModel):
-    code: Code230
+    code: Code240
     detail: str
     instance: Optional[str] = None
     status: float
@@ -6890,11 +7502,11 @@ class TokenType(StrEnum):
 
 
 class ApiV2AnalyticsTokensPerMinuteGetParametersQuery(BaseModel):
-    startDate: Optional[str] = Field(
+    startDate: Optional[AwareDatetime] = Field(
         None,
         description='Start of the date range, ISO 8601 in UTC, for example 2026-01-01T00:00:00Z. Defaults to 24 hours before endDate.',
     )
-    endDate: Optional[str] = Field(
+    endDate: Optional[AwareDatetime] = Field(
         None, description='End of the date range, ISO 8601 in UTC. Defaults to now.'
     )
     providers: Optional[list[str]] = Field(
@@ -6919,6 +7531,12 @@ class ApiV2AnalyticsTokensPerMinuteGetParametersQuery(BaseModel):
 
 
 class Metric34(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -6983,28 +7601,28 @@ class ApiV2AnalyticsTokensPerMinuteGetResponse(BaseModel):
     page: Optional[Page2] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period29 = Field(..., description='The date range the response covers.')
+    period: Period30 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code231(StrEnum):
+class Code241(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsTokensPerMinuteGetResponse1(BaseModel):
-    code: Code231
+    code: Code241
     message: str
 
 
-class Code232(StrEnum):
+class Code242(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsTokensPerMinuteGetResponse2(BaseModel):
-    code: Code232
+    code: Code242
     detail: str
     instance: Optional[str] = None
     status: float
@@ -7012,40 +7630,199 @@ class ApiV2AnalyticsTokensPerMinuteGetResponse2(BaseModel):
     type: str
 
 
-class Code233(StrEnum):
+class Code243(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsTokensPerMinuteGetResponse3(BaseModel):
-    code: Code233
+    code: Code243
     message: str
 
 
-class Code234(StrEnum):
+class Code244(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsTokensPerMinuteGetResponse4(BaseModel):
-    code: Code234
+    code: Code244
     message: str
 
 
-class Code235(StrEnum):
+class Code245(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsTokensPerMinuteGetResponse5(BaseModel):
-    code: Code235
+    code: Code245
     message: str
 
 
-class Code236(StrEnum):
+class Code246(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsTokensPerMinuteGetResponse6(BaseModel):
-    code: Code236
+    code: Code246
+    detail: str
+    instance: Optional[str] = None
+    status: float
+    title: str
+    type: str
+
+
+class ApiV2AnalyticsToolCostAndCallVolumeGetParametersQuery(BaseModel):
+    startDate: Optional[AwareDatetime] = Field(
+        None,
+        description='Start of the date range, ISO 8601 in UTC, for example 2026-01-01T00:00:00Z. Defaults to 24 hours before endDate.',
+        examples=['2024-01-01T00:00:00.000Z'],
+    )
+    endDate: Optional[AwareDatetime] = Field(
+        None,
+        description='End of the date range, ISO 8601 in UTC. Defaults to now.',
+        examples=['2024-01-31T23:59:59.000Z'],
+    )
+    metricType: Optional[MetricType34] = Field(
+        None, description='Accepted for compatibility. This endpoint ignores it.'
+    )
+    page: Optional[conint(ge=0)] = Field(
+        0, description='Zero-based page of `_embedded.items` to return. Defaults to 0.'
+    )
+    size: Optional[conint(le=100, gt=0)] = Field(
+        20,
+        description='Number of `_embedded.items` per page, from 1 to 100. Defaults to 20.',
+    )
+    teamId: Optional[str] = Field(
+        None,
+        description="Hashed id of the team to answer for. Optional. With a user token it may be any team the user belongs to; without it the user's default team answers. An API key always answers for its own team, and naming any other team is refused with 403.",
+    )
+
+
+class Metric35(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
+    created: AwareDatetime = Field(
+        ..., description='When the entry was produced, ISO 8601 in UTC.'
+    )
+    id: str = Field(..., description='Identifier of this entry, new on every call.')
+    label: str = Field(..., description='Name of the group the figure belongs to.')
+    links: Optional[dict[str, Links]] = Field(
+        None,
+        description='Links to this request and to related requests, keyed by relation.',
+    )
+    metricResult: float = Field(
+        ...,
+        description='Cost in USD or number of tool calls, identified by metricType.',
+    )
+    metricType: str = Field(
+        ...,
+        description='Name of the figure, for example COST_BY_AGENT_OVER_TIME. One response can hold several figures, such as cost beside requests, tokens or runs, so read this field to know what each metricResult measures.',
+    )
+    resourceType: str = Field(..., description='Always metric.')
+    updated: Optional[AwareDatetime] = Field(..., description='Always null.')
+
+
+class Item39(BaseModel):
+    groupName: str = Field(
+        ...,
+        description='The group the figures belong to, such as an agent or model name.',
+    )
+    metrics: list[Metric35]
+    toolName: str = Field(
+        ..., description='Display name of the tool, or its ID when names collide.'
+    )
+
+
+class FieldEmbedded38(BaseModel):
+    items: list[Item39] = Field(
+        ..., description='One item per group over the whole date range.'
+    )
+
+
+class ApiV2AnalyticsToolCostAndCallVolumeGetResponse(BaseModel):
+    field_embedded: FieldEmbedded38 = Field(..., alias='_embedded')
+    field_links: dict[str, FieldLinks25] = Field(
+        ...,
+        alias='_links',
+        description='Links to this request and to related requests, keyed by relation.',
+    )
+    created: AwareDatetime = Field(
+        ..., description='When the response was produced, ISO 8601 in UTC.'
+    )
+    id: str = Field(
+        ..., description='Identifier of the response type, the same on every call.'
+    )
+    label: str = Field(..., description='Human-readable name of the figure returned.')
+    page: Optional[Page2] = Field(
+        None, description='Where this page sits among all pages of `_embedded.items`.'
+    )
+    period: Period30 = Field(..., description='The date range the response covers.')
+    resourceType: str = Field(
+        ..., description='Kind of response, for example metric_timeseries.'
+    )
+    updated: Optional[AwareDatetime] = Field(..., description='Always null.')
+
+
+class Code247(StrEnum):
+    INVALID_TEAM_ID = 'INVALID_TEAM_ID'
+
+
+class ApiV2AnalyticsToolCostAndCallVolumeGetResponse1(BaseModel):
+    code: Code247
+    message: str
+
+
+class Code248(StrEnum):
+    VALIDATION_ERROR = 'VALIDATION_ERROR'
+
+
+class ApiV2AnalyticsToolCostAndCallVolumeGetResponse2(BaseModel):
+    code: Code248
+    detail: str
+    instance: Optional[str] = None
+    status: float
+    title: str
+    type: str
+
+
+class Code249(StrEnum):
+    UNAUTHORIZED = 'UNAUTHORIZED'
+
+
+class ApiV2AnalyticsToolCostAndCallVolumeGetResponse3(BaseModel):
+    code: Code249
+    message: str
+
+
+class Code250(StrEnum):
+    FORBIDDEN = 'FORBIDDEN'
+    TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
+
+
+class ApiV2AnalyticsToolCostAndCallVolumeGetResponse4(BaseModel):
+    code: Code250
+    message: str
+
+
+class Code251(StrEnum):
+    INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
+
+
+class ApiV2AnalyticsToolCostAndCallVolumeGetResponse5(BaseModel):
+    code: Code251
+    message: str
+
+
+class Code252(StrEnum):
+    INTERNAL_ERROR = 'INTERNAL_ERROR'
+
+
+class ApiV2AnalyticsToolCostAndCallVolumeGetResponse6(BaseModel):
+    code: Code252
     detail: str
     instance: Optional[str] = None
     status: float
@@ -7080,7 +7857,13 @@ class ApiV2AnalyticsToolLatencyGetParametersQuery(BaseModel):
     )
 
 
-class Metric35(BaseModel):
+class Metric36(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -7101,22 +7884,22 @@ class Metric35(BaseModel):
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Item39(BaseModel):
+class Item40(BaseModel):
     groupName: str = Field(
         ...,
         description='The group the figures belong to, such as an agent or model name.',
     )
-    metrics: list[Metric35]
+    metrics: list[Metric36]
 
 
-class FieldEmbedded38(BaseModel):
-    items: list[Item39] = Field(
+class FieldEmbedded39(BaseModel):
+    items: list[Item40] = Field(
         ..., description='One item per group over the whole date range.'
     )
 
 
 class ApiV2AnalyticsToolLatencyGetResponse(BaseModel):
-    field_embedded: FieldEmbedded38 = Field(..., alias='_embedded')
+    field_embedded: FieldEmbedded39 = Field(..., alias='_embedded')
     field_links: dict[str, FieldLinks25] = Field(
         ...,
         alias='_links',
@@ -7132,28 +7915,28 @@ class ApiV2AnalyticsToolLatencyGetResponse(BaseModel):
     page: Optional[Page2] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period29 = Field(..., description='The date range the response covers.')
+    period: Period30 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code237(StrEnum):
+class Code253(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsToolLatencyGetResponse1(BaseModel):
-    code: Code237
+    code: Code253
     message: str
 
 
-class Code238(StrEnum):
+class Code254(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsToolLatencyGetResponse2(BaseModel):
-    code: Code238
+    code: Code254
     detail: str
     instance: Optional[str] = None
     status: float
@@ -7161,40 +7944,40 @@ class ApiV2AnalyticsToolLatencyGetResponse2(BaseModel):
     type: str
 
 
-class Code239(StrEnum):
+class Code255(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsToolLatencyGetResponse3(BaseModel):
-    code: Code239
+    code: Code255
     message: str
 
 
-class Code240(StrEnum):
+class Code256(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsToolLatencyGetResponse4(BaseModel):
-    code: Code240
+    code: Code256
     message: str
 
 
-class Code241(StrEnum):
+class Code257(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsToolLatencyGetResponse5(BaseModel):
-    code: Code241
+    code: Code257
     message: str
 
 
-class Code242(StrEnum):
+class Code258(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsToolLatencyGetResponse6(BaseModel):
-    code: Code242
+    code: Code258
     detail: str
     instance: Optional[str] = None
     status: float
@@ -7229,7 +8012,13 @@ class ApiV2AnalyticsToolSuccessRateGetParametersQuery(BaseModel):
     )
 
 
-class Metric36(BaseModel):
+class Metric37(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -7250,22 +8039,22 @@ class Metric36(BaseModel):
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Item40(BaseModel):
+class Item41(BaseModel):
     groupName: str = Field(
         ...,
         description='The group the figures belong to, such as an agent or model name.',
     )
-    metrics: list[Metric36]
+    metrics: list[Metric37]
 
 
-class FieldEmbedded39(BaseModel):
-    items: list[Item40] = Field(
+class FieldEmbedded40(BaseModel):
+    items: list[Item41] = Field(
         ..., description='One item per group over the whole date range.'
     )
 
 
 class ApiV2AnalyticsToolSuccessRateGetResponse(BaseModel):
-    field_embedded: FieldEmbedded39 = Field(..., alias='_embedded')
+    field_embedded: FieldEmbedded40 = Field(..., alias='_embedded')
     field_links: dict[str, FieldLinks25] = Field(
         ...,
         alias='_links',
@@ -7281,28 +8070,28 @@ class ApiV2AnalyticsToolSuccessRateGetResponse(BaseModel):
     page: Optional[Page2] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period29 = Field(..., description='The date range the response covers.')
+    period: Period30 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code243(StrEnum):
+class Code259(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsToolSuccessRateGetResponse1(BaseModel):
-    code: Code243
+    code: Code259
     message: str
 
 
-class Code244(StrEnum):
+class Code260(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsToolSuccessRateGetResponse2(BaseModel):
-    code: Code244
+    code: Code260
     detail: str
     instance: Optional[str] = None
     status: float
@@ -7310,40 +8099,40 @@ class ApiV2AnalyticsToolSuccessRateGetResponse2(BaseModel):
     type: str
 
 
-class Code245(StrEnum):
+class Code261(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsToolSuccessRateGetResponse3(BaseModel):
-    code: Code245
+    code: Code261
     message: str
 
 
-class Code246(StrEnum):
+class Code262(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsToolSuccessRateGetResponse4(BaseModel):
-    code: Code246
+    code: Code262
     message: str
 
 
-class Code247(StrEnum):
+class Code263(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsToolSuccessRateGetResponse5(BaseModel):
-    code: Code247
+    code: Code263
     message: str
 
 
-class Code248(StrEnum):
+class Code264(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsToolSuccessRateGetResponse6(BaseModel):
-    code: Code248
+    code: Code264
     detail: str
     instance: Optional[str] = None
     status: float
@@ -7405,7 +8194,13 @@ class Trend(StrEnum):
     eliminated = 'eliminated'
 
 
-class Metric37(BaseModel):
+class Metric38(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -7436,22 +8231,22 @@ class Metric37(BaseModel):
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Item41(BaseModel):
+class Item42(BaseModel):
     groupName: str = Field(
         ...,
         description='The group the figures belong to, such as an agent or model name.',
     )
-    metrics: list[Metric37]
+    metrics: list[Metric38]
 
 
-class FieldEmbedded40(BaseModel):
-    items: list[Item41] = Field(
+class FieldEmbedded41(BaseModel):
+    items: list[Item42] = Field(
         ..., description='One item per group over the whole date range.'
     )
 
 
 class ApiV2AnalyticsTopMoversGetResponse(BaseModel):
-    field_embedded: FieldEmbedded40 = Field(..., alias='_embedded')
+    field_embedded: FieldEmbedded41 = Field(..., alias='_embedded')
     field_links: dict[str, FieldLinks25] = Field(
         ...,
         alias='_links',
@@ -7467,28 +8262,28 @@ class ApiV2AnalyticsTopMoversGetResponse(BaseModel):
     page: Optional[Page2] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period29 = Field(..., description='The date range the response covers.')
+    period: Period30 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code249(StrEnum):
+class Code265(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsTopMoversGetResponse1(BaseModel):
-    code: Code249
+    code: Code265
     message: str
 
 
-class Code250(StrEnum):
+class Code266(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsTopMoversGetResponse2(BaseModel):
-    code: Code250
+    code: Code266
     detail: str
     instance: Optional[str] = None
     status: float
@@ -7496,40 +8291,40 @@ class ApiV2AnalyticsTopMoversGetResponse2(BaseModel):
     type: str
 
 
-class Code251(StrEnum):
+class Code267(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsTopMoversGetResponse3(BaseModel):
-    code: Code251
+    code: Code267
     message: str
 
 
-class Code252(StrEnum):
+class Code268(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsTopMoversGetResponse4(BaseModel):
-    code: Code252
+    code: Code268
     message: str
 
 
-class Code253(StrEnum):
+class Code269(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsTopMoversGetResponse5(BaseModel):
-    code: Code253
+    code: Code269
     message: str
 
 
-class Code254(StrEnum):
+class Code270(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsTopMoversGetResponse6(BaseModel):
-    code: Code254
+    code: Code270
     detail: str
     instance: Optional[str] = None
     status: float
@@ -7564,7 +8359,13 @@ class ApiV2AnalyticsTopToolsByCallCountGetParametersQuery(BaseModel):
     )
 
 
-class Metric38(BaseModel):
+class Metric39(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -7583,22 +8384,22 @@ class Metric38(BaseModel):
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Item42(BaseModel):
+class Item43(BaseModel):
     groupName: str = Field(
         ...,
         description='The group the figures belong to, such as an agent or model name.',
     )
-    metrics: list[Metric38]
+    metrics: list[Metric39]
 
 
-class FieldEmbedded41(BaseModel):
-    items: list[Item42] = Field(
+class FieldEmbedded42(BaseModel):
+    items: list[Item43] = Field(
         ..., description='One item per group over the whole date range.'
     )
 
 
 class ApiV2AnalyticsTopToolsByCallCountGetResponse(BaseModel):
-    field_embedded: FieldEmbedded41 = Field(..., alias='_embedded')
+    field_embedded: FieldEmbedded42 = Field(..., alias='_embedded')
     field_links: dict[str, FieldLinks25] = Field(
         ...,
         alias='_links',
@@ -7614,28 +8415,28 @@ class ApiV2AnalyticsTopToolsByCallCountGetResponse(BaseModel):
     page: Optional[Page2] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period29 = Field(..., description='The date range the response covers.')
+    period: Period30 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code255(StrEnum):
+class Code271(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsTopToolsByCallCountGetResponse1(BaseModel):
-    code: Code255
+    code: Code271
     message: str
 
 
-class Code256(StrEnum):
+class Code272(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsTopToolsByCallCountGetResponse2(BaseModel):
-    code: Code256
+    code: Code272
     detail: str
     instance: Optional[str] = None
     status: float
@@ -7643,40 +8444,40 @@ class ApiV2AnalyticsTopToolsByCallCountGetResponse2(BaseModel):
     type: str
 
 
-class Code257(StrEnum):
+class Code273(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsTopToolsByCallCountGetResponse3(BaseModel):
-    code: Code257
+    code: Code273
     message: str
 
 
-class Code258(StrEnum):
+class Code274(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsTopToolsByCallCountGetResponse4(BaseModel):
-    code: Code258
+    code: Code274
     message: str
 
 
-class Code259(StrEnum):
+class Code275(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsTopToolsByCallCountGetResponse5(BaseModel):
-    code: Code259
+    code: Code275
     message: str
 
 
-class Code260(StrEnum):
+class Code276(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsTopToolsByCallCountGetResponse6(BaseModel):
-    code: Code260
+    code: Code276
     detail: str
     instance: Optional[str] = None
     status: float
@@ -7716,7 +8517,7 @@ class ApiV2AnalyticsTraceCostDistributionGetParametersQuery(BaseModel):
     )
 
 
-class FieldLinks42(BaseModel):
+class FieldLinks43(BaseModel):
     """
     Link to this request.
     """
@@ -7736,7 +8537,7 @@ class DataPoint(BaseModel):
     transactionId: str = Field(..., description='Identifier of the trace.')
 
 
-class Period46(BaseModel):
+class Period48(BaseModel):
     """
     The date range the response covers.
     """
@@ -7772,7 +8573,7 @@ class Summary1(BaseModel):
 
 
 class ApiV2AnalyticsTraceCostDistributionGetResponse(BaseModel):
-    field_links: FieldLinks42 = Field(
+    field_links: FieldLinks43 = Field(
         ..., alias='_links', description='Link to this request.'
     )
     dataPoints: list[DataPoint] = Field(
@@ -7783,28 +8584,28 @@ class ApiV2AnalyticsTraceCostDistributionGetResponse(BaseModel):
         ..., description='Identifier of the response type, the same on every call.'
     )
     label: str = Field(..., description='Human-readable name of the figure returned.')
-    period: Period46 = Field(..., description='The date range the response covers.')
+    period: Period48 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(..., description='Kind of response.')
     summary: Summary1 = Field(
         ..., description='Statistics over the traces in dataPoints.'
     )
 
 
-class Code261(StrEnum):
+class Code277(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsTraceCostDistributionGetResponse1(BaseModel):
-    code: Code261
+    code: Code277
     message: str
 
 
-class Code262(StrEnum):
+class Code278(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsTraceCostDistributionGetResponse2(BaseModel):
-    code: Code262
+    code: Code278
     detail: str
     instance: Optional[str] = None
     status: float
@@ -7812,40 +8613,40 @@ class ApiV2AnalyticsTraceCostDistributionGetResponse2(BaseModel):
     type: str
 
 
-class Code263(StrEnum):
+class Code279(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsTraceCostDistributionGetResponse3(BaseModel):
-    code: Code263
+    code: Code279
     message: str
 
 
-class Code264(StrEnum):
+class Code280(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsTraceCostDistributionGetResponse4(BaseModel):
-    code: Code264
+    code: Code280
     message: str
 
 
-class Code265(StrEnum):
+class Code281(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsTraceCostDistributionGetResponse5(BaseModel):
-    code: Code265
+    code: Code281
     message: str
 
 
-class Code266(StrEnum):
+class Code282(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsTraceCostDistributionGetResponse6(BaseModel):
-    code: Code266
+    code: Code282
     detail: str
     instance: Optional[str] = None
     status: float
@@ -7880,7 +8681,13 @@ class ApiV2AnalyticsTransactionCountByTeamGetParametersQuery(BaseModel):
     )
 
 
-class Metric39(BaseModel):
+class Metric40(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    __annotations__ = {
+        '__pydantic_extra__': Dict[str, Any],
+    }
     created: AwareDatetime = Field(
         ..., description='When the entry was produced, ISO 8601 in UTC.'
     )
@@ -7899,25 +8706,25 @@ class Metric39(BaseModel):
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Item43(BaseModel):
+class Item44(BaseModel):
     groupName: str = Field(
         ...,
         description='The group the figures belong to, such as an agent or model name.',
     )
-    metrics: list[Metric39]
+    metrics: list[Metric40]
 
 
-class FieldEmbedded42(BaseModel):
-    items: list[Item43] = Field(
+class FieldEmbedded43(BaseModel):
+    items: list[Item44] = Field(
         ..., description='One item per group over the whole date range.'
     )
 
 
-class FieldLinks43(BaseModel):
+class FieldLinks44(BaseModel):
     href: str = Field(..., description='URL of the related request.')
 
 
-class Period47(BaseModel):
+class Period49(BaseModel):
     """
     The date range the response covers.
     """
@@ -7931,8 +8738,8 @@ class Period47(BaseModel):
 
 
 class ApiV2AnalyticsTransactionCountByTeamGetResponse(BaseModel):
-    field_embedded: FieldEmbedded42 = Field(..., alias='_embedded')
-    field_links: dict[str, FieldLinks43] = Field(
+    field_embedded: FieldEmbedded43 = Field(..., alias='_embedded')
+    field_links: dict[str, FieldLinks44] = Field(
         ...,
         alias='_links',
         description='Links to this request and to related requests, keyed by relation.',
@@ -7947,28 +8754,28 @@ class ApiV2AnalyticsTransactionCountByTeamGetResponse(BaseModel):
     page: Optional[Page2] = Field(
         None, description='Where this page sits among all pages of `_embedded.items`.'
     )
-    period: Period47 = Field(..., description='The date range the response covers.')
+    period: Period49 = Field(..., description='The date range the response covers.')
     resourceType: str = Field(
         ..., description='Kind of response, for example metric_timeseries.'
     )
     updated: Optional[AwareDatetime] = Field(..., description='Always null.')
 
 
-class Code267(StrEnum):
+class Code283(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2AnalyticsTransactionCountByTeamGetResponse1(BaseModel):
-    code: Code267
+    code: Code283
     message: str
 
 
-class Code268(StrEnum):
+class Code284(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2AnalyticsTransactionCountByTeamGetResponse2(BaseModel):
-    code: Code268
+    code: Code284
     detail: str
     instance: Optional[str] = None
     status: float
@@ -7976,40 +8783,40 @@ class ApiV2AnalyticsTransactionCountByTeamGetResponse2(BaseModel):
     type: str
 
 
-class Code269(StrEnum):
+class Code285(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2AnalyticsTransactionCountByTeamGetResponse3(BaseModel):
-    code: Code269
+    code: Code285
     message: str
 
 
-class Code270(StrEnum):
+class Code286(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2AnalyticsTransactionCountByTeamGetResponse4(BaseModel):
-    code: Code270
+    code: Code286
     message: str
 
 
-class Code271(StrEnum):
+class Code287(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2AnalyticsTransactionCountByTeamGetResponse5(BaseModel):
-    code: Code271
+    code: Code287
     message: str
 
 
-class Code272(StrEnum):
+class Code288(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2AnalyticsTransactionCountByTeamGetResponse6(BaseModel):
-    code: Code272
+    code: Code288
     detail: str
     instance: Optional[str] = None
     status: float
@@ -8057,7 +8864,7 @@ class ApiV2InsightsFeedbackPostRequest(BaseModel):
         'USD',
         description='Three-letter ISO 4217 currency code of `realizedSavings`. Defaults to `USD`.',
     )
-    realizedSavingsMeasuredAt: Optional[str] = Field(
+    realizedSavingsMeasuredAt: Optional[AwareDatetime] = Field(
         None,
         description='When the realized savings were measured, ISO 8601 in UTC. Optional; defaults to null.',
     )
@@ -8110,22 +8917,22 @@ class ApiV2InsightsFeedbackPostResponse(BaseModel):
     runId: str = Field(..., description='The run the recommendation belongs to.')
 
 
-class Code273(StrEnum):
+class Code289(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2InsightsFeedbackPostResponse1(BaseModel):
-    code: Code273
+    code: Code289
     message: str
 
 
-class Code274(StrEnum):
+class Code290(StrEnum):
     INVALID_IDEMPOTENCY_KEY = 'INVALID_IDEMPOTENCY_KEY'
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2InsightsFeedbackPostResponse2(BaseModel):
-    code: Code274
+    code: Code290
     detail: str
     instance: Optional[str] = None
     status: float
@@ -8133,31 +8940,31 @@ class ApiV2InsightsFeedbackPostResponse2(BaseModel):
     type: str
 
 
-class Code275(StrEnum):
+class Code291(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2InsightsFeedbackPostResponse3(BaseModel):
-    code: Code275
+    code: Code291
     message: str
 
 
-class Code276(StrEnum):
+class Code292(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2InsightsFeedbackPostResponse4(BaseModel):
-    code: Code276
+    code: Code292
     message: str
 
 
-class Code277(StrEnum):
+class Code293(StrEnum):
     NOT_FOUND = 'NOT_FOUND'
 
 
 class ApiV2InsightsFeedbackPostResponse5(BaseModel):
-    code: Code277
+    code: Code293
     detail: str
     instance: Optional[str] = None
     status: float
@@ -8165,13 +8972,13 @@ class ApiV2InsightsFeedbackPostResponse5(BaseModel):
     type: str
 
 
-class Code278(StrEnum):
+class Code294(StrEnum):
     IDEMPOTENCY_KEY_CONFLICT = 'IDEMPOTENCY_KEY_CONFLICT'
     IDEMPOTENCY_REQUEST_IN_PROGRESS = 'IDEMPOTENCY_REQUEST_IN_PROGRESS'
 
 
 class ApiV2InsightsFeedbackPostResponse6(BaseModel):
-    code: Code278
+    code: Code294
     detail: str
     instance: Optional[str] = None
     status: float
@@ -8179,12 +8986,12 @@ class ApiV2InsightsFeedbackPostResponse6(BaseModel):
     type: str
 
 
-class Code279(StrEnum):
+class Code295(StrEnum):
     RATE_LIMITED = 'RATE_LIMITED'
 
 
 class ApiV2InsightsFeedbackPostResponse7(BaseModel):
-    code: Code279
+    code: Code295
     detail: str
     instance: Optional[str] = None
     status: float
@@ -8192,21 +8999,21 @@ class ApiV2InsightsFeedbackPostResponse7(BaseModel):
     type: str
 
 
-class Code280(StrEnum):
+class Code296(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2InsightsFeedbackPostResponse8(BaseModel):
-    code: Code280
+    code: Code296
     message: str
 
 
-class Code281(StrEnum):
+class Code297(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2InsightsFeedbackPostResponse9(BaseModel):
-    code: Code281
+    code: Code297
     detail: str
     instance: Optional[str] = None
     status: float
@@ -8214,12 +9021,12 @@ class ApiV2InsightsFeedbackPostResponse9(BaseModel):
     type: str
 
 
-class Code282(StrEnum):
+class Code298(StrEnum):
     IDEMPOTENCY_BACKEND_UNAVAILABLE = 'IDEMPOTENCY_BACKEND_UNAVAILABLE'
 
 
 class ApiV2InsightsFeedbackPostResponse10(BaseModel):
-    code: Code282
+    code: Code298
     detail: str
     instance: Optional[str] = None
     status: float
@@ -8255,21 +9062,21 @@ class ApiV2InsightsInvestigatorsGetResponse(
     root: list[ApiV2InsightsInvestigatorsGetResponseItem]
 
 
-class Code283(StrEnum):
+class Code299(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2InsightsInvestigatorsGetResponse1(BaseModel):
-    code: Code283
+    code: Code299
     message: str
 
 
-class Code284(StrEnum):
+class Code300(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2InsightsInvestigatorsGetResponse2(BaseModel):
-    code: Code284
+    code: Code300
     detail: str
     instance: Optional[str] = None
     status: float
@@ -8277,31 +9084,31 @@ class ApiV2InsightsInvestigatorsGetResponse2(BaseModel):
     type: str
 
 
-class Code285(StrEnum):
+class Code301(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2InsightsInvestigatorsGetResponse3(BaseModel):
-    code: Code285
+    code: Code301
     message: str
 
 
-class Code286(StrEnum):
+class Code302(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2InsightsInvestigatorsGetResponse4(BaseModel):
-    code: Code286
+    code: Code302
     message: str
 
 
-class Code287(StrEnum):
+class Code303(StrEnum):
     RATE_LIMITED = 'RATE_LIMITED'
 
 
 class ApiV2InsightsInvestigatorsGetResponse5(BaseModel):
-    code: Code287
+    code: Code303
     detail: str
     instance: Optional[str] = None
     status: float
@@ -8309,21 +9116,21 @@ class ApiV2InsightsInvestigatorsGetResponse5(BaseModel):
     type: str
 
 
-class Code288(StrEnum):
+class Code304(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2InsightsInvestigatorsGetResponse6(BaseModel):
-    code: Code288
+    code: Code304
     message: str
 
 
-class Code289(StrEnum):
+class Code305(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2InsightsInvestigatorsGetResponse7(BaseModel):
-    code: Code289
+    code: Code305
     detail: str
     instance: Optional[str] = None
     status: float
@@ -8367,11 +9174,11 @@ class ApiV2InsightsRunsGetParametersQuery(BaseModel):
         None,
         description='Keep only runs with this status: `running`, `completed`, `partial`, `failed` or `cancelled`.',
     )
-    since: Optional[str] = Field(
+    since: Optional[AwareDatetime] = Field(
         None,
         description='Keep only runs created at or after this time. ISO 8601, for example `2026-01-01T00:00:00Z`.',
     )
-    until: Optional[str] = Field(
+    until: Optional[AwareDatetime] = Field(
         None,
         description='Keep only runs created at or before this time. ISO 8601, for example `2026-01-31T23:59:59Z`.',
     )
@@ -8424,21 +9231,21 @@ class ApiV2InsightsRunsGetResponse(BaseModel):
     )
 
 
-class Code290(StrEnum):
+class Code306(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2InsightsRunsGetResponse1(BaseModel):
-    code: Code290
+    code: Code306
     message: str
 
 
-class Code291(StrEnum):
+class Code307(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2InsightsRunsGetResponse2(BaseModel):
-    code: Code291
+    code: Code307
     detail: str
     instance: Optional[str] = None
     status: float
@@ -8446,31 +9253,31 @@ class ApiV2InsightsRunsGetResponse2(BaseModel):
     type: str
 
 
-class Code292(StrEnum):
+class Code308(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2InsightsRunsGetResponse3(BaseModel):
-    code: Code292
+    code: Code308
     message: str
 
 
-class Code293(StrEnum):
+class Code309(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2InsightsRunsGetResponse4(BaseModel):
-    code: Code293
+    code: Code309
     message: str
 
 
-class Code294(StrEnum):
+class Code310(StrEnum):
     RATE_LIMITED = 'RATE_LIMITED'
 
 
 class ApiV2InsightsRunsGetResponse5(BaseModel):
-    code: Code294
+    code: Code310
     detail: str
     instance: Optional[str] = None
     status: float
@@ -8478,21 +9285,21 @@ class ApiV2InsightsRunsGetResponse5(BaseModel):
     type: str
 
 
-class Code295(StrEnum):
+class Code311(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2InsightsRunsGetResponse6(BaseModel):
-    code: Code295
+    code: Code311
     message: str
 
 
-class Code296(StrEnum):
+class Code312(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2InsightsRunsGetResponse7(BaseModel):
-    code: Code296
+    code: Code312
     detail: str
     instance: Optional[str] = None
     status: float
@@ -8545,11 +9352,11 @@ class ApiV2InsightsRunsPostRequest(BaseModel):
     filterTraceType: Optional[list[str]] = Field(
         [], description='Analyze only these trace types. Defaults to all trace types.'
     )
-    periodEnd: Optional[str] = Field(
+    periodEnd: Optional[AwareDatetime] = Field(
         ...,
         description='End of the period to analyze, ISO 8601 in UTC. Must be after `periodStart`.',
     )
-    periodStart: Optional[str] = Field(
+    periodStart: Optional[AwareDatetime] = Field(
         ...,
         description='Start of the period to analyze, ISO 8601 in UTC. The period can be at most 90 days long.',
     )
@@ -8577,23 +9384,23 @@ class ApiV2InsightsRunsPostResponse(BaseModel):
     )
 
 
-class Code297(StrEnum):
+class Code313(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2InsightsRunsPostResponse1(BaseModel):
-    code: Code297
+    code: Code313
     message: str
 
 
-class Code298(StrEnum):
+class Code314(StrEnum):
     INVALID_IDEMPOTENCY_KEY = 'INVALID_IDEMPOTENCY_KEY'
     INVALID_INPUT = 'INVALID_INPUT'
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2InsightsRunsPostResponse2(BaseModel):
-    code: Code298
+    code: Code314
     detail: str
     instance: Optional[str] = None
     status: float
@@ -8601,33 +9408,33 @@ class ApiV2InsightsRunsPostResponse2(BaseModel):
     type: str
 
 
-class Code299(StrEnum):
+class Code315(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2InsightsRunsPostResponse3(BaseModel):
-    code: Code299
+    code: Code315
     message: str
 
 
-class Code300(StrEnum):
+class Code316(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2InsightsRunsPostResponse4(BaseModel):
-    code: Code300
+    code: Code316
     message: str
 
 
-class Code301(StrEnum):
+class Code317(StrEnum):
     IDEMPOTENCY_KEY_CONFLICT = 'IDEMPOTENCY_KEY_CONFLICT'
     IDEMPOTENCY_REQUEST_IN_PROGRESS = 'IDEMPOTENCY_REQUEST_IN_PROGRESS'
     RUN_IN_PROGRESS = 'RUN_IN_PROGRESS'
 
 
 class ApiV2InsightsRunsPostResponse5(BaseModel):
-    code: Code301
+    code: Code317
     detail: str
     instance: Optional[str] = None
     status: float
@@ -8635,12 +9442,12 @@ class ApiV2InsightsRunsPostResponse5(BaseModel):
     type: str
 
 
-class Code302(StrEnum):
+class Code318(StrEnum):
     RATE_LIMITED = 'RATE_LIMITED'
 
 
 class ApiV2InsightsRunsPostResponse6(BaseModel):
-    code: Code302
+    code: Code318
     detail: str
     instance: Optional[str] = None
     status: float
@@ -8648,23 +9455,23 @@ class ApiV2InsightsRunsPostResponse6(BaseModel):
     type: str
 
 
-class Code303(StrEnum):
+class Code319(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2InsightsRunsPostResponse7(BaseModel):
-    code: Code303
+    code: Code319
     message: str
 
 
-class Code304(StrEnum):
+class Code320(StrEnum):
     ANALYSIS_UNAVAILABLE = 'ANALYSIS_UNAVAILABLE'
     INTERNAL_ERROR = 'INTERNAL_ERROR'
     MISSING_CONFIG = 'MISSING_CONFIG'
 
 
 class ApiV2InsightsRunsPostResponse8(BaseModel):
-    code: Code304
+    code: Code320
     detail: str
     instance: Optional[str] = None
     status: float
@@ -8672,12 +9479,12 @@ class ApiV2InsightsRunsPostResponse8(BaseModel):
     type: str
 
 
-class Code305(StrEnum):
+class Code321(StrEnum):
     IDEMPOTENCY_BACKEND_UNAVAILABLE = 'IDEMPOTENCY_BACKEND_UNAVAILABLE'
 
 
 class ApiV2InsightsRunsPostResponse9(BaseModel):
-    code: Code305
+    code: Code321
     detail: str
     instance: Optional[str] = None
     status: float
@@ -9074,21 +9881,21 @@ class ApiV2InsightsRunsRunIdGetResponse(BaseModel):
     )
 
 
-class Code306(StrEnum):
+class Code322(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2InsightsRunsRunIdGetResponse1(BaseModel):
-    code: Code306
+    code: Code322
     message: str
 
 
-class Code307(StrEnum):
+class Code323(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2InsightsRunsRunIdGetResponse2(BaseModel):
-    code: Code307
+    code: Code323
     detail: str
     instance: Optional[str] = None
     status: float
@@ -9096,31 +9903,31 @@ class ApiV2InsightsRunsRunIdGetResponse2(BaseModel):
     type: str
 
 
-class Code308(StrEnum):
+class Code324(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2InsightsRunsRunIdGetResponse3(BaseModel):
-    code: Code308
+    code: Code324
     message: str
 
 
-class Code309(StrEnum):
+class Code325(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2InsightsRunsRunIdGetResponse4(BaseModel):
-    code: Code309
+    code: Code325
     message: str
 
 
-class Code310(StrEnum):
+class Code326(StrEnum):
     NOT_FOUND = 'NOT_FOUND'
 
 
 class ApiV2InsightsRunsRunIdGetResponse5(BaseModel):
-    code: Code310
+    code: Code326
     detail: str
     instance: Optional[str] = None
     status: float
@@ -9128,12 +9935,12 @@ class ApiV2InsightsRunsRunIdGetResponse5(BaseModel):
     type: str
 
 
-class Code311(StrEnum):
+class Code327(StrEnum):
     RATE_LIMITED = 'RATE_LIMITED'
 
 
 class ApiV2InsightsRunsRunIdGetResponse6(BaseModel):
-    code: Code311
+    code: Code327
     detail: str
     instance: Optional[str] = None
     status: float
@@ -9141,21 +9948,21 @@ class ApiV2InsightsRunsRunIdGetResponse6(BaseModel):
     type: str
 
 
-class Code312(StrEnum):
+class Code328(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2InsightsRunsRunIdGetResponse7(BaseModel):
-    code: Code312
+    code: Code328
     message: str
 
 
-class Code313(StrEnum):
+class Code329(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2InsightsRunsRunIdGetResponse8(BaseModel):
-    code: Code313
+    code: Code329
     detail: str
     instance: Optional[str] = None
     status: float
@@ -9219,21 +10026,21 @@ class ApiV2InsightsRunsRunIdFeedbackGetResponse(
     root: list[ApiV2InsightsRunsRunIdFeedbackGetResponseItem]
 
 
-class Code314(StrEnum):
+class Code330(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2InsightsRunsRunIdFeedbackGetResponse1(BaseModel):
-    code: Code314
+    code: Code330
     message: str
 
 
-class Code315(StrEnum):
+class Code331(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2InsightsRunsRunIdFeedbackGetResponse2(BaseModel):
-    code: Code315
+    code: Code331
     detail: str
     instance: Optional[str] = None
     status: float
@@ -9241,31 +10048,31 @@ class ApiV2InsightsRunsRunIdFeedbackGetResponse2(BaseModel):
     type: str
 
 
-class Code316(StrEnum):
+class Code332(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2InsightsRunsRunIdFeedbackGetResponse3(BaseModel):
-    code: Code316
+    code: Code332
     message: str
 
 
-class Code317(StrEnum):
+class Code333(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2InsightsRunsRunIdFeedbackGetResponse4(BaseModel):
-    code: Code317
+    code: Code333
     message: str
 
 
-class Code318(StrEnum):
+class Code334(StrEnum):
     RATE_LIMITED = 'RATE_LIMITED'
 
 
 class ApiV2InsightsRunsRunIdFeedbackGetResponse5(BaseModel):
-    code: Code318
+    code: Code334
     detail: str
     instance: Optional[str] = None
     status: float
@@ -9273,21 +10080,21 @@ class ApiV2InsightsRunsRunIdFeedbackGetResponse5(BaseModel):
     type: str
 
 
-class Code319(StrEnum):
+class Code335(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2InsightsRunsRunIdFeedbackGetResponse6(BaseModel):
-    code: Code319
+    code: Code335
     message: str
 
 
-class Code320(StrEnum):
+class Code336(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2InsightsRunsRunIdFeedbackGetResponse7(BaseModel):
-    code: Code320
+    code: Code336
     detail: str
     instance: Optional[str] = None
     status: float
@@ -9319,21 +10126,21 @@ class ApiV2StatusConnectionGetResponse(BaseModel):
     )
 
 
-class Code321(StrEnum):
+class Code337(StrEnum):
     INVALID_TEAM_ID = 'INVALID_TEAM_ID'
 
 
 class ApiV2StatusConnectionGetResponse1(BaseModel):
-    code: Code321
+    code: Code337
     message: str
 
 
-class Code322(StrEnum):
+class Code338(StrEnum):
     VALIDATION_ERROR = 'VALIDATION_ERROR'
 
 
 class ApiV2StatusConnectionGetResponse2(BaseModel):
-    code: Code322
+    code: Code338
     detail: str
     instance: Optional[str] = None
     status: float
@@ -9341,40 +10148,40 @@ class ApiV2StatusConnectionGetResponse2(BaseModel):
     type: str
 
 
-class Code323(StrEnum):
+class Code339(StrEnum):
     UNAUTHORIZED = 'UNAUTHORIZED'
 
 
 class ApiV2StatusConnectionGetResponse3(BaseModel):
-    code: Code323
+    code: Code339
     message: str
 
 
-class Code324(StrEnum):
+class Code340(StrEnum):
     FORBIDDEN = 'FORBIDDEN'
     TEAM_NOT_IN_MEMBERSHIP = 'TEAM_NOT_IN_MEMBERSHIP'
 
 
 class ApiV2StatusConnectionGetResponse4(BaseModel):
-    code: Code324
+    code: Code340
     message: str
 
 
-class Code325(StrEnum):
+class Code341(StrEnum):
     INTERNAL_SERVER_ERROR = 'INTERNAL_SERVER_ERROR'
 
 
 class ApiV2StatusConnectionGetResponse5(BaseModel):
-    code: Code325
+    code: Code341
     message: str
 
 
-class Code326(StrEnum):
+class Code342(StrEnum):
     INTERNAL_ERROR = 'INTERNAL_ERROR'
 
 
 class ApiV2StatusConnectionGetResponse6(BaseModel):
-    code: Code326
+    code: Code342
     detail: str
     instance: Optional[str] = None
     status: float

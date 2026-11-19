@@ -112,4 +112,19 @@ def test_get_endpoint_config_preserves_force_new(flag_off):
     assert config.new_path == "/api/v2/analytics/revenue-per-customer"
 
 
+def test_billing_coverage_reads_the_analytics_route_without_the_flag(flag_off, monkeypatch):
+    """BACK-4916: hosted deployments leave the flag unset and still skip the slow platform read."""
+    configured_host = "https://app.coverage.revenium.invalid"
+    monkeypatch.setenv("REVENIUM_APP_BASE_URL", configured_host)
+    config = _ENDPOINT_REGISTRY["billing_coverage"]
+    assert config.old_path == config.new_path, (
+        "old_path names an operation the consumed-operations allowlist records as invoked"
+    )
+    assert config.mapping_status == "NEW_API_ONLY", "old_path is a placeholder, not a legacy read"
+    assert get_endpoint_path("billing_coverage") == "/api/v2/analytics/billing-coverage"
+    resolved = get_endpoint_config("billing_coverage")
+    assert resolved.force_new is True
+    assert resolved.new_base_url == configured_host, "the coverage read sends this host as its base_url"
+
+
 # ---------------------------------------------------------------------------

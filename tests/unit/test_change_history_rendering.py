@@ -335,6 +335,12 @@ class TestNoStoredStringReachesTheTextWithItsLineBreaks:
         assert len(text.splitlines()) == 4
         assert "deleted by admin@acme.com" in text
 
+    def test_a_summary_reason_with_line_breaks_is_one_reason_line(self):
+        text = render_change_summary("Summary", {**SUMMARY, "lastChangeReason": FORGED})
+
+        assert len(text.splitlines()) == 5
+        assert "- Last change reason: x - 2026-10-29T00:00:00.000Z: deleted by admin@acme.com" in text
+
 
 class TestPaging:
     def test_an_empty_history_is_an_answer(self):
@@ -380,6 +386,34 @@ class TestTheSummary:
             "- Last changed: 2026-10-28T14:14:03.512Z by API key ci-bot (owner ops@acme.com)",
             "- History starts: 2026-10-22T21:03:55.120Z",
         ]
+
+    def test_the_reason_of_the_last_change_follows_who_made_it(self):
+        text = render_change_summary(
+            "Change summary of budget cc_1", {**SUMMARY, "lastChangeReason": "Raised for the Q4 launch"}
+        )
+
+        assert text.splitlines() == [
+            "Change summary of budget cc_1:",
+            "- Created: 2026-10-24T09:00:00.000Z by jane@acme.com",
+            "- Last changed: 2026-10-28T14:14:03.512Z by API key ci-bot (owner ops@acme.com)",
+            "- Last change reason: Raised for the Q4 launch",
+            "- History starts: 2026-10-22T21:03:55.120Z",
+        ]
+
+    @pytest.mark.parametrize("reason", [None, "", " \n\t "], ids=["null", "empty", "blank"])
+    def test_a_change_saved_without_a_reason_shows_no_reason_line(self, reason):
+        text = render_change_summary("Summary", {**SUMMARY, "lastChangeReason": reason})
+
+        assert len(text.splitlines()) == 4
+        assert "reason" not in text.lower()
+
+    def test_a_reason_without_a_last_change_is_not_shown(self):
+        summary = {**SUMMARY, "lastChangedAt": None, "lastChangedBy": None, "lastChangeReason": "Stray"}
+
+        text = render_change_summary("Summary", summary)
+
+        assert "- Last changed: not since it was created" in text
+        assert "Stray" not in text
 
     def test_an_item_older_than_the_history_and_unchanged_since(self):
         summary = {

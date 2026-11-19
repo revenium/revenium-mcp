@@ -171,6 +171,51 @@ class TestClerkModeVerifyCapability:
             assert wording not in rendered
 
 
+class TestMultiCustomerModeHealthRefreshAndList:
+    @pytest.mark.asyncio
+    async def test_health_names_what_the_capability_actions_do(self, multi_customer_mode):
+        result = await multi_customer_mode.handle_action("get_health_status", {})
+
+        text = result[0].text
+        assert '"status": "static_capabilities"' in text
+        assert "built-in table" in text
+        assert "refresh_capabilities has nothing to refresh" in text
+        for wording in CONNECTIVITY_WORDING:
+            assert wording not in text
+
+    @pytest.mark.asyncio
+    async def test_refresh_says_there_is_nothing_to_refresh(self, multi_customer_mode):
+        result = await multi_customer_mode.handle_action("refresh_capabilities", {})
+
+        text = result[0].text
+        assert "Nothing to Refresh" in text
+        assert "Capabilities Refreshed" not in text
+        assert '"status": "static_capabilities"' in text
+        for wording in CONNECTIVITY_WORDING:
+            assert wording not in text
+
+    @pytest.mark.asyncio
+    async def test_all_capabilities_list_every_static_table(self, multi_customer_mode):
+        result = await multi_customer_mode.handle_action("manage_capabilities", {})
+
+        text = result[0].text
+        assert STATIC_CAPABILITIES_NOTE in text
+        assert f"**Available Capabilities**: {len(SUPPORTED_RESOURCE_TYPES)} configured" in text
+        for resource_type in SUPPORTED_RESOURCE_TYPES:
+            assert f'"{resource_type}": {{' in text
+        assert '"plan_types"' in text
+        assert "not_initialized" not in text
+        for wording in CONNECTIVITY_WORDING:
+            assert wording not in text
+
+    @pytest.mark.asyncio
+    async def test_env_mode_without_ucm_still_refuses_refresh(self, env_mode_without_ucm):
+        with pytest.raises(ToolError) as refused:
+            await env_mode_without_ucm.handle_action("refresh_capabilities", {})
+
+        assert "not initialized" in refused.value.message
+
+
 READ_ACTIONS = ["get_capabilities", "get_capability", "verify_capability"]
 
 
