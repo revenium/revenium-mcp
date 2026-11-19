@@ -16,9 +16,12 @@ too would split one resource's read surface across two tools.
 """
 
 import json
+import operator
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, ClassVar, Dict, List, Optional, Union
+from enum import Enum
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, ClassVar, Dict, List, Optional, Set, Union
 
 if TYPE_CHECKING:
     from ..auth.tenant_context import TenantContext
@@ -75,6 +78,9 @@ _CREDENTIAL_BY_ORGANIZATION_FILTER_MAP: Dict[str, str] = {
     "sort": "sort",
 }
 
+_MASKED_VALUE_PREFIX = "..."
+_CREATE_CONFIRMED_KEY = "create_confirmed"
+
 
 def _raise_if_lookup_incomplete(
     navigation_result: Any, message: str, field: str, value: str
@@ -107,6 +113,25 @@ def _existing_credential_error(existing: Dict[str, Any]) -> ToolError:
     )
 
 
+def _unconfirmed_create_message(credential_id: str) -> str:
+    return (
+        f"Credential create could not be confirmed: the platform returned credential "
+        f"{credential_id}, but its answer carries nothing to tell a new credential from an "
+        f"existing one with this external ID that kept its old settings"
+    )
+
+
+def _unconfirmed_create_next_steps(credential_id: str) -> List[str]:
+    return [
+        f"Use 'get' with credential_id='{credential_id}' to check its name, subscriber, "
+        "organization and subscriptions",
+        f"Use 'update' with credential_id='{credential_id}' to apply the secret and "
+        "subscriptions you sent, whichever case this is",
+        "Do not create it again with this externalId: the platform answers a repeat "
+        "with the existing credential",
+    ]
+
+
 def _returned_value(returned: Dict[str, Any], key: str, nested: str) -> Any:
     value = returned.get(key)
     if value is not None:
@@ -115,26 +140,100 @@ def _returned_value(returned: Dict[str, Any], key: str, nested: str) -> Any:
     return nested_record.get("id") if isinstance(nested_record, dict) else None
 
 
-def _returned_an_existing_credential(sent: Dict[str, Any], returned: Any) -> bool:
-    """True when the record the platform returned for a create is not the one sent.
+def _shown_secret(sent_secret: Any, returned: Dict[str, Any]) -> Optional[str]:
+    """The secret the answer shows in full, or None when there is none to compare.
+
+    Other than the secret sent, a value starting with the platform's mask
+    prefix (``...``, as it shows external IDs) is a display token, not the
+    stored secret.
+    """
+    secret = returned.get("externalSecret")
+    if not isinstance(secret, str) or not secret:
+        return None
+    if secret != sent_secret and secret.startswith(_MASKED_VALUE_PREFIX):
+        return None
+    return secret
+
+
+def _requested_subscription_ids(sent: Dict[str, Any]) -> Optional[Set[Any]]:
+    sent_ids = sent.get("subscriptionIds")
+    return set(sent_ids) if isinstance(sent_ids, list) and sent_ids else None
+
+
+def _linked_subscription_ids(returned: Dict[str, Any]) -> Optional[Set[Any]]:
+    """The subscription ids the answer links, or None when it shows no list to compare."""
+    linked = returned.get("subscriptions")
+    if not isinstance(linked, list):
+        return None
+    return {entry.get("id") for entry in linked if isinstance(entry, dict)}
+
+
+class CreateVerdict(Enum):
+    CREATED = "created"
+    EXISTING_RETURNED = "existing_returned"
+    UNCONFIRMED = "unconfirmed"
+
+
+@dataclass(frozen=True)
+class _ComparedField:
+    """One thing a create sent, beside what the answer shows of it (None when it shows nothing)."""
+
+    sent: Any
+    shown: Any
+    confirms_a_create: bool = False
+    agrees: Callable[[Any, Any], bool] = operator.eq
+
+    def contradicts(self) -> bool:
+        return self.sent is not None and self.shown is not None and not self.agrees(self.sent, self.shown)
+
+    def leaves_unconfirmed(self) -> bool:
+        return self.confirms_a_create and self.sent is not None and self.shown is None
+
+
+def _compared_create_fields(sent: Dict[str, Any], returned: Dict[str, Any]) -> List[_ComparedField]:
+    """Each field a true create returns as sent.
+
+    The platform sets a credential's label to its name, so a label sent beside a
+    different name is not what comes back: the name is compared, falling back to
+    the label on either side only when no name is there.
+
+    A repeat create that sends the kept credential's name, subscriber and
+    organization shows nothing apart on them, so only the secret and the
+    subscription links can tell a new credential from a kept one. A create is
+    confirmed only when the answer shows the secret and, when the call sent
+    subscriptions, their links; a call that sent none is confirmed by the
+    secret alone.
+    """
+    sent_secret = sent.get("externalSecret")
+    return [
+        _ComparedField(sent.get("name", sent.get("label")), returned.get("name") or returned.get("label")),
+        _ComparedField(sent.get("subscriberId"), _returned_value(returned, "subscriberId", "subscriber")),
+        _ComparedField(sent.get("organizationId"), _returned_value(returned, "organizationId", "organization")),
+        _ComparedField(sent_secret, _shown_secret(sent_secret, returned), confirms_a_create=True),
+        _ComparedField(
+            _requested_subscription_ids(sent),
+            _linked_subscription_ids(returned),
+            confirms_a_create=True,
+            agrees=set.issubset,
+        ),
+    ]
+
+
+def _create_verdict(sent: Dict[str, Any], returned: Any) -> CreateVerdict:
+    """Whether the record the platform returned for a create is the one sent.
 
     The platform answers a create whose external ID already exists with the
     existing credential, unchanged, instead of an error; it masks external IDs,
-    so the name and the owning subscriber and organization are what can be
-    compared. The platform sets a credential's label to its name, so a label
-    sent beside a different name is not what comes back.
+    so the external ID cannot be compared.
     """
     if not isinstance(returned, dict):
-        return False
-    comparisons = (
-        (sent.get("name", sent.get("label")), returned.get("name") or returned.get("label")),
-        (sent.get("subscriberId"), _returned_value(returned, "subscriberId", "subscriber")),
-        (sent.get("organizationId"), _returned_value(returned, "organizationId", "organization")),
-    )
-    return any(
-        sent_value is not None and returned_value is not None and sent_value != returned_value
-        for sent_value, returned_value in comparisons
-    )
+        return CreateVerdict.UNCONFIRMED
+    fields = _compared_create_fields(sent, returned)
+    if any(field.contradicts() for field in fields):
+        return CreateVerdict.EXISTING_RETURNED
+    if any(field.leaves_unconfirmed() for field in fields):
+        return CreateVerdict.UNCONFIRMED
+    return CreateVerdict.CREATED
 
 
 class CredentialsHierarchyManager:
@@ -691,6 +790,14 @@ class SubscriberCredentialsManagement(ToolBase):
             return [
                 TextContent(type="text", text=f"**{heading}**\n\n{json.dumps(result, indent=2)}")
             ]
+        if result.get(_CREATE_CONFIRMED_KEY) is False:
+            credential_id = result.get("id", "unknown")
+            return self.formatter.format_success_response(
+                message=_unconfirmed_create_message(credential_id),
+                data=result,
+                next_steps=_unconfirmed_create_next_steps(credential_id),
+                action=action,
+            )
         return self.formatter.format_success_response(
             message=f"Credential {action} completed successfully",
             data=result,
@@ -1075,13 +1182,16 @@ class SubscriberCredentialsManagement(ToolBase):
         # SECURITY: Obfuscate sensitive fields in created credential before returning to user
         # This prevents API keys and secrets from being exposed in tool outputs
         obfuscated_result = obfuscate_credential_data(result)
-        if _returned_an_existing_credential(credential_data, result):
+        verdict = _create_verdict(credential_data, result)
+        if verdict is CreateVerdict.EXISTING_RETURNED:
             raise _existing_credential_error(obfuscated_result)
 
         # Add business context to result
         obfuscated_result["business_context"] = self.business_context.get_billing_impact_explanation(
             "create", credential_data
         )
+        if verdict is CreateVerdict.UNCONFIRMED:
+            obfuscated_result[_CREATE_CONFIRMED_KEY] = False
 
         return obfuscated_result
 

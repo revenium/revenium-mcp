@@ -28,6 +28,7 @@ from src.revenium_mcp_server.tools_decomposed.cost_controls_management import (
     _summarize_department_blocks,
     _summarize_department_warnings,
 )
+from src.revenium_mcp_server.alerts.update_fidelity import DEPARTMENT_ALERT_FORMS
 from src.revenium_mcp_server.client import ReveniumAPIError
 from src.revenium_mcp_server.common.error_handling import ErrorCodes, ToolError
 from mcp.types import TextContent
@@ -315,6 +316,219 @@ class TestCostControlsManagerUpdate:
             await cc_manager.update_cost_control(
                 {"control_id": "cc_1", "control_data": {"hardLimit": -1}}
             )
+        mock_client.get_cost_control_by_id.assert_not_called()
+
+
+class TestUpdateRefusesANamelessControl:
+    """BACK-4985: a blank name stores a control the name search cannot find."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("name", ["", "   ", "\n\t"], ids=["empty", "spaces", "whitespace"])
+    async def test_a_blank_name_is_refused_before_sending(self, cc_manager, mock_client, name):
+        with pytest.raises(ToolError) as refusal:
+            await cc_manager.update_cost_control(
+                {"control_id": "cc_1", "control_data": {"name": name}}
+            )
+
+        assert refusal.value.error_code == ErrorCodes.VALIDATION_ERROR
+        assert refusal.value.field == "control_data.name"
+        assert "name cannot be blank" in refusal.value.message
+        mock_client.get_cost_control_by_id.assert_not_called()
+        mock_client.update_cost_control.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_named_update_is_sent(self, cc_manager, mock_client):
+        mock_client.update_cost_control.return_value = {"id": "cc_1"}
+
+        await cc_manager.update_cost_control(
+            {"control_id": "cc_1", "control_data": {"name": "Q4 cap"}}
+        )
+
+        mock_client.update_cost_control.assert_awaited_once_with("cc_1", {"name": "Q4 cap"})
+
+
+class TestUpdateRefusesABlockControlWithoutACap:
+    """BACK-4985: a BLOCK control with no hardLimit is not applied at a hard limit."""
+
+    @pytest.mark.asyncio
+    async def test_clearing_the_cap_of_a_stored_block_control_is_refused(self, cc_manager, mock_client):
+        mock_client.get_cost_control_by_id.return_value = {"id": "cc_1", "action": "BLOCK", "hardLimit": 500}
+
+        with pytest.raises(ToolError) as refusal:
+            await cc_manager.update_cost_control(
+                {"control_id": "cc_1", "control_data": {"hardLimit": None}}
+            )
+
+        assert refusal.value.error_code == ErrorCodes.VALIDATION_ERROR
+        assert refusal.value.field == "control_data.hardLimit"
+        assert "would be a BLOCK control with no hardLimit" in refusal.value.message
+        mock_client.update_cost_control.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_clearing_the_cap_while_setting_block_is_refused_without_a_read(
+        self, cc_manager, mock_client
+    ):
+        with pytest.raises(ToolError) as refusal:
+            await cc_manager.update_cost_control(
+                {"control_id": "cc_1", "control_data": {"hardLimit": None, "action": "BLOCK"}}
+            )
+
+        assert refusal.value.field == "control_data.hardLimit"
+        mock_client.get_cost_control_by_id.assert_not_called()
+        mock_client.update_cost_control.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stored_cap", [None, 0], ids=["null", "zero"])
+    async def test_switching_a_control_without_a_cap_to_block_is_refused(
+        self, cc_manager, mock_client, stored_cap
+    ):
+        mock_client.get_cost_control_by_id.return_value = {
+            "id": "cc_1", "action": "WARN_ONLY", "hardLimit": stored_cap, "warnThreshold": 80,
+        }
+
+        with pytest.raises(ToolError) as refusal:
+            await cc_manager.update_cost_control(
+                {"control_id": "cc_1", "control_data": {"action": "BLOCK"}}
+            )
+
+        assert refusal.value.field == "control_data.hardLimit"
+        mock_client.update_cost_control.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_says_what_is_accepted(self, cc_manager, mock_client):
+        mock_client.get_cost_control_by_id.return_value = {"id": "cc_1", "action": "BLOCK", "hardLimit": 500}
+
+        with pytest.raises(ToolError) as refusal:
+            await cc_manager.update_cost_control(
+                {"control_id": "cc_1", "control_data": {"hardLimit": None}}
+            )
+
+        suggestions = " ".join(refusal.value.suggestions)
+        assert "hardLimit greater than 0" in suggestions
+        assert "'action': 'WARN_ONLY', 'hardLimit': None" in suggestions
+
+    @pytest.mark.asyncio
+    async def test_clearing_the_cap_of_a_warn_only_control_is_sent(self, cc_manager, mock_client):
+        """null clears the cap (the platform's PATCH contract); a WARN_ONLY control blocks nobody either way."""
+        mock_client.get_cost_control_by_id.return_value = {"id": "cc_1", "action": "WARN_ONLY", "hardLimit": 500}
+        mock_client.update_cost_control.return_value = {"id": "cc_1"}
+
+        await cc_manager.update_cost_control({"control_id": "cc_1", "control_data": {"hardLimit": None}})
+
+        mock_client.update_cost_control.assert_awaited_once_with("cc_1", {"hardLimit": None})
+
+    @pytest.mark.asyncio
+    async def test_clearing_the_cap_while_leaving_block_is_sent_without_a_read(self, cc_manager, mock_client):
+        mock_client.update_cost_control.return_value = {"id": "cc_1"}
+        body = {"hardLimit": None, "action": "WARN_ONLY"}
+
+        await cc_manager.update_cost_control({"control_id": "cc_1", "control_data": body})
+
+        mock_client.get_cost_control_by_id.assert_not_called()
+        mock_client.update_cost_control.assert_awaited_once_with("cc_1", body)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "body",
+        [{"action": "BLOCK", "hardLimit": 900}, {"hardLimit": 900}, {"warnThreshold": None}],
+        ids=["block_with_cap", "new_cap", "other_field"],
+    )
+    async def test_an_update_that_keeps_a_cap_is_sent_without_a_read(self, cc_manager, mock_client, body):
+        mock_client.update_cost_control.return_value = {"id": "cc_1"}
+
+        await cc_manager.update_cost_control({"control_id": "cc_1", "control_data": body})
+
+        mock_client.get_cost_control_by_id.assert_not_called()
+        mock_client.update_cost_control.assert_awaited_once_with("cc_1", body)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("hard_limit", [0, -1], ids=["zero", "negative"])
+    @pytest.mark.parametrize("action", [{}, {"action": "BLOCK"}], ids=["cap_only", "with_block"])
+    async def test_a_cap_of_zero_or_less_is_sent_unread_for_the_platform_to_refuse(
+        self, cc_manager, mock_client, hard_limit, action
+    ):
+        """CostControlService.validateThreshold answers 400 for a hardLimit of zero or less."""
+        mock_client.update_cost_control.side_effect = ReveniumAPIError(
+            "hardLimit must be greater than 0", status_code=400
+        )
+        body = {**action, "hardLimit": hard_limit}
+
+        with pytest.raises(ReveniumAPIError):
+            await cc_manager.update_cost_control({"control_id": "cc_1", "control_data": body})
+
+        mock_client.get_cost_control_by_id.assert_not_called()
+        mock_client.update_cost_control.assert_awaited_once_with("cc_1", body)
+
+    @pytest.mark.asyncio
+    async def test_switching_a_capped_control_to_block_is_sent(self, cc_manager, mock_client):
+        mock_client.get_cost_control_by_id.return_value = {"id": "cc_1", "action": "WARN_ONLY", "hardLimit": 500}
+        mock_client.update_cost_control.return_value = {"id": "cc_1"}
+
+        await cc_manager.update_cost_control({"control_id": "cc_1", "control_data": {"action": "BLOCK"}})
+
+        mock_client.update_cost_control.assert_awaited_once_with("cc_1", {"action": "BLOCK"})
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [400, 403, 404])
+    async def test_a_control_the_read_cannot_find_is_not_found(self, cc_manager, mock_client, status):
+        mock_client.get_cost_control_by_id.side_effect = ReveniumAPIError("boom", status_code=status)
+
+        with pytest.raises(ToolError) as refusal:
+            await cc_manager.update_cost_control(
+                {"control_id": "cc_missing", "control_data": {"hardLimit": None}}
+            )
+
+        assert refusal.value.error_code == ErrorCodes.RESOURCE_NOT_FOUND
+        mock_client.update_cost_control.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "body", [{"hardLimit": None}, {"action": "BLOCK"}], ids=["clear_cap", "set_block"]
+    )
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            ReveniumAPIError("down", status_code=503),
+            ReveniumAPIError("Request timed out"),
+        ],
+        ids=["server_error", "no_answer"],
+    )
+    async def test_an_update_only_the_stored_control_could_clear_is_refused_when_it_cannot_be_read(
+        self, cc_manager, mock_client, body, failure
+    ):
+        """The platform's PATCH accepts hardLimit null on a BLOCK control, so it cannot be left to decide."""
+        mock_client.get_cost_control_by_id.side_effect = failure
+
+        with pytest.raises(ToolError) as refusal:
+            await cc_manager.update_cost_control({"control_id": "cc_1", "control_data": body})
+
+        assert refusal.value.field == "control_id"
+        assert "'cc_1' could not be read" in refusal.value.message
+        assert "Nothing was sent" in refusal.value.message
+        assert "'action': 'WARN_ONLY', 'hardLimit': None" in " ".join(refusal.value.suggestions)
+        mock_client.update_cost_control.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_read_that_answers_no_control_is_refused_as_unreadable(self, cc_manager, mock_client):
+        mock_client.get_cost_control_by_id.return_value = []
+
+        with pytest.raises(ToolError) as refusal:
+            await cc_manager.update_cost_control({"control_id": "cc_1", "control_data": {"hardLimit": None}})
+
+        assert "'cc_1' could not be read" in refusal.value.message
+        mock_client.update_cost_control.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_registered_tool_flags_the_refusal_and_sends_nothing(self, cc_mgmt, mock_client):
+        mock_client.get_cost_control_by_id.return_value = {"id": "cc_1", "action": "BLOCK", "hardLimit": 500}
+        cc_mgmt.get_client = AsyncMock(return_value=mock_client)
+
+        with pytest.raises(ToolError) as refusal:
+            await cc_mgmt.handle_action("update", {"control_id": "cc_1", "control_data": {"hardLimit": None}})
+
+        assert refusal.value.field == "control_data.hardLimit"
+        mock_client.update_cost_control.assert_not_called()
+
 
 class TestNotificationEmailsDocumentation:
     """notificationEmails is discoverable on control_data with its PATCH rule."""
@@ -1041,12 +1255,14 @@ class TestDepartmentDocumentationSurface:
         assert "parent_department_id" in schema["properties"]
 
     @pytest.mark.asyncio
-    async def test_department_is_documented_as_cost_control_only(self, cc_mgmt):
-        """BACK-2760 closed with the alert/anomaly API throwing on DEPARTMENT, so
-        the tool that teaches the dimension must also fence it off."""
+    async def test_department_on_alerts_is_fenced_to_the_two_budget_shapes(self, cc_mgmt):
+        """The platform admits DEPARTMENT on an alert only as one filter or as a grouping
+        with no filters (DepartmentAlertGate, BACK-5706); everything wider stays here."""
         caps = await cc_mgmt._get_tool_capabilities()
         rendered = json.dumps([c.description for c in caps])
         assert "manage_alerts" in rendered
+        assert DEPARTMENT_ALERT_FORMS in rendered
+        assert "refuses DEPARTMENT on any other alert" in rendered
         assert "cost-control-only" in rendered
 
     @pytest.mark.asyncio

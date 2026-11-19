@@ -546,6 +546,35 @@ class TestCreateWithSubscription:
         client.create_product.assert_called_once()
         client.create_subscription.assert_called_once()
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("up_to_key", ["up_to", "upTo"])
+    async def test_an_unlimited_plan_tier_reaches_the_platform_unbounded(self, up_to_key):
+        """BACK-6000: the platform allows one unlimited tier per tier list, so the
+        plan keeps its own next to the added rating aggregation's."""
+        client = _make_client()
+        mgr = _make_hierarchy_manager(client)
+        self._setup_happy_path(mgr, client)
+        plan_tiers = [
+            {"name": "Included", up_to_key: 1000, "flat_amount": "29.99"},
+            {"name": "Overage", up_to_key: None, "unit_amount": "0.01"},
+        ]
+        product_data = _valid_product_data()
+        product_data["plan"]["tiers"] = [dict(tier) for tier in plan_tiers]
+
+        with patch(
+            "src.revenium_mcp_server.tools_decomposed.product_management.get_config_value",
+            return_value="owner_123",
+        ):
+            await mgr.create_with_subscription(
+                {"product_data": product_data, "subscription_data": _valid_subscription_data()}
+            )
+
+        sent_plan = client.create_product.call_args[0][0]["plan"]
+        assert sent_plan["tiers"] == plan_tiers
+        assert sent_plan["tiers"][-1][up_to_key] is None
+        (aggregation,) = sent_plan["ratingAggregations"]
+        assert [tier["up_to"] for tier in aggregation["tiers"]] == [None]
+
     async def _create_with_subscription(self, mgr):
         with patch(
             "src.revenium_mcp_server.tools_decomposed.product_management.get_config_value",
@@ -1092,27 +1121,6 @@ class TestCreateWithSubscription:
 
         call_args = client.create_product.call_args[0][0]
         assert call_args["plan"]["ratingAggregations"][0]["name"] == "Custom"
-
-    @pytest.mark.asyncio
-    async def test_unlimited_tier_modified(self):
-        """Tiers with up_to=None get modified to large limit."""
-        client = _make_client()
-        mgr = _make_hierarchy_manager(client)
-        self._setup_happy_path(mgr, client)
-
-        pd = _valid_product_data()
-        pd["plan"]["tiers"] = [{"name": "Unlimited", "up_to": None, "unit_amount": "0.01"}]
-
-        with patch(
-            "src.revenium_mcp_server.tools_decomposed.product_management.get_config_value",
-            return_value=None,
-        ):
-            await mgr.create_with_subscription(
-                {"product_data": pd, "subscription_data": _valid_subscription_data()}
-            )
-
-        call_args = client.create_product.call_args[0][0]
-        assert call_args["plan"]["tiers"][0]["up_to"] == 1000000
 
     @pytest.mark.asyncio
     async def test_team_id_auto_populated(self):

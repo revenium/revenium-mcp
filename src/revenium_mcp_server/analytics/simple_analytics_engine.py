@@ -19,6 +19,7 @@ from .response_formatter import ResponseFormatter
 from .envelope_reads import with_unread_pages_notice
 from .paging import page_of_rows
 from .report_reads import (
+    UNPAIRED_ANALYTICS_HOST_ADVICE,
     blames_unpaired_analytics_host,
     fails_whole_call,
     is_server_configuration_error,
@@ -60,16 +61,12 @@ _READ_CONFIGURATION_ADVICE = [
     "The server's configuration stopped the read before any request was sent",
     "Ask the server's administrator to correct the setting the error names",
 ]
-_UNPAIRED_ANALYTICS_HOST_ADVICE = [
-    "Every read this server sends to the analytics host is refused the same way until "
-    "REVENIUM_APP_BASE_URL names the analytics host of its platform",
-]
 
 
 def _read_failure_advice(error: Exception, retry_advice: List[str]) -> List[str]:
     """Configuration, credential or permission advice when the failure is one, else the read's own retry advice."""
     if blames_unpaired_analytics_host(error):
-        return _UNPAIRED_ANALYTICS_HOST_ADVICE
+        return UNPAIRED_ANALYTICS_HOST_ADVICE
     if isinstance(error, TeamIdUnavailableError) or is_server_configuration_error(error):
         return _READ_CONFIGURATION_ADVICE
     if rejects_credential(error):

@@ -15,7 +15,12 @@ from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
-from .alert_operators import CHANGE_OPERATORS, FILTER_LIST_OPERATOR, validate_filter_rows
+from .alert_operators import (
+    CHANGE_OPERATORS,
+    FILTER_LIST_OPERATOR,
+    INCLUDE_DESCENDANTS_SPELLINGS,
+    validate_filter_rows,
+)
 from .exceptions import InvalidInputError, ValidationError
 
 TIME_WINDOW_FORMAT = re.compile(r"^\d+[smhd]$")
@@ -105,6 +110,57 @@ def _refuse_unknown_window(window: Any, accepted: List[str]) -> NoReturn:
         suggestions=[f"Use one of: {', '.join(accepted)}"],
         examples={"accepted_time_windows": accepted},
     )
+
+
+_DIMENSION_FORMAT_ROW = "{'dimension': 'MODEL', 'operator': 'IS', 'value': 'gpt-4'}"
+_FIELD_FORMAT_ROW = "{'field': 'model', 'operator': 'is', 'value': 'gpt-4'}"
+
+
+def _names(row: Dict[str, Any], key: str) -> bool:
+    return row.get(key) is not None and str(row[key]).strip() != ""
+
+
+def _is_dimension_format_row(row: Dict[str, Any]) -> bool:
+    return _names(row, "dimension") and not _names(row, "field")
+
+
+def _refuse_a_row_without_one_dimension(row: Dict[str, Any]) -> None:
+    from .common.error_handling import create_structured_validation_error
+
+    names_dimension, names_field = _names(row, "dimension"), _names(row, "field")
+    if names_dimension != names_field:
+        return
+    problem = "names its dimension twice" if names_dimension else "names no dimension"
+    raise create_structured_validation_error(
+        message=(
+            f"Filter row {row!r} {problem}: a row carries either 'dimension' (the API's "
+            "shape) or 'field', never both and never neither. Nothing was sent."
+        ),
+        field="filters",
+        value=row,
+        suggestions=[
+            f"API shape: {_DIMENSION_FORMAT_ROW}",
+            f"Or the field shape: {_FIELD_FORMAT_ROW}",
+        ],
+    )
+
+
+def _refuse_a_field_row_without_text_names(row: Dict[str, Any]) -> None:
+    from .common.error_handling import create_structured_validation_error
+
+    for key in ("field", "operator"):
+        named = row.get(key)
+        if isinstance(named, str) and named.strip():
+            continue
+        raise create_structured_validation_error(
+            message=(
+                f"Filter row {row!r} has no text in '{key}': a field-format row names "
+                "its field and its operator as non-blank strings. Nothing was sent."
+            ),
+            field="filters",
+            value=row,
+            suggestions=[f"Field shape: {_FIELD_FORMAT_ROW}"],
+        )
 
 
 class InputValidator:
@@ -724,20 +780,35 @@ class InputValidator:
         return validated_thresholds
 
     @staticmethod
-    def _convert_filters_to_api_format(filters: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Convert user-friendly filters to API format.
+    def convert_filters_to_api_format(filters: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Bring filter rows of either accepted shape to API format.
+
+        A field-format row is converted:
+            {"field": "organization", "operator": "contains", "value": "acme"}
+            -> {"dimension": "ORGANIZATION", "operator": "CONTAINS", "value": "acme"}
+        Its ``field`` and ``operator`` must be non-blank strings, or the row is
+        refused (``_refuse_a_field_row_without_text_names``).
+
+        A dimension-format row (``dimension`` present, no ``field``) is already
+        in API format and is passed through as written. A row naming neither
+        ``dimension`` nor ``field``, or both, is refused
+        (``_refuse_a_row_without_one_dimension``). Every row then goes through
+        ``validate_filter_rows``, which refuses a row that is not a dictionary.
+
+        Every alert write that carries filter rows (create with ``detection_rules``,
+        a direct ``anomaly_data`` create, and update) sends them through here, so
+        the row-shape rule does not depend on which shape the first row has.
 
         Args:
-            filters: List of user-friendly filter dictionaries
+            filters: Filter rows in field format, dimension format, or a mix
 
         Returns:
             List of API-compatible filter dictionaries
 
-        Expected user format:
-            {"field": "organization", "operator": "contains", "value": "acme"}
-
-        API format:
-            {"dimension": "ORGANIZATION", "operator": "CONTAINS", "value": "acme"}
+        Raises:
+            ToolError: When a row names neither or both of ``dimension`` and ``field``,
+                or a field-format row has no text in ``field`` or ``operator``
+            ValidationError: When a row is not a dictionary, or breaks a row rule
         """
         if not filters:
             return []
@@ -770,8 +841,15 @@ class InputValidator:
 
         for filter_data in filters:
             if not isinstance(filter_data, dict):
+                api_filters.append(filter_data)
                 continue
 
+            _refuse_a_row_without_one_dimension(filter_data)
+            if _is_dimension_format_row(filter_data):
+                api_filters.append(filter_data)
+                continue
+
+            _refuse_a_field_row_without_text_names(filter_data)
             field = filter_data.get("field", "").lower()
             operator = filter_data.get("operator", "").lower()
             value = filter_data.get("value")
@@ -801,6 +879,10 @@ class InputValidator:
                     "operator": api_operator,
                     "value": None if value is None else str(value),
                 }
+
+            for spelling in INCLUDE_DESCENDANTS_SPELLINGS:
+                if spelling in filter_data:
+                    api_filter[spelling] = filter_data[spelling]
 
             api_filters.append(api_filter)
 
@@ -890,7 +972,7 @@ class InputValidator:
             "webhookConfigurations": user_data.get(
                 "webhook_configurations", []
             ),  # Correct field name
-            "filters": InputValidator._convert_filters_to_api_format(user_data.get("filters", [])),
+            "filters": InputValidator.convert_filters_to_api_format(user_data.get("filters", [])),
             "isPercentage": user_data.get("is_percentage", False),
             "triggerAfterPersistsDuration": user_data.get("trigger_after_persists_duration", ""),
         }

@@ -9,7 +9,7 @@ Based on research of leading MCP servers (Supabase, Notion, Spring AI).
 
 import json
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from revenium_mcp_server.models import BillingPeriod, PlanType
 
@@ -242,15 +242,6 @@ class ProductValidationEngine:
         plan = data.get("plan")
         if not isinstance(plan, dict):
             return []
-        located = [("plan.tiers", plan.get("tiers"))]
-        for key in APIFieldMapper.RATING_AGGREGATION_KEYS:
-            aggregations = plan.get(key)
-            if isinstance(aggregations, list):
-                located += [
-                    (f"plan.{key}[{index}].tiers", aggregation.get("tiers"))
-                    for index, aggregation in enumerate(aggregations)
-                    if isinstance(aggregation, dict)
-                ]
         return [
             ValidationError(
                 field,
@@ -258,7 +249,7 @@ class ProductValidationEngine:
                 "Tiers must be a list of tier objects",
                 'Wrap the tier in a list: "tiers": [{"name": "Tier 1", "up_to": null, "unit_amount": "0.01"}]',
             )
-            for field, tiers in located
+            for field, tiers in _tier_lists(plan)
             if tiers is not None and not isinstance(tiers, list)
         ]
 
@@ -523,6 +514,7 @@ class ProductValidationEngine:
         # Check if tiers are properly configured
         if "plan" in data and isinstance(data["plan"], dict):
             plan_data = data["plan"]
+            errors.extend(_more_than_one_unlimited_tier_errors(plan_data))
             tiers = []  # Initialize tiers to prevent UnboundLocalError
             if "tiers" in plan_data and isinstance(plan_data["tiers"], list):
                 tiers = plan_data["tiers"]
@@ -538,32 +530,6 @@ class ProductValidationEngine:
                         )
                     )
                 else:
-                    # CRITICAL BUSINESS RULE: Only one tier can be unlimited (no up_to) across ALL tiers in ALL aggregations
-                    unlimited_tiers = [
-                        i for i, tier in enumerate(tiers) if tier.get("up_to") is None
-                    ]
-
-                    # Count unlimited tiers in ratingAggregations as well
-                    total_unlimited_count = len(unlimited_tiers)
-                    rating_aggregations = plan_data.get("ratingAggregations", [])
-
-                    for agg_idx, aggregation in enumerate(rating_aggregations):
-                        agg_tiers = aggregation.get("tiers", [])
-                        for tier_idx, tier in enumerate(agg_tiers):
-                            if tier.get("up_to") is None:
-                                total_unlimited_count += 1
-
-                    if total_unlimited_count > 1:
-                        errors.append(
-                            ValidationError(
-                                field="plan.tiers + plan.ratingAggregations.tiers",
-                                value=f"Total unlimited tiers across all aggregations: {total_unlimited_count}",
-                                error="Cannot have more than one tier with unlimited usage (up_to is null) across ALL tiers in ALL aggregations",
-                                suggestion="Only ONE tier across the entire product can be unlimited. Use separate aggregations for different metering elements, each with limited tiers except one.",
-                                severity="error",
-                            )
-                        )
-
                     # BUSINESS RULE: Tier pricing validation
                     for i, tier in enumerate(tiers):
                         # Check for deprecated starting_from field
@@ -1149,6 +1115,47 @@ class ProductValidationEngine:
                 "PREVENTED" if validation_result.get("isError") else "FAILED_TO_PREVENT"
             ),
         }
+
+
+def _tier_lists(plan: Dict[str, Any]) -> List[Tuple[str, Any]]:
+    """Each tier list the platform checks on its own: the plan's, then each aggregation's, under either key."""
+    located = [("plan.tiers", plan.get("tiers"))]
+    for key in APIFieldMapper.RATING_AGGREGATION_KEYS:
+        aggregations = plan.get(key)
+        if isinstance(aggregations, list):
+            located += [
+                (f"plan.{key}[{index}].tiers", aggregation.get("tiers"))
+                for index, aggregation in enumerate(aggregations)
+                if isinstance(aggregation, dict)
+            ]
+    return located
+
+
+def _unlimited_tier_count(tiers: Any) -> int:
+    if not isinstance(tiers, list):
+        return 0
+    return sum(
+        1
+        for tier in tiers
+        if isinstance(tier, dict) and _internal_tier(tier).get("up_to") is None
+    )
+
+
+def _more_than_one_unlimited_tier_errors(plan: Dict[str, Any]) -> List[ValidationError]:
+    """The platform's rule, per tier list: at most one tier whose upTo (or up_to) is null."""
+    return [
+        ValidationError(
+            field=field,
+            value=count,
+            error="Cannot have more than one tier where up_to is null (unlimited usage) in one tier list",
+            suggestion=(
+                "Give every tier in this list but the last an up_to value. The plan's tiers and "
+                "each rating aggregation's tiers may each have one unlimited tier."
+            ),
+        )
+        for field, tiers in _tier_lists(plan)
+        if (count := _unlimited_tier_count(tiers)) > 1
+    ]
 
 
 def _internal_tier(tier: Any) -> Any:

@@ -1329,7 +1329,7 @@ class ProductValidator:
                         "published": "Publishes the product (unless product_data sets published to false) so it can take the subscription",
                         "metering": "Adds a free usage tier on the first metering element found in your organization (refuses if there is none)",
                         "system_fields": "Auto-populates ownerId and teamId; organizationId is required in subscription_data",
-                        "tier_structure": "Ensures proper tier configuration (single unlimited tier)",
+                        "tier_structure": "Sends the plan's tiers as written; the free usage tier is in its own rating aggregation, so the plan may still end in an unlimited tier",
                         "required_fields": "Adds all 15+ required subscription fields with defaults",
                     },
                     "workflow_notes": {
@@ -1361,9 +1361,9 @@ class ProductValidator:
                         },
                         "validation_failed": {
                             "error": "Product validation failed - tier structure issues",
-                            "cause": "Multiple unlimited tiers across plan.tiers and ratingAggregations",
-                            "solution": "This is automatically handled by tier structure optimization",
-                            "note": "Implementation ensures only one unlimited tier exists",
+                            "cause": "More than one unlimited tier (up_to null) in one tier list",
+                            "solution": "Give every tier in that list but the last an up_to value",
+                            "note": "plan.tiers and each rating aggregation's tiers may each have one unlimited tier",
                         },
                     },
                     "when_to_use": {
@@ -2504,17 +2504,6 @@ class ProductHierarchyManager:
         ):
             default_element_id = await self._organization_metering_element_id()
 
-            # Remove unlimited tier from plan.tiers to avoid conflict
-            if "plan" in product_data and "tiers" in product_data["plan"]:
-                for tier in product_data["plan"]["tiers"]:
-                    if APIFieldMapper.map_tier_fields_to_internal(tier).get("up_to") is None:
-                        # Make this tier limited to avoid unlimited tier conflict
-                        tier["upTo" if "upTo" in tier else "up_to"] = 1000000
-                        logger.info(
-                            "Modified plan tier to be limited to avoid unlimited tier conflict"
-                        )
-
-            # Add rating aggregation with proper structure
             product_data["plan"]["ratingAggregations"] = [
                 {
                     "name": f"Usage Billing for {product_data.get('name', 'Product')}",
@@ -2524,7 +2513,7 @@ class ProductHierarchyManager:
                     "tiers": [
                         {
                             "name": "Usage Tier",
-                            "up_to": None,  # This will be the only unlimited tier
+                            "up_to": None,
                             "unit_amount": "0.0",  # Free usage for basic functionality
                             "flat_amount": None,
                         }
@@ -3374,7 +3363,7 @@ create_with_subscription(
 # Sources: Assigns first available source from your account
 # Metering: Adds a free usage tier on the first metering element found in your organization
 # System fields: Auto-populates ownerId and teamId (organizationId is required)
-# Tier structure: Ensures proper configuration (single unlimited tier)
+# Tier structure: Sends the plan's tiers as written; the plan may still end in an unlimited tier
 # Required fields: Adds all 15+ subscription fields with defaults
 ```"""
 

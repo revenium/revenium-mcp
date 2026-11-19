@@ -352,6 +352,8 @@ class ToolConfigurationRegistry:
             invoice_number: Optional[str] = None,
             pay_states: Optional[Union[List[str], str]] = None,
             states: Optional[Union[List[str], str]] = None,
+            payment_sources: Optional[Union[List[str], str]] = None,
+            failed_payments_only: Optional[Union[bool, str]] = None,
             starting_amount: Optional[Union[float, str]] = None,
             ending_amount: Optional[Union[float, str]] = None,
             minimum: Optional[Union[float, str]] = None,
@@ -442,6 +444,8 @@ class ToolConfigurationRegistry:
                 "invoice_number": invoice_number,
                 "pay_states": pay_states,
                 "states": states,
+                "payment_sources": payment_sources,
+                "failed_payments_only": failed_payments_only,
                 "starting_amount": starting_amount,
                 "ending_amount": ending_amount,
                 "minimum": minimum,
@@ -511,11 +515,12 @@ class ToolConfigurationRegistry:
                 "include_pull_requests",
                 "include_descendants",
                 "assisted_only",
+                "failed_payments_only",
             ]
             arguments = preprocess_boolean_parameters(arguments, boolean_params)
 
             # ARRAY PREPROCESSING: Convert string array parameters to actual Python lists.
-            array_params = ["include_dimensions", "providers", "agents", "pay_states", "states"]
+            array_params = ["include_dimensions", "providers", "agents", "pay_states", "states", "payment_sources"]
             arguments = _json_list_arguments(arguments, array_params)
 
             # Remove None values

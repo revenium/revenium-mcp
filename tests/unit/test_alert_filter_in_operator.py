@@ -18,6 +18,7 @@ from src.revenium_mcp_server.alert_operators import (
     FILTER_LIST_OPERATOR,
     FILTER_OPERATORS,
     normalize_filter_operator,
+    validate_filter_rows,
 )
 from src.revenium_mcp_server.schema.alert_schema import AlertSchemaDiscovery
 from src.revenium_mcp_server.schema_discovery import SchemaDiscoveryEngine
@@ -25,7 +26,6 @@ from src.revenium_mcp_server.validators import InputValidator
 from src.revenium_mcp_server.alerts.anomaly_manager import (
     AnomalyManager,
     format_filter_row,
-    validate_filter_rows,
 )
 from src.revenium_mcp_server.common.error_handling import ToolError
 from src.revenium_mcp_server.exceptions import ValidationError
@@ -164,10 +164,12 @@ class TestValidateFilterRows:
         )
         assert rows == [{"dimension": "PROVIDER", "operator": "IS", "value": "openai"}]
 
-    def test_user_friendly_rows_pass_through_untouched(self):
-        """Rows without `dimension` belong to _convert_filters_to_api_format."""
+    def test_a_row_without_a_dimension_is_refused_not_passed_through(self):
+        """Every alert write converts its rows first, so a row reaching here without one is scoped to nothing."""
         friendly = [{"field": "provider", "operator": "contains", "value": "openai"}]
-        assert validate_filter_rows(friendly) == friendly
+        with pytest.raises(ValidationError) as excinfo:
+            validate_filter_rows(friendly)
+        assert "dimension" in str(excinfo.value)
 
     def test_unknown_keys_are_carried_through(self):
         rows = validate_filter_rows(
@@ -329,13 +331,13 @@ class TestUserFriendlyFilterConversion:
     """The friendly field/operator/value shape lands on the same row check."""
 
     def test_in_row_converts_to_an_api_row(self):
-        rows = InputValidator._convert_filters_to_api_format(
+        rows = InputValidator.convert_filters_to_api_format(
             [{"field": "model", "operator": "in", "values": ["gpt-4", "gpt-5"]}]
         )
         assert rows == [{"dimension": "MODEL", "operator": "IN", "values": ["gpt-4", "gpt-5"]}]
 
     def test_one_of_is_the_same_operator(self):
-        rows = InputValidator._convert_filters_to_api_format(
+        rows = InputValidator.convert_filters_to_api_format(
             [{"field": "provider", "operator": "one_of", "values": ["openai", "anthropic"]}]
         )
         assert rows == [
@@ -344,21 +346,21 @@ class TestUserFriendlyFilterConversion:
 
     def test_in_without_values_is_rejected(self):
         with pytest.raises(ValidationError) as excinfo:
-            InputValidator._convert_filters_to_api_format(
+            InputValidator.convert_filters_to_api_format(
                 [{"field": "model", "operator": "in"}]
             )
         assert excinfo.value.details["field"] == "values"
 
     def test_in_with_an_empty_list_is_rejected(self):
         with pytest.raises(ValidationError) as excinfo:
-            InputValidator._convert_filters_to_api_format(
+            InputValidator.convert_filters_to_api_format(
                 [{"field": "model", "operator": "in", "values": []}]
             )
         assert excinfo.value.details["field"] == "values"
 
     def test_in_with_a_blank_entry_is_rejected(self):
         with pytest.raises(ValidationError) as excinfo:
-            InputValidator._convert_filters_to_api_format(
+            InputValidator.convert_filters_to_api_format(
                 [{"field": "model", "operator": "in", "values": [""]}]
             )
         assert excinfo.value.details["field"] == "values"
@@ -368,13 +370,13 @@ class TestUserFriendlyFilterConversion:
         row, and a convenience surface that guessed would teach a shape its
         sibling rejects."""
         with pytest.raises(ValidationError) as excinfo:
-            InputValidator._convert_filters_to_api_format(
+            InputValidator.convert_filters_to_api_format(
                 [{"field": "model", "operator": "in", "value": "gpt-4"}]
             )
         assert excinfo.value.details["field"] == "values"
 
     def test_scalar_rows_still_convert(self):
-        rows = InputValidator._convert_filters_to_api_format(
+        rows = InputValidator.convert_filters_to_api_format(
             [{"field": "provider", "operator": "contains", "value": "openai"}]
         )
         assert rows == [{"dimension": "PROVIDER", "operator": "CONTAINS", "value": "openai"}]

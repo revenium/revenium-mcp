@@ -335,6 +335,19 @@ class TestGetUcmCapabilities:
         assert result == {"field": "val"}
         svc.ucm.get_capabilities.assert_called_once_with("products")
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("auth_mode", ["clerk", "api_key"])
+    async def test_multi_customer_mode_answers_from_the_static_table(self, monkeypatch, auth_mode):
+        from src.revenium_mcp_server.capability_manager.static_capabilities import (
+            static_capabilities,
+        )
+
+        monkeypatch.setenv("AUTH_MODE", auth_mode)
+
+        result = await _make_service().get_ucm_capabilities("products")
+
+        assert result == await static_capabilities("products")
+
 
 # ---------------------------------------------------------------------------
 # validate_capability_value
@@ -356,6 +369,26 @@ class TestValidateCapabilityValue:
         svc.integration_helper.validate_capability_value.assert_called_once_with(
             "products", "status", "active"
         )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("value", "verdict"), [("USD", True), ("XYZ", False)])
+    async def test_multi_customer_mode_checks_the_static_table(self, monkeypatch, value, verdict):
+        monkeypatch.setenv("AUTH_MODE", "clerk")
+
+        result = await _make_service().validate_capability_value("products", "currencies", value)
+
+        assert result is verdict
+
+    @pytest.mark.asyncio
+    async def test_multi_customer_mode_refuses_a_capability_the_table_does_not_list(
+        self, monkeypatch
+    ):
+        from src.revenium_mcp_server.exceptions import ValidationError
+
+        monkeypatch.setenv("AUTH_MODE", "clerk")
+
+        with pytest.raises(ValidationError, match="not in the static capability set"):
+            await _make_service().validate_capability_value("products", "colours", "red")
 
 
 # ---------------------------------------------------------------------------

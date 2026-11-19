@@ -149,6 +149,7 @@ class TestManageCapabilitiesActions:
     @patch("src.revenium_mcp_server.tools_decomposed.manage_capabilities.ucm_integration_service")
     async def test_refresh_capabilities(self, mock_ucm, capabilities_tool):
         """refresh_capabilities returns refresh status."""
+        _ucm_running(mock_ucm)
         mock_ucm.refresh_all_capabilities = AsyncMock(
             return_value={"status": "refreshed", "types_updated": 5}
         )
@@ -189,6 +190,7 @@ class TestManageCapabilitiesActions:
     @patch("src.revenium_mcp_server.tools_decomposed.manage_capabilities.ucm_integration_service")
     async def test_manage_capabilities_action(self, mock_ucm, capabilities_tool):
         """manage_capabilities action returns all capabilities overview."""
+        _ucm_running(mock_ucm)
         mock_ucm.get_all_capabilities = AsyncMock(
             return_value={"products": {}, "subscriptions": {}}
         )

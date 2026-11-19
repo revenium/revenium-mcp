@@ -1018,9 +1018,10 @@ class TestSimpleParseAlertText:
         result = self._parse("alert at $10,000")
         assert result["threshold"] == 10000.0
 
-    def test_default_threshold_when_no_number(self):
-        result = self._parse("alert on high usage")
-        assert result["threshold"] == 100.0
+    def test_a_text_without_a_number_is_refused_instead_of_given_a_threshold(self):
+        with pytest.raises(ToolError) as refusal:
+            self._parse("alert on high usage")
+        assert "could not read a threshold" in refusal.value.message
 
     @pytest.mark.parametrize(
         "text, threshold, is_percentage",
@@ -1032,7 +1033,6 @@ class TestSimpleParseAlertText:
             ("alert at 500", 500.0, False),
             ("something weird 42", 42.0, False),
             ("alert at 99.5", 99.5, False),
-            ("alert on high usage", 100.0, False),
             ("daily budget 500 over 24 hours", 500.0, False),
             ("weekly spending budget 2000 over 7 days", 2000.0, False),
             ("Alert when total cost budget 500 over 15m", 500.0, False),
@@ -1069,11 +1069,11 @@ class TestSimpleParseAlertText:
     # --- Name generation ---
 
     def test_short_text_name(self):
-        result = self._parse("budget alert")
-        assert result["name"] == "Auto-generated Alert: budget alert"
+        result = self._parse("budget alert 500")
+        assert result["name"] == "Auto-generated Alert: budget alert 500"
 
     def test_long_text_truncated(self):
-        long_text = "a" * 60
+        long_text = "a" * 60 + " 500"
         result = self._parse(long_text)
         assert result["name"].endswith("...")
         assert len(result["name"]) < 80

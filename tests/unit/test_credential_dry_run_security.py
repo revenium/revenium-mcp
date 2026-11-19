@@ -179,12 +179,12 @@ class TestSubscriberExistence:
         assert len(_issues(result, "subscriberId", ValidationSeverity.WARNING)) == 1
 
     @pytest.mark.asyncio
-    async def test_the_subscriber_id_is_sent_as_one_path_segment(self, mock_client):
+    async def test_the_subscriber_id_is_handed_to_the_client_as_given(self, mock_client):
         mock_client.get_subscriber_by_id = AsyncMock(return_value={"id": "../x"})
 
         await self._preview(mock_client, subscriberId="../x")
 
-        mock_client.get_subscriber_by_id.assert_awaited_once_with("..%2Fx")
+        mock_client.get_subscriber_by_id.assert_awaited_once_with("../x")
 
     @pytest.mark.asyncio
     async def test_a_blank_subscriber_is_not_looked_up(self, mock_client):
@@ -218,6 +218,29 @@ def _real_client_answering(response):
         client.client, "request", new_callable=AsyncMock, return_value=response
     )
     return client, patcher
+
+
+class TestSubscriberIdOnTheWire:
+    """BACK-4665: the client encodes the id once, so the preview looks up the subscriber it names."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "subscriber_id, segment",
+        [("../x", "..%2Fx"), ("a b", "a%20b"), ("a@b", "a%40b")],
+        ids=["slash", "space", "email_style"],
+    )
+    async def test_the_subscriber_lookup_sends_the_id_encoded_once(self, subscriber_id, segment):
+        request = httpx.Request("GET", "https://api.test.revenium.ai/x")
+        response = httpx.Response(200, request=request, json={"id": subscriber_id})
+        client, patcher = _real_client_answering(response)
+
+        with patcher as send:
+            result = await CredentialDryRunValidator(client).validate_create_operation(
+                {**_CREATE_DATA, "subscriberId": subscriber_id}
+            )
+
+        assert send.await_args.kwargs["url"].endswith(f"/profitstream/v2/api/subscribers/{segment}")
+        assert [issue for issue in result.validation_issues if issue.field == "subscriberId"] == []
 
 
 class TestMalformedSubscriberIdThroughTheClient:

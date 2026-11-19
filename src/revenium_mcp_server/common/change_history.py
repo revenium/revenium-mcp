@@ -104,7 +104,7 @@ def render_change_page(title: str, response: Any, page: Any) -> str:
 
 
 def render_change_summary(title: str, summary: Any) -> str:
-    """Who created the item and who changed it last, from its own change history."""
+    """Who created the item, who changed it last and why, from its own change history."""
     if not isinstance(summary, Mapping) or "historyStartsAt" not in summary:
         raise _unreadable_answer(title)
     fields: Mapping[str, Any] = _flattened(summary)
@@ -117,19 +117,30 @@ def render_change_summary(title: str, summary: Any) -> str:
         if created_at
         else "before change history began"
     )
-    last_changed_at = fields.get("lastChangedAt")
-    if last_changed_at:
-        last_changed = _when_by(last_changed_at, fields.get("lastChangedBy"))
-    else:
-        last_changed = "not since it was created" if created_at else "not since change history began"
     return "\n".join(
         [
             f"{title}:",
             f"- Created: {created}",
-            f"- Last changed: {last_changed}",
+            *_last_change_lines(fields, created=bool(created_at)),
             f"- History starts: {history_starts}",
         ]
     )
+
+
+def _last_change_lines(fields: Mapping[str, Any], *, created: bool) -> List[str]:
+    last_changed_at = fields.get("lastChangedAt")
+    if not last_changed_at:
+        since = "it was created" if created else "change history began"
+        return [f"- Last changed: not since {since}"]
+    lines = [f"- Last changed: {_when_by(last_changed_at, fields.get('lastChangedBy'))}"]
+    reason = _given_reason(fields.get("lastChangeReason"))
+    if reason:
+        lines.append(f"- Last change reason: {reason}")
+    return lines
+
+
+def _given_reason(reason: Any) -> Optional[str]:
+    return reason if isinstance(reason, str) and reason.strip() else None
 
 
 def _page_parts(title: str, response: Any) -> Tuple[Mapping[str, Any], Dict[str, Any], List[Any]]:
@@ -167,8 +178,8 @@ def _unreadable_entries_line(count: int) -> str:
 
 def _entry_lines(entry: Mapping[str, Any]) -> List[str]:
     lines = [f"- {_headline(entry)}"]
-    reason = entry.get("reason")
-    if isinstance(reason, str) and reason.strip():
+    reason = _given_reason(entry.get("reason"))
+    if reason:
         lines.append(f"  Reason: {reason}")
     settings = [s for s in entry.get("fieldChanges") or [] if isinstance(s, Mapping)]
     lines.extend(f"  {_setting_line(setting)}" for setting in settings)

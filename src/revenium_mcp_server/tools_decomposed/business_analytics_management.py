@@ -63,6 +63,7 @@ from ..analytics.savings_findings import SAVINGS_ASSISTANTS, SAVINGS_LEVELS, par
 from ..analytics.tool_cost_and_calls import TOOL_COST_AND_CALLS_DEFAULT_PAGE_SIZE
 from ..analytics.formatters.user_costs_formatter import UserCostsFormatter
 from ..analytics.formatters.base_formatter import BaseFormattingUtilities
+from ..analytics.report_reads import UNPAIRED_ANALYTICS_HOST_ADVICE, blames_unpaired_analytics_host
 from ..analytics.simple_analytics_engine import COST_SUMMARY_RETRY_ADVICE, SimpleAnalyticsEngine
 from ..analytics.envelope_reads import with_unread_pages_notice
 from ..analytics.paging import PageInfo, counted, pagination_lines, past_last_page_sentence
@@ -150,6 +151,7 @@ _DETECTION_NOUNS = {
 }
 #: get_coverage_ratio takes its own lower-case window names.
 COVERAGE_PERIOD_VALUES = ("24h", "7d", "30d", "90d", "custom")
+_COVERAGE_NAMED_PERIODS = tuple(value for value in COVERAGE_PERIOD_VALUES if value != "custom")
 
 _BILLING_DATE_FILTERS = ("start_date", "end_date")
 #: Statistical roll-ups accepted by `group`, and by `aggregation` as its alias.
@@ -248,6 +250,36 @@ class BusinessAnalyticsManagement(ToolBase):
     )
     business_category: ClassVar[str] = "Metering and Analytics Tools"
     tool_type: ClassVar[ToolType] = ToolType.ANALYTICS
+
+    _COVERAGE_CREDENTIAL_REFUSAL_HINT: ClassVar[str] = (
+        "- A 403 refuses this credential, not the feature: the message above names the cause "
+        "(for example a metering-scoped API key, or a credential that cannot view the team's "
+        "organization); use a credential that can view the team's organization"
+    )
+    _COVERAGE_UNPAIRED_HOST_TROUBLESHOOTING: ClassVar[List[str]] = [
+        "The refusal comes from this server's configuration, not from the credential: the "
+        "read went to an analytics host that does not belong to its platform",
+        *UNPAIRED_ANALYTICS_HOST_ADVICE,
+        "Ask the server's administrator to correct REVENIUM_APP_BASE_URL; trying again with "
+        "other arguments is refused the same way",
+    ]
+
+    @classmethod
+    def _coverage_failure_guidance(cls, error: Exception) -> str:
+        """The troubleshooting the coverage refusal ends with, for the failure it reports."""
+        if blames_unpaired_analytics_host(error):
+            return "**Troubleshooting:**\n" + "\n".join(
+                f"- {line}" for line in cls._COVERAGE_UNPAIRED_HOST_TROUBLESHOOTING
+            )
+        return f"""**Troubleshooting:**
+- `period` ({_values(_COVERAGE_NAMED_PERIODS)}) or start_date/end_date for a calendar range; with neither, this action reads {cls._COVERAGE_DEFAULT_PERIOD}
+- start_date/end_date: the platform refuses an end after today and a range longer than it allows; its message is shown above
+- The team is resolved from your credentials — no team parameter is needed
+- Use `get_filter_options(dimension='providers')` to check the provider name you passed
+{cls._COVERAGE_CREDENTIAL_REFUSAL_HINT}
+
+**For Help:**
+- Use `get_capabilities()` to check current status"""
 
     def _format_api_error_details(self, error: Exception) -> str:
         """The platform's cleaned-up error message and HTTP status, never its raw body."""
@@ -633,6 +665,8 @@ If you're seeing this error, please report it as it indicates a reliability issu
    - Read-only billing listings; numeric-honest amounts (missing → 'n/a', never a fabricated 0)
    - start_date / end_date on all three: yyyy-MM-dd calendar days (the whole UTC day, both days included) or ISO-8601 instants with Z or an offset; pass both or neither
    - starting_amount / ending_amount on list_invoices: whole numbers, 0 or more (a fraction is refused, a blank is ignored)
+   - failed_payments_only=true on list_invoices lists only the invoices whose payment was attempted and failed; payment_sources narrows it to EXTERNAL_PAYMENT_NOTIFICATION, PAYMENT_VIA_PAYMENT_PROVIDER or INVOICE_ONLY_NO_PAYMENT (any other value is refused)
+   - Each list_invoices row ends with when each invoice was generated, when the platform sends it; start_date / end_date on list_invoices match that generation time, not the billing period the row prints
    - list_invoices / list_refunds: page-numbered; list_period_charges: cursor/keyset (no page param)
    - Every row of the page is printed (size 1 to 100); list_invoices and list_refunds end with the page, the total and the call for the next page (repeat the same filters with it)
 
@@ -707,7 +741,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
    - meteredBasis, when present, names the metered window, the store it was read from, and any transform applied to the figures
    - Coding-assistant usage is a yes/no PRESENCE FLAG, never an amount; 'no' does not prove absence, and a check the platform reports as incomplete (codingAssistantUsageUnknown) renders as unknown
    - A provider row with a revisionWindowStart says its figures from that day onward may still be restated
-   - Requires the coding-assistant-separation-active feature: without it the platform answers 403, not a reduced report
+   - A 403 refuses the credential, not the feature: the platform answers coverage to any credential that can view the team's organization. A refusal that names REVENIUM_APP_BASE_URL comes from this server's configuration, not from the credential
 
 6g. **get_filter_options**
    - Enumerate the valid filter values for a dimension (providers, models, agents, tasks, and the rest)
@@ -1229,8 +1263,8 @@ window on every page.
   "states": ["FINALIZED"]
 }
 ```
-**Purpose**: List invoices with a compact per-entry line (number, state, pay status, total amount + currency code, period). Amounts are numeric-honest: a missing/non-numeric total renders `n/a`, never a fabricated `0`. A billed amount prints as charged, rounded to six decimals (two significant digits when smaller), so a cost an analytics report shows as $0.23 can read 0.232 USD here. Every row of the page is printed, and the answer ends with the page, the total and the page and size to pass next (repeat the same filters).
-**Parameters** (all optional): `page`, `size`, `invoice_number`, `start_date`, `end_date`, `pay_states`, `states`, `starting_amount`, `ending_amount`
+**Purpose**: List invoices with a compact per-entry line (number, state, pay status, total amount + currency code, billing period, and when the invoice was generated). `start_date` and `end_date` match the generation time, not the billing period. `failed_payments_only=true` keeps only the invoices whose payment was attempted and failed; `payment_sources` takes EXTERNAL_PAYMENT_NOTIFICATION, PAYMENT_VIA_PAYMENT_PROVIDER or INVOICE_ONLY_NO_PAYMENT. Amounts are numeric-honest: a missing/non-numeric total renders `n/a`, never a fabricated `0`. A billed amount prints as charged, rounded to six decimals (two significant digits when smaller), so a cost an analytics report shows as $0.23 can read 0.232 USD here. Every row of the page is printed, and the answer ends with the page, the total and the page and size to pass next (repeat the same filters).
+**Parameters** (all optional): `page`, `size`, `invoice_number`, `start_date`, `end_date`, `pay_states`, `states`, `failed_payments_only`, `payment_sources`, `starting_amount`, `ending_amount`
 
 ### list_refunds
 ```json
@@ -1446,7 +1480,7 @@ window on every page.
 **Purpose**: Provider metering coverage — how much of the providers' billed spend Revenium actually metered, the hidden (unmetered) spend, and the per-provider breakdown.
 **Parameters**:
 - `provider` (optional): a single provider name; omit to cover every connected provider
-**Scope**: the team is resolved from your credentials. `period` picks a rolling comparison window: `24h`, `7d`, `30d` (default) or `90d`. `start_date` and `end_date` alone pick a calendar range instead (`get_coverage_ratio(start_date='2026-09-01', end_date='2026-09-30')`); a named period sent with dates is refused, and `custom` with both dates reads the same range. Each date is a `yyyy-MM-dd` calendar day, which covers the whole UTC day with both ends included (`start_date='2026-09-01'`, `end_date='2026-09-30'` is all of September), or an ISO-8601 instant with `Z` or an offset, which is converted to UTC. The `period` value is passed through verbatim, so a newer platform period also works.
+**Scope**: the team is resolved from your credentials. `period` picks a rolling comparison window: `24h`, `7d`, `30d` (default) or `90d`. `start_date` and `end_date` alone pick a calendar range instead (`get_coverage_ratio(start_date='2026-09-01', end_date='2026-09-30')`); a named period sent with dates is refused, and `custom` with both dates reads the same range. Each date is a `yyyy-MM-dd` calendar day, which covers the whole UTC day with both ends included (`start_date='2026-09-01'`, `end_date='2026-09-30'` is all of September), or an ISO-8601 instant with `Z` or an offset, which is converted to UTC. Any other `period` is refused by the platform, which lists the values it accepts.
 **Reading the numbers**:
 - a coverage ratio of `n/a` is NOT zero coverage — `state` says which of `NO_INTEGRATION`, `ZERO_SPEND_PERIOD` or `DATA_UNAVAILABLE` produced it
 - `hiddenSpend` is billed-but-not-metered spend, so it is the gap to close, not additional cost; it can also be null
@@ -1461,7 +1495,7 @@ window on every page.
 - no amount carries a currency code: the report does not send one, so figures print bare rather than under an invented denomination
 - coding-assistant usage is a yes/no PRESENCE FLAG, never a dollar figure; `no` does not prove there was none. When the platform sets `codingAssistantUsageUnknown` (the check could not complete), the report or row renders `unknown` instead; an older platform build without that field reports an incomplete check as `no`
 - a `byProvider` row with a `revisionWindowStart` says that provider's figures from that day onward may still be restated; a row without one has final figures
-- the endpoint requires the coding-assistant-separation-active feature: teams without it get a 403 (a feature-availability answer, not a permissions problem)
+- a 403 means this credential may not read the team's coverage (for example a metering-scoped API key, or a credential that cannot view the team's organization); the report is not gated on a feature. A refusal that names REVENIUM_APP_BASE_URL is this server's analytics host setting, not the credential
 
 ### get_ai_assistant_team_medians
 ```json
@@ -2921,9 +2955,19 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
         "end_date": "endDate",
         "pay_states": "payStates",
         "states": "states",
+        "payment_sources": "paymentSources",
+        "failed_payments_only": "failedPaymentsOnly",
         "starting_amount": "startingAmount",
         "ending_amount": "endingAmount",
     }
+    # Mirrors the paymentSources enum of list_invoices in specs/openapi/hypercurrent.json (BACK-5956).
+    # Checked here, unlike pay_states and states, so a wrong value is refused with the
+    # accepted ones listed; a source the platform adds must be added here or it is refused.
+    _PAYMENT_SOURCES: ClassVar[Tuple[str, ...]] = (
+        "EXTERNAL_PAYMENT_NOTIFICATION",
+        "PAYMENT_VIA_PAYMENT_PROVIDER",
+        "INVOICE_ONLY_NO_PAYMENT",
+    )
     _REFUND_FILTER_MAP: ClassVar[Dict[str, str]] = {
         "query": "query",
         "start_date": "startDate",
@@ -3120,6 +3164,48 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
             whole[field] = exact
         return whole
 
+    def _with_payment_filters(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """The arguments with payment_sources in the platform's spelling and failed_payments_only kept only when true.
+
+        The platform documents only what failedPaymentsOnly=true does, so a
+        false is left out and the list answers as it did before the filter.
+        """
+        narrowed = dict(arguments)
+        if self._validate_optional_bool(arguments, "failed_payments_only") is not True:
+            narrowed.pop("failed_payments_only", None)
+        if arguments.get("payment_sources") is not None:
+            narrowed["payment_sources"] = self._payment_sources(arguments["payment_sources"])
+        return narrowed
+
+    @classmethod
+    def _payment_sources(cls, value: Any) -> List[str]:
+        """Each payment source named, as a list or a comma-separated text, in the platform's spelling.
+
+        Raises:
+            ToolError: Listing the accepted sources, when any one is not among them
+        """
+        items = value.split(",") if isinstance(value, str) else value
+        spelling = {source.lower(): source for source in cls._PAYMENT_SOURCES}
+        if isinstance(items, list):
+            spelled = [spelling.get(item.strip().lower()) if isinstance(item, str) else None for item in items]
+            if spelled and None not in spelled:
+                return [source for source in spelled if source is not None]
+        accepted = ", ".join(cls._PAYMENT_SOURCES)
+        raise create_structured_validation_error(
+            message=f"payment_sources takes one or more of {accepted}, got {value!r}. Nothing was read.",
+            field="payment_sources",
+            value=value,
+            suggestions=[f"Use one or more of: {accepted}"],
+            examples={"correct_usage": {"action": "list_invoices", "payment_sources": ["INVOICE_ONLY_NO_PAYMENT"]}},
+        )
+
+    @staticmethod
+    def _invoice_generated_part(invoice: Dict[str, Any]) -> str:
+        """When the invoice was generated, as the tail of its row; empty for a platform that does not send it."""
+        if "timestamp" not in invoice:
+            return ""
+        return f" | generated {invoice.get('timestamp') or 'n/a'}"
+
     @staticmethod
     def _map_billing_filters(
         arguments: Dict[str, Any], allowlist: Dict[str, str]
@@ -3188,6 +3274,7 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
         self._refuse_billing_arguments_not_applied(arguments, "list_invoices")
         arguments = self._with_billing_instants(arguments, "list_invoices")
         arguments = self._with_whole_amounts(arguments)
+        arguments = self._with_payment_filters(arguments)
         try:
             logger.info("Processing list_invoices request")
             client = await self.get_client(ctx=ctx)
@@ -3218,8 +3305,9 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
                 money = self._render_billing_amount(inv.get("totalAmount"), inv.get("currency"))
                 start = inv.get("startDate") or "n/a"
                 end = inv.get("endDate") or "n/a"
+                generated = self._invoice_generated_part(inv)
                 lines.append(
-                    f"- {number} | {state} | {pay_status} | {money} | {start} → {end}"
+                    f"- {number} | {state} | {pay_status} | {money} | {start} → {end}{generated}"
                 )
             footer = pagination_lines(info, "invoice", "invoices")
             if footer:
@@ -3238,7 +3326,7 @@ UNPAID invoices contribute their full amount; PARTIALLY_PAID invoices contribute
 {error_details}
 
 **Troubleshooting:**
-- Optional filters: invoice_number, start_date, end_date, pay_states, states, starting_amount, ending_amount
+- Optional filters: invoice_number, start_date, end_date, pay_states, states, payment_sources, failed_payments_only, starting_amount, ending_amount
 - Verify your API key can view the team's billing data
 
 **For Help:**
@@ -6039,9 +6127,8 @@ No usage recorded for '{skill_id}' in the requested period ({requested}), or the
                 value=period,
                 suggestions=[
                     f"Omit period to use the default ({self._COVERAGE_DEFAULT_PERIOD})",
-                    "Documented values: 24h, 7d, 30d, 90d, custom (custom also "
-                    "needs start_date and end_date); the value is passed through, "
-                    "so a newer platform period also works",
+                    f"Accepted values: {_values(COVERAGE_PERIOD_VALUES)} (custom also "
+                    "needs start_date and end_date)",
                 ],
                 examples={"correct_usage": {"action": "get_coverage_ratio", "period": "7d"}},
             )
@@ -6096,7 +6183,7 @@ No usage recorded for '{skill_id}' in the requested period ({requested}), or the
                 value=period,
                 suggestions=[
                     *self._COVERAGE_DATE_FORMS,
-                    "Or use a named window: 24h, 7d, 30d, 90d",
+                    f"Or use a named window: {_values(_COVERAGE_NAMED_PERIODS)}",
                 ],
                 examples={"correct_usage": self._COVERAGE_CUSTOM_EXAMPLE},
             )
@@ -6172,9 +6259,8 @@ No usage recorded for '{skill_id}' in the requested period ({requested}), or the
 
             lines.extend(self._render_metered_basis_lines(report.get("meteredBasis")))
 
-            # Upstream serializes this boolean on every 200 (flag-off tenants
-            # get a 403 instead, since the endpoint is feature-gated). The
-            # membership check stays as defense against older payloads only.
+            # Upstream serializes this boolean on every 200; the membership
+            # check stays as defense against older payloads only.
             if self._reports_coding_assistant_check(report):
                 lines.extend([
                     "",
@@ -6256,15 +6342,7 @@ No usage recorded for '{skill_id}' in the requested period ({requested}), or the
 
 {error_details}
 
-**Troubleshooting:**
-- `period` (24h, 7d, 30d, 90d) or start_date/end_date for a calendar range; with neither, this action reads 30d
-- start_date/end_date: the platform refuses an end after today and a range longer than it allows; its message is shown above
-- The team is resolved from your credentials — no team parameter is needed
-- Use `get_filter_options(dimension='providers')` to check the provider name you passed
-- A 403 usually means the coding-assistant-separation-active feature is not enabled for this environment — the whole report is gated on it; with the feature on, any member who can view the organization may read it
-
-**For Help:**
-- Use `get_capabilities()` to check current status
+{self._coverage_failure_guidance(e)}
 """, error_code=ErrorCodes.API_ERROR)
 
     async def _handle_get_model_costs(
@@ -7728,6 +7806,15 @@ If you're seeing this error, please report it as it indicates a reliability issu
                     "items": {"type": "string"},
                     "description": "Lifecycle-state filter on list_invoices. Validated by the platform",
                 },
+                "payment_sources": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": list(self._PAYMENT_SOURCES)},
+                    "description": "Payment-source filter on list_invoices: one or more of the listed sources, checked before the read",
+                },
+                "failed_payments_only": {
+                    "type": "boolean",
+                    "description": "On list_invoices, true lists only the invoices whose payment was attempted and failed; false or omitted lists every invoice",
+                },
                 "starting_amount": {
                     "type": "integer",
                     "description": "Lower bound on invoice total amount for list_invoices, a whole number of 0 or more",
@@ -8122,6 +8209,8 @@ If you're seeing this error, please report it as it indicates a reliability issu
                         "end_date": "str (yyyy-MM-dd day or ISO-8601 instant with Z or an offset)",
                         "pay_states": "list",
                         "states": "list",
+                        "payment_sources": "list (" + ", ".join(self._PAYMENT_SOURCES) + ")",
+                        "failed_payments_only": "bool (true lists only invoices whose payment failed)",
                         "starting_amount": "int (whole number, 0 or more)",
                         "ending_amount": "int (whole number, 0 or more)",
                     },
@@ -8426,7 +8515,7 @@ If you're seeing this error, please report it as it indicates a reliability issu
                     "The two metered totals, the credential flag and meteredBasis are omitted by older platform builds; absent is not zero",
                     "No figure carries a currency code — the report does not send one",
                     "codingAssistantUsagePresent is a presence flag: 'no' also covers a probe that could not complete",
-                    "The coding-assistant flag is absent for teams without coding-assistant separation enabled",
+                    "The platform sends the coding-assistant flag on every report and row; codingAssistantUsageUnknown marks a check that did not finish, which renders as unknown rather than 'no' (an older build without that field sends 'no')",
                     "Flat report — there is no pagination on the per-provider rows",
                 ],
             ),

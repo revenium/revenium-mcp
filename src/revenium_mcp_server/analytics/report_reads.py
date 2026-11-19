@@ -9,8 +9,9 @@ volume read (``ToolCostAndCallVolumeProcessor``). ``blames_unpaired_analytics_ho
 call volume read: the cost summary uses ``fails_whole_call`` to fail its read as
 a whole and ``refuses_permission`` to word a part the credential may not read,
 and ``_read_failure_advice`` in ``simple_analytics_engine`` uses them to choose
-the advice of both answers. The anomaly scan and the other tool reports do not
-classify their failures here.
+the advice of both answers. The coverage ratio read uses only
+``blames_unpaired_analytics_host`` and ``UNPAIRED_ANALYTICS_HOST_ADVICE``. The
+anomaly scan and the other tool reports do not classify their failures here.
 """
 
 import re
@@ -28,6 +29,11 @@ _HTTP_STATUS_PREFIX = re.compile(r"HTTP \d+:")
 _REJECTED_CREDENTIAL_ERRORS = (AuthenticationError, TeamScopeForbiddenError)
 _ANALYTICS_API_SETTING_ERRORS = (NewApiRequiredError, CalendarRangeNeedsNewApiError)
 _PLATFORM_TIMEOUT_STATUSES = frozenset({408, 504})
+
+UNPAIRED_ANALYTICS_HOST_ADVICE = [
+    "Every read this server sends to the analytics host is refused the same way until "
+    "REVENIUM_APP_BASE_URL names the analytics host of its platform",
+]
 
 
 def fails_whole_call(error: BaseException) -> bool:

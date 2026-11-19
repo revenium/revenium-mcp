@@ -331,6 +331,168 @@ class TestHandleQuery:
         assert "invalid" in str(exc_info.value).lower()
 
 
+class TestAlertRuleListByCreator:
+    """BACK-5958: an admin lists only the alert rules one person created."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("action", ["list", "query"])
+    @pytest.mark.parametrize("key", ["created_by_id", "createdById"])
+    async def test_the_creator_id_is_sent_as_created_by_id(
+        self, alert_mgmt, mock_client, action, key
+    ):
+        alert_mgmt.anomaly_manager.list_anomalies = AsyncMock(return_value=[])
+
+        await alert_mgmt._handle_anomaly_operations(
+            mock_client, action, {"filters": {key: " jR2kmLs ", "sort": "name,asc"}}
+        )
+
+        sent = alert_mgmt.anomaly_manager.list_anomalies.call_args.args[3]
+        assert sent == {"createdById": "jR2kmLs", "sort": "name,asc"}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("key", ["created_by_id", "createdById"])
+    @pytest.mark.parametrize(
+        "creator", [None, "", "   ", "jane@acme.com", 42, ["jR2kmLs"]],
+        ids=["null", "empty", "blank", "email", "number", "list"],
+    )
+    async def test_a_creator_id_that_cannot_name_a_user_is_refused_before_any_read(
+        self, alert_mgmt, mock_client, key, creator
+    ):
+        alert_mgmt.anomaly_manager.list_anomalies = AsyncMock(return_value=[])
+
+        with pytest.raises(ToolError) as refused:
+            await alert_mgmt._handle_anomaly_operations(
+                mock_client, "list", {"filters": {key: creator}}
+            )
+
+        assert refused.value.field == "filters.created_by_id"
+        assert "not an email address" in refused.value.message
+        alert_mgmt.anomaly_manager.list_anomalies.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_an_unrelated_key_beside_it_is_still_refused(self, alert_mgmt, mock_client):
+        alert_mgmt.anomaly_manager.list_anomalies = AsyncMock(return_value=[])
+
+        with pytest.raises(ToolError) as refused:
+            await alert_mgmt._handle_anomaly_operations(
+                mock_client, "list", {"filters": {"created_by_id": "jR2kmLs", "owner": "jane"}}
+            )
+
+        assert "Unknown filter key 'owner'" in refused.value.message
+        assert refused.value.message.endswith(
+            "Valid filter keys for 'list anomalies': created_by_id, query, sort"
+        )
+        alert_mgmt.anomaly_manager.list_anomalies.assert_not_called()
+
+    @staticmethod
+    def _empty_page_client():
+        client = MagicMock()
+        client.get_anomalies = AsyncMock(return_value={})
+        client._extract_embedded_data = MagicMock(return_value=[])
+        client._extract_pagination_info = MagicMock(return_value={"totalElements": 0})
+        return client
+
+    @pytest.mark.asyncio
+    async def test_an_empty_page_names_the_creator_id(self):
+        client = self._empty_page_client()
+
+        text = _text(
+            await AnomalyManager().list_anomalies(client, 0, 20, {"createdById": "zzNoUser"})
+        )
+
+        assert "No alert rule matched creator id 'zzNoUser'" in text
+        assert client.get_anomalies.call_args.kwargs["createdById"] == "zzNoUser"
+
+    @pytest.mark.asyncio
+    async def test_an_empty_page_narrowed_by_a_name_search_too_does_not_blame_the_creator(self):
+        text = _text(
+            await AnomalyManager().list_anomalies(
+                self._empty_page_client(),
+                0,
+                20,
+                {"createdById": "jR2kmLs", "query": "gpt", "type": "THRESHOLD"},
+            )
+        )
+
+        assert (
+            "No alert rule matched creator id 'jR2kmLs' together with the other filters (query)"
+            in text
+        )
+        assert "names no user" not in text
+        assert "created no alert rule" not in text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "others",
+        [{"sort": "name"}, {"type": "THRESHOLD"}],
+        ids=["sort", "type ignored by the platform"],
+    )
+    async def test_a_filter_that_does_not_narrow_keeps_the_creator_wording(self, others):
+        text = _text(
+            await AnomalyManager().list_anomalies(
+                self._empty_page_client(), 0, 20, {"createdById": "jR2kmLs", **others}
+            )
+        )
+
+        assert "either the id names no user" in text
+        assert "other filters" not in text
+
+    @pytest.mark.asyncio
+    async def test_an_empty_page_without_the_filter_reads_as_before(self):
+        text = _text(await AnomalyManager().list_anomalies(self._empty_page_client(), 0, 20, {}))
+
+        assert "creator id" not in text
+        assert "No anomalies match your criteria." in text
+
+    @pytest.mark.asyncio
+    async def test_capabilities_name_the_filter_and_where_the_id_comes_from(self, alert_mgmt):
+        text = _text(await alert_mgmt.handle_action("get_capabilities", {}))
+
+        assert "created_by_id" in text
+        assert "lookup_user(email=...)" in text
+        assert "not an email address" in text
+
+
+class TestAlertRuleListRefusesType:
+    """AIAnomalyController.listByCreator binds `type` and reads it on no path."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("action", ["list", "query"])
+    @pytest.mark.parametrize("rule_type", ["THRESHOLD", "CUMULATIVE_USAGE", "ZZZ_NOT_A_TYPE"])
+    async def test_a_type_filter_is_refused_before_any_read(
+        self, alert_mgmt, mock_client, action, rule_type
+    ):
+        alert_mgmt.anomaly_manager.list_anomalies = AsyncMock(return_value=[])
+
+        with pytest.raises(ToolError) as refused:
+            await alert_mgmt._handle_anomaly_operations(
+                mock_client, action, {"filters": {"type": rule_type}}
+            )
+
+        assert refused.value.field == "filters.type"
+        assert "Alert rules cannot be filtered by type" in refused.value.message
+        alert_mgmt.anomaly_manager.list_anomalies.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_says_where_each_rules_type_is_read(self, alert_mgmt, mock_client):
+        alert_mgmt.anomaly_manager.list_anomalies = AsyncMock(return_value=[])
+
+        with pytest.raises(ToolError) as refused:
+            await alert_mgmt._handle_anomaly_operations(
+                mock_client, "list", {"filters": {"type": "THRESHOLD", "created_by_id": "jR2kmLs"}}
+            )
+
+        assert "read each rule's Type line" in refused.value.message
+
+    @pytest.mark.asyncio
+    async def test_capabilities_say_type_is_refused(self, alert_mgmt):
+        text = _text(await alert_mgmt.handle_action("get_capabilities", {}))
+
+        assert "accepted keys: created_by_id, query, sort;" in text
+        assert "type is refused" in text
+        assert "query, sort, type" not in text
+
+
 def _refusing_platform(error):
     client = MagicMock()
     client.team_id = "team_test"
@@ -1498,6 +1660,32 @@ class TestHandleResetBudget:
         mock_client.reset_anomaly_budget.assert_awaited_once_with("a1")
 
     @pytest.mark.asyncio
+    async def test_reset_of_a_department_grouped_budget_names_the_spend_outside_every_department(
+        self, alert_mgmt, mock_client
+    ):
+        """BACK-5954: a reset answers the grouped resource, figure included."""
+        mock_client.reset_anomaly_budget.return_value = {
+            "anomalyId": 178302,
+            "threshold": 500.0,
+            "groups": [],
+            "spendNotInAnyDepartment": 1250.0,
+        }
+        text = _text(await alert_mgmt._handle_reset_budget(mock_client, {"anomaly_id": "a1"}))
+        lines = [ln for ln in text.splitlines() if "outside every department" in ln]
+        assert lines == [
+            "**Department gap**: 1250 outside every department (not covered by this budget)"
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("missing", [{"spendNotInAnyDepartment": None}, {}])
+    async def test_reset_without_the_figure_prints_no_such_line(
+        self, alert_mgmt, mock_client, missing
+    ):
+        mock_client.reset_anomaly_budget.return_value = {"anomalyId": "a1", **missing}
+        text = _text(await alert_mgmt._handle_reset_budget(mock_client, {"anomaly_id": "a1"}))
+        assert "Department gap" not in text
+
+    @pytest.mark.asyncio
     async def test_reset_budget_missing_id_raises(self, alert_mgmt, mock_client):
         with pytest.raises(ToolError):
             await alert_mgmt._handle_reset_budget(mock_client, {})
@@ -1747,6 +1935,72 @@ class TestHandleGetBudgetPortfolio:
         line = next(ln for ln in text.splitlines() if "`a1`" in ln)
         assert line == f"- Monthly Budget (`a1`) · metric TOTAL_COST · {expected}"
 
+    _OUTSIDE_EVERY_DEPARTMENT = "outside every department (not covered by this budget)"
+
+    def _department_grouped_entry(self, **over):
+        return self._grouped_entry(
+            alertId="d1",
+            name="Department Budget",
+            groups=[
+                {"groupValue": "Engineering", "currentValue": 300.0, "percentUsed": 0.6},
+                {"groupValue": "Sales", "currentValue": 160.0, "percentUsed": 0.32},
+            ],
+            **over,
+        )
+
+    @pytest.mark.asyncio
+    async def test_portfolio_department_grouped_entry_prints_the_spend_outside_every_department(
+        self, alert_mgmt, mock_client
+    ):
+        """BACK-5954: the platform reports the spend no department covers; it is
+        printed once and never added to the summed spend or percent."""
+        entry = self._department_grouped_entry(spendNotInAnyDepartment=1250.0)
+        text = await self._render_portfolio(alert_mgmt, mock_client, [entry])
+        line = next(ln for ln in text.splitlines() if "`d1`" in ln)
+        assert line.count(self._OUTSIDE_EVERY_DEPARTMENT) == 1
+        assert f"1250 {self._OUTSIDE_EVERY_DEPARTMENT}" in line
+        assert "460/500 summed across groups" in line
+        assert "92% used summed across groups" in line
+
+    @pytest.mark.asyncio
+    async def test_portfolio_spend_outside_departments_prints_two_decimals(
+        self, alert_mgmt, mock_client
+    ):
+        entry = self._department_grouped_entry(spendNotInAnyDepartment=12.3456)
+        text = await self._render_portfolio(alert_mgmt, mock_client, [entry])
+        assert f"12.35 {self._OUTSIDE_EVERY_DEPARTMENT}" in text
+
+    @pytest.mark.asyncio
+    async def test_portfolio_zero_spend_outside_departments_is_printed(
+        self, alert_mgmt, mock_client
+    ):
+        """A measured zero is a figure; only a null means not measured."""
+        entry = self._department_grouped_entry(spendNotInAnyDepartment=0)
+        text = await self._render_portfolio(alert_mgmt, mock_client, [entry])
+        assert f"0 {self._OUTSIDE_EVERY_DEPARTMENT}" in text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("missing", [{"spendNotInAnyDepartment": None}, {}])
+    async def test_portfolio_without_a_spend_outside_departments_figure_prints_no_such_part(
+        self, alert_mgmt, mock_client, missing
+    ):
+        entry = self._department_grouped_entry(**missing)
+        text = await self._render_portfolio(alert_mgmt, mock_client, [entry])
+        assert "outside every department" not in text
+        assert "None" not in text
+
+    @pytest.mark.asyncio
+    async def test_portfolio_ungrouped_entry_is_unchanged_by_the_department_gap(
+        self, alert_mgmt, mock_client
+    ):
+        entry = self._entry(groupCount=None, worstPercentUsed=None, groupsOverLimit=None)
+        text = await self._render_portfolio(alert_mgmt, mock_client, [entry])
+        line = next(ln for ln in text.splitlines() if "`a1`" in ln)
+        assert line == (
+            "- Monthly Budget (`a1`) · metric TOTAL_COST · 250/1000 · 25% used"
+            " · vs-linear ON_TRACK"
+        )
+
     @pytest.mark.asyncio
     async def test_portfolio_grouped_totals_print_two_decimals(self, alert_mgmt, mock_client):
         entry = self._grouped_entry(currentValue=460.123456, threshold=500.0)
@@ -1880,6 +2134,46 @@ class TestHandleGetBudgetProgress:
         text = _text(result)
         assert "5jgQQ7" in text
         assert "None" not in text
+
+    @staticmethod
+    def _grouped_progress(**over):
+        """GroupedBudgetProgressResource: per-group results, no summed currentValue."""
+        base = {
+            "anomalyId": 178302,
+            "metricType": "TOTAL_COST",
+            "threshold": 500.0,
+            "groups": [{"groupValue": "Engineering", "currentValue": 300.0, "percentUsed": 0.6}],
+        }
+        base.update(over)
+        return base
+
+    @pytest.mark.asyncio
+    async def test_single_grouped_progress_line_prints_the_spend_outside_every_department(
+        self, alert_mgmt, mock_client
+    ):
+        """BACK-5954: the single read of a budget grouped by department carries
+        spendNotInAnyDepartment; the compact line names it, not only the raw payload."""
+        mock_client.get_anomaly_budget_progress = AsyncMock(
+            return_value=self._grouped_progress(spendNotInAnyDepartment=1250.0)
+        )
+        text = _text(
+            await alert_mgmt._handle_get_budget_progress(mock_client, {"anomaly_id": "5jgQQ7"})
+        )
+        line = next(ln for ln in text.splitlines() if ln.startswith("- "))
+        assert line.endswith("· 1250 outside every department (not covered by this budget)")
+
+    @pytest.mark.asyncio
+    async def test_single_grouped_progress_without_the_figure_keeps_its_line(
+        self, alert_mgmt, mock_client
+    ):
+        mock_client.get_anomaly_budget_progress = AsyncMock(
+            return_value=self._grouped_progress(spendNotInAnyDepartment=None)
+        )
+        text = _text(
+            await alert_mgmt._handle_get_budget_progress(mock_client, {"anomaly_id": "5jgQQ7"})
+        )
+        line = next(ln for ln in text.splitlines() if ln.startswith("- "))
+        assert line == "- `178302` — TOTAL_COST: state unavailable"
 
     @pytest.mark.asyncio
     async def test_single_forwards_filters(self, alert_mgmt, mock_client):
@@ -2025,6 +2319,73 @@ class TestHandleGetBudgetProgress:
         assert "120% used" in text
         assert ("over budget" in text) is over
 
+    @staticmethod
+    def _department_grouped_bulk_item(**over):
+        """BudgetProgressItemSuccess for a grouped alert (hypercurrent origin/develop,
+        AIAnomalyProgressController): summed currentValue, groups, no groupCount."""
+        base = {
+            "ok": True,
+            "alertId": "jR2kmLs",
+            "metricType": "TOTAL_COST",
+            "cumulativePeriod": "MONTHLY",
+            "threshold": 1000.0,
+            "currentValue": 460.0,
+            "remaining": 540.0,
+            "percentUsed": 0.46,
+            "window": {"start": "2026-11-01", "now": "2026-11-17", "endExpected": "2026-11-30"},
+            "aheadBehindVsLinear": {"expectedByNow": 500.0, "delta": -40.0, "status": "ON_TRACK"},
+            "groups": [
+                {
+                    "groupValue": "dep_eng",
+                    "groupDisplayName": "Engineering",
+                    "currentValue": 300.0,
+                    "remaining": 700.0,
+                    "percentUsed": 0.3,
+                },
+                {
+                    "groupValue": "dep_sales",
+                    "groupDisplayName": "Sales",
+                    "currentValue": 160.0,
+                    "remaining": 840.0,
+                    "percentUsed": 0.16,
+                },
+            ],
+            "spendNotInAnyDepartment": 1250.0,
+        }
+        base.update(over)
+        return base
+
+    @pytest.mark.asyncio
+    async def test_bulk_department_grouped_item_prints_the_spend_outside_every_department(
+        self, alert_mgmt, mock_client
+    ):
+        """BACK-5954: the bulk read prints only the compact lines, so the figure has to be on them."""
+        mock_client.get_budget_progress_bulk = AsyncMock(
+            return_value={"items": [self._department_grouped_bulk_item()]}
+        )
+        text = _text(
+            await alert_mgmt._handle_get_budget_progress(mock_client, {"anomaly_ids": ["jR2kmLs"]})
+        )
+        line = next(ln for ln in text.splitlines() if "`jR2kmLs`" in ln)
+        assert line == (
+            "- `jR2kmLs` · metric TOTAL_COST · 460/1000 · 46% used"
+            " · 1250 outside every department (not covered by this budget)"
+            " · vs-linear ON_TRACK"
+        )
+
+    @pytest.mark.asyncio
+    async def test_bulk_department_grouped_item_without_the_figure_keeps_its_line(
+        self, alert_mgmt, mock_client
+    ):
+        mock_client.get_budget_progress_bulk = AsyncMock(
+            return_value={"items": [self._department_grouped_bulk_item(spendNotInAnyDepartment=None)]}
+        )
+        text = _text(
+            await alert_mgmt._handle_get_budget_progress(mock_client, {"anomaly_ids": ["jR2kmLs"]})
+        )
+        line = next(ln for ln in text.splitlines() if "`jR2kmLs`" in ln)
+        assert line == "- `jR2kmLs` · metric TOTAL_COST · 460/1000 · 46% used · vs-linear ON_TRACK"
+
     @pytest.mark.asyncio
     async def test_bulk_degrades_entry_without_numeric_fields(self, alert_mgmt, mock_client):
         good = self._progress(anomalyId="a1")
@@ -2122,8 +2483,10 @@ class TestValidateChecksWhatCreateChecks:
         validated = await answer(tools.handle_action("validate", {"anomaly_data": dict(alert)}))
         created = await answer(tools.handle_action("create", {"anomaly_data": dict(alert)}))
 
-        assert "Failed to convert to API format" in validated[1]
-        assert "Failed to convert to API format" in created[1]
+        for answered in (validated[1], created[1]):
+            assert "Invalid operator" in answered
+            assert "field: operator" in answered
+            assert "Failed to convert to API format" not in answered
         assert validated[0] == created[0]
         assert '"valid": true' not in validated[1]
         assert platform.created_bodies == []

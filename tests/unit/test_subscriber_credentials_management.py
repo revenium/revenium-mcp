@@ -470,6 +470,20 @@ class TestCredentialsHierarchyIncompleteWalk:
         self._assert_retryable_walk_failure(exc_info.value)
 
 
+def _rendered(refusal: ToolError) -> str:
+    return " ".join([refusal.message, *refusal.suggestions, str(refusal.context)])
+
+
+def _assert_answered_as_unconfirmed(text: str, credential_id: str) -> None:
+    assert f"Credential create could not be confirmed: the platform returned credential {credential_id}" in text
+    assert "nothing to tell a new credential from an existing one" in text
+    assert f"Use 'get' with credential_id='{credential_id}'" in text
+    assert f"Use 'update' with credential_id='{credential_id}'" in text
+    assert '"create_confirmed": false' in text
+    assert "completed successfully" not in text
+    assert "secret123" not in text
+
+
 class TestCreateOfAnExistingExternalId:
     """The platform answers a create whose external ID exists with the old credential."""
 
@@ -531,10 +545,194 @@ class TestCreateOfAnExistingExternalId:
                 "label": "New Key",
                 "subscriber": {"id": "sub_1"},
                 "organization": {"id": "org_1"},
+                "externalSecret": "secret123",
             },
         )
         assert "Credential create completed successfully" in text
         assert "already existed" not in text
+        assert "secret123" not in text
+
+    @pytest.mark.asyncio
+    async def test_a_repeat_with_a_new_secret_is_refused_as_existing(self, cred_tool):
+        with pytest.raises(ToolError) as exc:
+            await self._create(
+                cred_tool,
+                {
+                    "id": "old_3",
+                    "label": "New Key",
+                    "subscriber": {"id": "sub_1"},
+                    "organization": {"id": "org_1"},
+                    "externalSecret": "old-secret-value",
+                },
+            )
+
+        assert exc.value.error_code == ErrorCodes.RESOURCE_CONFLICT
+        assert "old_3" in exc.value.message
+        assert "nothing was created" in exc.value.message
+        assert "secret123" not in _rendered(exc.value)
+        assert "old-secret-value" not in _rendered(exc.value)
+
+    @pytest.mark.asyncio
+    async def test_a_repeat_with_a_new_subscription_is_refused_as_existing(self, cred_tool):
+        cred_tool.client.team_id = "team_1"
+        cred_tool.client.create_credential = AsyncMock(
+            return_value={
+                "id": "old_4",
+                "label": "New Key",
+                "subscriber": {"id": "sub_1"},
+                "organization": {"id": "org_1"},
+                "externalSecret": "secret123",
+                "subscriptions": [{"id": "subscription_old"}],
+            }
+        )
+
+        with pytest.raises(ToolError) as exc:
+            await cred_tool.handle_action(
+                "create",
+                {"credential_data": {**self.SENT, "subscriptionIds": ["subscription_new"]}},
+            )
+
+        assert exc.value.error_code == ErrorCodes.RESOURCE_CONFLICT
+        assert "old_4" in exc.value.message
+
+    @pytest.mark.asyncio
+    async def test_a_missing_subscription_link_outranks_a_secret_the_answer_hides(
+        self, cred_tool
+    ):
+        cred_tool.client.team_id = "team_1"
+        cred_tool.client.create_credential = AsyncMock(
+            return_value={
+                "id": "old_5",
+                "label": "New Key",
+                "subscriber": {"id": "sub_1"},
+                "organization": {"id": "org_1"},
+                "externalSecret": "...t123",
+                "subscriptions": [{"id": "subscription_old"}],
+            }
+        )
+
+        with pytest.raises(ToolError) as exc:
+            await cred_tool.handle_action(
+                "create",
+                {"credential_data": {**self.SENT, "subscriptionIds": ["subscription_new"]}},
+            )
+
+        assert exc.value.error_code == ErrorCodes.RESOURCE_CONFLICT
+        assert "old_5" in exc.value.message
+
+    @pytest.mark.asyncio
+    async def test_a_true_create_linking_the_sent_subscriptions_is_reported_as_created(
+        self, cred_tool
+    ):
+        cred_tool.client.team_id = "team_1"
+        cred_tool.client.create_credential = AsyncMock(
+            return_value={
+                "id": "new_3",
+                "label": "New Key",
+                "subscriber": {"id": "sub_1"},
+                "organization": {"id": "org_1"},
+                "externalSecret": "secret123",
+                "subscriptions": [{"id": "subscription_new"}],
+            }
+        )
+
+        result = await cred_tool.handle_action(
+            "create",
+            {"credential_data": {**self.SENT, "subscriptionIds": ["subscription_new"]}},
+        )
+
+        assert "Credential create completed successfully" in result[0].text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("shown_secret", [None, "", "...t123"], ids=["absent", "empty", "masked"])
+    async def test_an_answer_without_a_comparable_secret_is_answered_as_unconfirmed(
+        self, cred_tool, shown_secret
+    ):
+        answer = {
+            "id": "cred_5",
+            "label": "New Key",
+            "subscriber": {"id": "sub_1"},
+            "organization": {"id": "org_1"},
+        }
+        if shown_secret is not None:
+            answer["externalSecret"] = shown_secret
+
+        text = await self._create(cred_tool, answer)
+
+        _assert_answered_as_unconfirmed(text, "cred_5")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("shown_links", ["absent", None], ids=["absent", "null"])
+    async def test_requested_subscriptions_the_answer_does_not_show_are_unconfirmed(
+        self, cred_tool, shown_links
+    ):
+        answer = {
+            "id": "cred_6",
+            "label": "New Key",
+            "subscriber": {"id": "sub_1"},
+            "organization": {"id": "org_1"},
+            "externalSecret": "secret123",
+        }
+        if shown_links != "absent":
+            answer["subscriptions"] = shown_links
+        cred_tool.client.team_id = "team_1"
+        cred_tool.client.create_credential = AsyncMock(return_value=answer)
+
+        result = await cred_tool.handle_action(
+            "create",
+            {"credential_data": {**self.SENT, "subscriptionIds": ["subscription_new"]}},
+        )
+
+        _assert_answered_as_unconfirmed(result[0].text, "cred_6")
+
+    @pytest.mark.asyncio
+    async def test_an_empty_subscriptions_list_is_refused_as_existing_not_unconfirmed(
+        self, cred_tool
+    ):
+        cred_tool.client.team_id = "team_1"
+        cred_tool.client.create_credential = AsyncMock(
+            return_value={
+                "id": "old_7",
+                "label": "New Key",
+                "subscriber": {"id": "sub_1"},
+                "organization": {"id": "org_1"},
+                "externalSecret": "secret123",
+                "subscriptions": [],
+            }
+        )
+
+        with pytest.raises(ToolError) as exc:
+            await cred_tool.handle_action(
+                "create",
+                {"credential_data": {**self.SENT, "subscriptionIds": ["subscription_new"]}},
+            )
+
+        assert exc.value.error_code == ErrorCodes.RESOURCE_CONFLICT
+        assert "old_7" in exc.value.message
+
+    @pytest.mark.asyncio
+    async def test_a_sent_secret_that_begins_with_three_dots_is_compared_as_sent(
+        self, cred_tool
+    ):
+        dotted_secret = "...fake-test-value"
+        cred_tool.client.team_id = "team_1"
+        cred_tool.client.create_credential = AsyncMock(
+            return_value={
+                "id": "new_4",
+                "label": "New Key",
+                "subscriber": {"id": "sub_1"},
+                "organization": {"id": "org_1"},
+                "externalSecret": dotted_secret,
+            }
+        )
+
+        result = await cred_tool.handle_action(
+            "create", {"credential_data": {**self.SENT, "externalSecret": dotted_secret}}
+        )
+
+        assert "Credential create completed successfully" in result[0].text
+        assert "could not be confirmed" not in result[0].text
+        assert dotted_secret not in result[0].text
 
     @pytest.mark.asyncio
     async def test_a_true_create_whose_label_became_its_name_is_reported_as_created(
@@ -547,6 +745,7 @@ class TestCreateOfAnExistingExternalId:
                 "label": "Billing Key",
                 "subscriber": {"id": "sub_1"},
                 "organization": {"id": "org_1"},
+                "externalSecret": "secret123",
             }
         )
         result = await cred_tool.handle_action(

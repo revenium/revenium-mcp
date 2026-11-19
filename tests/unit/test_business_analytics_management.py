@@ -19,6 +19,7 @@ from src.revenium_mcp_server.tools_decomposed import (
     business_analytics_management as business_analytics_module,
 )
 from src.revenium_mcp_server.tools_decomposed.business_analytics_management import (
+    COVERAGE_PERIOD_VALUES,
     BusinessAnalyticsManagement,
 )
 from src.revenium_mcp_server.auth import AuthenticationError
@@ -1637,6 +1638,13 @@ class TestCoverageRatio:
         assert exc.value.field == "provider"
 
     @pytest.mark.asyncio
+    async def test_period_refusal_lists_every_accepted_period(self, analytics_tool):
+        with pytest.raises(ToolError) as exc:
+            await analytics_tool.handle_action("get_coverage_ratio", {"period": 7})
+        assert exc.value.field == "period"
+        assert f"Accepted values: {', '.join(COVERAGE_PERIOD_VALUES)} " in str(exc.value.suggestions)
+
+    @pytest.mark.asyncio
     async def test_null_ratio_is_not_rendered_as_zero_coverage(self, analytics_tool):
         """A null aggregateRatio means 'no ratio could be computed', not 0%."""
         payload = {
@@ -2021,7 +2029,8 @@ class TestCoverageRatio:
         text = exc.value.message
         assert "Failed" in text
         assert "period" in text
-        assert "coding-assistant-separation-active" in text
+        assert "coding-assistant-separation-active" not in text
+        assert "view the team's organization" in text
 
     @pytest.mark.asyncio
     async def test_auth_error_escapes_so_the_envelope_sets_is_error(self, analytics_tool):

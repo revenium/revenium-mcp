@@ -558,6 +558,154 @@ class TestToolManagerMeterEvent:
             await tool_manager.meter_event({})
 
 
+class TestMeterEventTransactionId:
+    """BACK-4985: the platform meters a non-UUID transactionId under an id it derives from it."""
+
+    @pytest.mark.parametrize(
+        "transaction_id",
+        [
+            pytest.param("txn-tool-002", id="free_text"),
+            pytest.param("550e8400e29b41d4a716446655440000", id="bare_hex"),
+            pytest.param(" 550e8400-e29b-41d4-a716-446655440000", id="padded"),
+            pytest.param("550e8400-e29b-41d4-a716-446655440000\n", id="trailing_newline"),
+            pytest.param("", id="empty"),
+            pytest.param(42, id="number"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_a_transaction_id_that_is_not_a_uuid_is_refused_before_sending(
+        self, tool_manager, mock_client, transaction_id
+    ):
+        event_data = {"toolId": "t1", "durationMs": 10, "transactionId": transaction_id}
+
+        with pytest.raises(ToolError) as refusal:
+            await tool_manager.meter_event({"event_data": event_data})
+
+        assert refusal.value.error_code == ErrorCodes.VALIDATION_ERROR
+        assert refusal.value.field == "event_data.transactionId"
+        assert "is not a UUID" in refusal.value.message
+        assert "list_events" in refusal.value.message
+        mock_client.meter_tool_event.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_says_what_is_accepted(self, tool_manager):
+        event_data = {"toolId": "t1", "transactionId": "txn-tool-002"}
+
+        with pytest.raises(ToolError) as refusal:
+            await tool_manager.meter_event({"event_data": event_data})
+
+        suggestions = " ".join(refusal.value.suggestions)
+        assert "123e4567-e89b-12d3-a456-426614174000" in suggestions
+        assert "omit transactionId" in suggestions
+
+    @pytest.mark.parametrize(
+        "transaction_id",
+        ["550e8400-e29b-41d4-a716-446655440000", "550E8400-E29B-41D4-A716-446655440000"],
+        ids=["lower", "upper"],
+    )
+    @pytest.mark.asyncio
+    async def test_a_uuid_is_sent_unchanged(self, tool_manager, mock_client, transaction_id):
+        event_data = {"toolId": "t1", "transactionId": transaction_id}
+
+        await tool_manager.meter_event({"event_data": event_data})
+
+        mock_client.meter_tool_event.assert_awaited_once_with(event_data)
+
+    @pytest.mark.parametrize(
+        "event_data",
+        [{"toolId": "t1"}, {"toolId": "t1", "transactionId": None}],
+        ids=["absent", "null"],
+    )
+    @pytest.mark.asyncio
+    async def test_no_transaction_id_lets_the_platform_assign_one(
+        self, tool_manager, mock_client, event_data
+    ):
+        await tool_manager.meter_event({"event_data": event_data})
+
+        mock_client.meter_tool_event.assert_awaited_once_with(event_data)
+
+    @pytest.mark.asyncio
+    async def test_the_registered_tool_flags_the_refusal_and_sends_nothing(self, monkeypatch, tmp_path):
+        meter = AsyncMock()
+        monkeypatch.setattr(ReveniumClient, "meter_tool_event", meter)
+        arguments = {
+            "action": "meter_event",
+            "event_data": {"toolId": "t1", "durationMs": 10, "transactionId": "txn-tool-002"},
+        }
+
+        result, text = await call_domain_tool(monkeypatch, tmp_path, "manage_tools", arguments)
+
+        assert result.is_error is True, text
+        assert "event_data.transactionId 'txn-tool-002' is not a UUID" in text
+        meter.assert_not_called()
+
+
+class TestRecordEventTransactionId:
+    """BACK-6001: record_event posts to the same ingest as meter_event, so it refuses the same ids."""
+
+    @pytest.mark.parametrize(
+        "transaction_id",
+        [
+            pytest.param("txn-tool-002", id="free_text"),
+            pytest.param("550e8400-e29b-41d4-a716-446655440000\n", id="trailing_newline"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_a_transaction_id_that_is_not_a_uuid_is_refused_before_any_call(
+        self, tool_manager, mock_client, transaction_id
+    ):
+        event_data = {"durationMs": 10, "transactionId": transaction_id}
+
+        with pytest.raises(ToolError) as refusal:
+            await tool_manager.record_event({"tool_id": STORED_TOOL["id"], "event_data": event_data})
+
+        assert refusal.value.error_code == ErrorCodes.VALIDATION_ERROR
+        assert refusal.value.field == "event_data.transactionId"
+        assert refusal.value.message == (
+            f"event_data.transactionId {transaction_id!r} is not a UUID. The platform would "
+            "meter the event under a different id it derives from this one, so neither this id "
+            "nor list_events(filters={'transaction_id': ...}) would find it. Nothing was sent."
+        )
+        mock_client.get_tool.assert_not_called()
+        mock_client.record_tool_event.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_matches_the_meter_event_refusal(self, tool_manager):
+        event_data = {"toolId": STORED_TOOL["toolId"], "transactionId": "txn-tool-002"}
+
+        with pytest.raises(ToolError) as recorded:
+            await tool_manager.record_event({"tool_id": STORED_TOOL["id"], "event_data": event_data})
+        with pytest.raises(ToolError) as metered:
+            await tool_manager.meter_event({"event_data": event_data})
+
+        assert recorded.value.message == metered.value.message
+        assert recorded.value.suggestions == metered.value.suggestions
+
+    @pytest.mark.parametrize(
+        "event_data",
+        [{"durationMs": 10}, {"durationMs": 10, "transactionId": None}],
+        ids=["absent", "null"],
+    )
+    @pytest.mark.asyncio
+    async def test_no_transaction_id_lets_the_platform_assign_one(
+        self, tool_manager, mock_client, event_data
+    ):
+        mock_client.get_tool.return_value = STORED_TOOL
+
+        await tool_manager.record_event({"tool_id": STORED_TOOL["id"], "event_data": event_data})
+
+        mock_client.record_tool_event.assert_awaited_once_with(STORED_TOOL["toolId"], event_data)
+
+    @pytest.mark.asyncio
+    async def test_a_uuid_is_sent_unchanged(self, tool_manager, mock_client):
+        event_data = {"durationMs": 10, "transactionId": "550e8400-e29b-41d4-a716-446655440000"}
+        mock_client.get_tool.return_value = STORED_TOOL
+
+        await tool_manager.record_event({"tool_id": STORED_TOOL["id"], "event_data": event_data})
+
+        mock_client.record_tool_event.assert_awaited_once_with(STORED_TOOL["toolId"], event_data)
+
+
 class TestToolManagerListEvents:
     """Test ToolManager.list_events behavior."""
 

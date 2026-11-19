@@ -95,6 +95,7 @@ SHARED_DECODED_LISTS = {
     ("get_business_analytics", "agents"),
     ("get_business_analytics", "pay_states"),
     ("get_business_analytics", "states"),
+    ("get_business_analytics", "payment_sources"),
     ("manage_customers", "marketplace_names"),
     ("manage_customers", "automation_patterns"),
     ("manage_customers", "excluded_repos"),

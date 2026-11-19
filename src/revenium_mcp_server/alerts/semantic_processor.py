@@ -171,6 +171,65 @@ def refuse_an_undecided_threshold(text: str) -> None:
     )
 
 
+_EXPLICIT_THRESHOLD_CREATE = (
+    "create(anomaly_data={'name': ..., 'alertType': 'CUMULATIVE_USAGE', 'metricType': 'TOTAL_COST', "
+    "'operatorType': 'GREATER_THAN', 'threshold': 1500, 'periodDuration': 'WEEKLY'})"
+)
+
+
+def threshold_read_from_text(text: str) -> NumberInText:
+    """The threshold a sentence names, or a refusal when it names none to read."""
+    found = threshold_in_text(text)
+    if found is not None:
+        return found
+    raise create_structured_validation_error(
+        message=(
+            "create_from_text could not read a threshold from the text: it names no number "
+            "for the alert to fire at, and the tool does not choose one. Nothing was created."
+        ),
+        field="text",
+        value=text,
+        suggestions=[
+            "Put the threshold in the text, e.g. 'Notify when weekly spending exceeds $1500', "
+            "and call create_from_text again",
+            f"Or call create with the threshold stated, e.g. {_EXPLICIT_THRESHOLD_CREATE}",
+        ],
+    )
+
+
+_EXPLICIT_FILTER_CREATE = (
+    "create(anomaly_data={'name': ..., 'alertType': 'THRESHOLD', 'metricType': 'TOTAL_COST', "
+    "'operatorType': 'GREATER_THAN', 'threshold': 50, 'periodDuration': 'ONE_HOUR', "
+    "'filters': [{'dimension': 'PROVIDER', 'operator': 'CONTAINS', 'value': 'openai'}]})"
+)
+
+
+def refuse_a_filter_read_from_text(text: str, filters: List[Dict[str, Any]]) -> None:
+    """Refuse to create an alert with a filter the text parser read, showing what it read.
+
+    The parser's filter patterns misread ordinary sentences ('OpenAI model costs' becomes a
+    MODEL filter on 'costs', 'excluding test traffic' a PRODUCT filter that keeps 'test'),
+    so only a caller who states a filter explicitly gets an alert with one.
+    """
+    if not filters:
+        return
+    read = ", ".join(repr(row) for row in filters)
+    raise create_structured_validation_error(
+        message=(
+            f"create_from_text read the filter {read} from the text, and its text parser "
+            "cannot be relied on to read filters as meant. Nothing was created."
+        ),
+        field="text",
+        value=text,
+        suggestions=[
+            "To create the alert with a filter, call create with anomaly_data.filters "
+            f"stating it, e.g. {_EXPLICIT_FILTER_CREATE}",
+            "If the alert should cover all usage, leave the filter words out of the text "
+            "and call create_from_text again",
+        ],
+    )
+
+
 class AlertSemanticProcessor:
     """Processes natural language for alert creation with semantic search support."""
 

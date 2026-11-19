@@ -78,6 +78,10 @@ class AIAnomalyFilter(BaseModel):
         ...,
         description='The dimension to filter on. Dimensions represent different aspects of AI usage that can be filtered',
     )
+    includeDescendants: Optional[bool] = Field(
+        None,
+        description="DEPARTMENT only: also count the department's sub-departments. Defaults to true. Ignored for every other dimension.",
+    )
     operator: Operator = Field(
         ...,
         description='The comparison operator to apply when filtering. Determines how the dimension value is compared against the filter value. IN ("is one of") takes a list in `values` instead of a single `value` and matches when the dimension equals any listed entry; every other operator takes `value`. Filter rows are still combined with AND, so IN adds OR within one row only.',
@@ -102,6 +106,10 @@ class AIAnomalyFilterRead(BaseModel):
         ...,
         description='The dimension to filter on. Dimensions represent different aspects of AI usage that can be filtered',
     )
+    includeDescendants: Optional[bool] = Field(
+        None,
+        description="DEPARTMENT only: also count the department's sub-departments. Defaults to true. Ignored for every other dimension.",
+    )
     operator: Operator = Field(
         ...,
         description='The comparison operator to apply when filtering. Determines how the dimension value is compared against the filter value. IN ("is one of") takes a list in `values` instead of a single `value` and matches when the dimension equals any listed entry; every other operator takes `value`. Filter rows are still combined with AND, so IN adds OR within one row only.',
@@ -125,6 +133,10 @@ class AIAnomalyFilterWrite(BaseModel):
     dimension: Dimension = Field(
         ...,
         description='The dimension to filter on. Dimensions represent different aspects of AI usage that can be filtered',
+    )
+    includeDescendants: Optional[bool] = Field(
+        None,
+        description="DEPARTMENT only: also count the department's sub-departments. Defaults to true. Ignored for every other dimension.",
     )
     operator: Operator = Field(
         ...,
@@ -726,6 +738,27 @@ class BillingProfileRead(BaseModel):
     )
 
 
+class BudgetDepartmentFilterResource(BaseModel):
+    """
+    The one department a budget is filtered to
+    """
+
+    departmentId: Optional[str] = Field(
+        None,
+        description="The department's id, the same value the budget's own filter carries",
+        examples=['412'],
+    )
+    includeSubDepartments: Optional[bool] = Field(
+        None,
+        description="True when the budget also counts the department's sub-departments",
+    )
+    name: Optional[str] = Field(
+        None,
+        description="The department's name; null if it cannot be found",
+        examples=['Platform'],
+    )
+
+
 class BudgetGroupResult(BaseModel):
     """
     Budget progress for a single group within a grouped alert
@@ -749,6 +782,29 @@ class BudgetGroupResult(BaseModel):
         None,
         description='Remaining budget for this group, null if threshold is zero',
         examples=[549.75],
+    )
+
+
+class Code(StrEnum):
+    """
+    Machine-readable note
+    """
+
+    NO_MEMBERS = 'NO_MEMBERS'
+
+
+class BudgetNoticeResource(BaseModel):
+    """
+    A note about a budget whose figures are correct
+    """
+
+    code: Optional[Code] = Field(
+        None, description='Machine-readable note', examples=['NO_MEMBERS']
+    )
+    text: Optional[str] = Field(
+        None,
+        description='Plain-language text to show the admin',
+        examples=['No one is assigned to this department.'],
     )
 
 
@@ -802,6 +858,32 @@ class MetricType3(StrEnum):
     AUDIO_COUNT = 'AUDIO_COUNT'
 
 
+class Code1(StrEnum):
+    """
+    Machine-readable cause. SPEND_UNAVAILABLE: a retry may work. DEPARTMENT_DELETED: the budget's department no longer exists; edit or delete the budget
+    """
+
+    SPEND_UNAVAILABLE = 'SPEND_UNAVAILABLE'
+    DEPARTMENT_DELETED = 'DEPARTMENT_DELETED'
+
+
+class BudgetUnavailableResource(BaseModel):
+    """
+    Why a budget on the portfolio has no figures right now
+    """
+
+    code: Optional[Code1] = Field(
+        None,
+        description="Machine-readable cause. SPEND_UNAVAILABLE: a retry may work. DEPARTMENT_DELETED: the budget's department no longer exists; edit or delete the budget",
+        examples=['SPEND_UNAVAILABLE'],
+    )
+    reason: Optional[str] = Field(
+        None,
+        description='Plain-language reason to show the admin',
+        examples=['Spend could not be loaded. Try again.'],
+    )
+
+
 class BudgetWindowResource(BaseModel):
     """
     Budget window time boundaries
@@ -853,6 +935,111 @@ class CallerScope(BaseModel):
         None,
         description="RESOLVED: the rules' appliesToCaller answers are present, except where that field lists a reason to leave one out. UNAVAILABLE: Revenium could not read which departments the caller belongs to, so they are absent. NOT_NEEDED: the answer has no department rule, so nothing was looked up.",
         examples=['RESOLVED'],
+    )
+
+
+class ChangeType(StrEnum):
+    """
+    The kind of change
+    """
+
+    CREATED = 'CREATED'
+    EDITED = 'EDITED'
+    DELETED = 'DELETED'
+    STARTING_STATE = 'STARTING_STATE'
+
+
+class Relation(StrEnum):
+    """
+    SELF, or LINKED_ALERT for a change to the budget's linked alert
+    """
+
+    SELF = 'SELF'
+    LINKED_ALERT = 'LINKED_ALERT'
+
+
+class Type(StrEnum):
+    """
+    Budget (COST_CONTROL) or alert (ALERT)
+    """
+
+    COST_CONTROL = 'COST_CONTROL'
+    ALERT = 'ALERT'
+
+
+class ChangeSubject(BaseModel):
+    """
+    The budget or alert a change was made to
+    """
+
+    deleted: Optional[bool] = Field(
+        None, description='True when the item is deleted today'
+    )
+    id: Optional[str] = Field(None, description="The item's id", examples=['jR2kmLs'])
+    nameAtTheTime: Optional[str] = Field(
+        None,
+        description="The item's name as of this change",
+        examples=['Monthly OpenAI Cap'],
+    )
+    teamId: Optional[str] = Field(
+        None, description='The id of the team the item belongs to', examples=['a91XJp']
+    )
+    type: Optional[Type] = Field(
+        None, description='Budget (COST_CONTROL) or alert (ALERT)'
+    )
+
+
+class Kind(StrEnum):
+    """
+    The kind of author
+    """
+
+    PERSON = 'PERSON'
+    API_KEY = 'API_KEY'
+    REVENIUM_SUPPORT = 'REVENIUM_SUPPORT'
+    SYSTEM = 'SYSTEM'
+
+
+class Role(StrEnum):
+    """
+    The role the author acted under. A change saved before roles were recorded, and every alert change, reads ADMINISTRATOR, the only role that could make it; a system change reads SYSTEM.
+    """
+
+    ADMINISTRATOR = 'ADMINISTRATOR'
+    DEPARTMENT_ADMIN = 'DEPARTMENT_ADMIN'
+    SYSTEM = 'SYSTEM'
+
+
+class ChangedBy(BaseModel):
+    """
+    Who made a change. Revenium staff are never named: they show as Revenium Support.
+    """
+
+    apiKeyId: Optional[str] = Field(
+        None,
+        description="The API key's id, for an API_KEY author only",
+        examples=['5jW1GD'],
+    )
+    apiKeyName: Optional[str] = Field(
+        None,
+        description="The API key's name, for an API_KEY author only; null when it was not recorded in full",
+        examples=['ci-bot'],
+    )
+    display: Optional[str] = Field(
+        None,
+        description="The author as a finance reader sees it: a person's email, `API key <name> (owner <email>)` (the key id when the name is unknown), `Revenium Support`, or `Revenium (system)`. Show verbatim.",
+        examples=['API key ci-bot (owner ops@acme.com)'],
+    )
+    kind: Optional[Kind] = Field(None, description='The kind of author')
+    role: Optional[Role] = Field(
+        None,
+        description='The role the author acted under. A change saved before roles were recorded, and every alert change, reads ADMINISTRATOR, the only role that could make it; a system change reads SYSTEM.',
+        examples=['DEPARTMENT_ADMIN'],
+    )
+    value: Optional[str] = Field(
+        None,
+        description='The stored author exactly as recorded, already masked; `SYSTEM` for a system change, a change with no recorded author, and the starting state recorded when change history began. Any other starting state keeps its recorded author. `administrator` or `department admin` where the author is shown to a Member or Department Admin by role.',
+        examples=['ops@acme.com via API key 5jW1GD (ci-bot)'],
     )
 
 
@@ -922,7 +1109,7 @@ class CodingAssistantFilterSettingsResource(BaseModel):
     )
 
 
-class FieldEmbedded5(BaseModel):
+class FieldEmbedded6(BaseModel):
     objectList: Optional[list[Any]] = None
 
 
@@ -1168,6 +1355,16 @@ class Action(Enum):
     WARN_ONLY = 'WARN_ONLY'
 
 
+class CreatedAs(Enum):
+    """
+    The role the creator acted under. Null with createdBy. A rule created before roles were recorded reads ADMINISTRATOR, the only role that could create one then.
+    """
+
+    ADMINISTRATOR = 'ADMINISTRATOR'
+    DEPARTMENT_ADMIN = 'DEPARTMENT_ADMIN'
+    SYSTEM = 'SYSTEM'
+
+
 class GroupBy4(Enum):
     """
     Optional dimension to partition the rule evaluation (per-model, per-provider, etc.). Omit a field to keep its current value. Send null to clear it.
@@ -1205,6 +1402,16 @@ class MetricType6(Enum):
     CREDITS_CONSUMED = 'CREDITS_CONSUMED'
 
 
+class ModifiedAs(Enum):
+    """
+    The role the author of the last change acted under, in the same form as createdAs. Null with modifiedBy.
+    """
+
+    ADMINISTRATOR = 'ADMINISTRATOR'
+    DEPARTMENT_ADMIN = 'DEPARTMENT_ADMIN'
+    SYSTEM = 'SYSTEM'
+
+
 class WindowType(Enum):
     """
     Rolling window over which usage is accumulated
@@ -1214,122 +1421,6 @@ class WindowType(Enum):
     WEEKLY = 'WEEKLY'
     MONTHLY = 'MONTHLY'
     QUARTERLY = 'QUARTERLY'
-
-
-class CoverageMeteredBasisRead(BaseModel):
-    transform: Optional[str] = Field(
-        None,
-        description="What was done to the metered amounts before they were reported. none means each figure is the plain sum of that provider's metered usage. Otherwise a comma-separated list of adjustments: narrowed-window or zeroed-no-overlap.",
-        examples=['none'],
-    )
-    windowEnd: Optional[date_aliased] = Field(
-        None,
-        description='Last day included in the requested metered window',
-        examples=['2026-09-01'],
-    )
-    windowStart: Optional[date_aliased] = Field(
-        None,
-        description='First day included in the requested metered window',
-        examples=['2026-08-03'],
-    )
-
-
-class CoverageMeteredDayRowRead(BaseModel):
-    apiRateAgent: Optional[str] = Field(
-        None,
-        description="The coding-assistant token in the usage's agent field, under the same rule as apiRateProvider.",
-        examples=['claude-code'],
-    )
-    apiRateProvider: Optional[str] = Field(
-        None,
-        description="Null together with apiRateAgent when the row counts whatever the team's pricing policy. Otherwise the coding-assistant token in the usage's provider field. Coverage always counts Copilot; other assistants count when the team prices them at API rates.",
-        examples=['ClaudeCode'],
-    )
-    bucket: Optional[str] = Field(
-        None,
-        description='The billing bucket the cost is filed under, lowercase, as the coverage response names providers. Claude Code and Claude Cowork usage is sent under anthropic; its apiRateProvider or apiRateAgent token is what reports it against the Claude Enterprise key (anthropic_enterprise) rather than the Anthropic Console key.',
-        examples=['anthropic'],
-    )
-    callsThroughLastMillisecond: Optional[int] = Field(
-        None,
-        description='Number of calls of the day up to 23:59:59.999.',
-        examples=[1520],
-    )
-    day: Optional[date_aliased] = Field(
-        None, description='UTC calendar day of the usage.', examples=['2026-09-15']
-    )
-    dayTotal: Optional[float] = Field(
-        None,
-        description='Metered cost of the whole day, as a decimal string.',
-        examples=[2352.97745215],
-    )
-    dayTotalThroughLastMillisecond: Optional[float] = Field(
-        None,
-        description='Metered cost of the day up to 23:59:59.999, the latest instant a coverage window ends on.',
-        examples=[2352.97745215],
-    )
-    earliestMeteredAt: Optional[AwareDatetime] = Field(
-        None,
-        description='Earliest usage of the day in this row.',
-        examples=['2026-09-15T21:35:55.593Z'],
-    )
-
-
-class CoverageMeteredDaysRead(BaseModel):
-    fromDay: Optional[date_aliased] = Field(
-        None,
-        description='First UTC day the rows cover. Must be on or before the first day of the prior comparison period.',
-        examples=['2026-08-07'],
-    )
-    rows: Optional[list[CoverageMeteredDayRowRead]] = Field(
-        None, max_length=100000, min_length=0
-    )
-    toDay: Optional[date_aliased] = Field(
-        None,
-        description='Last UTC day the rows cover. Must be on or after the last day of the requested period.',
-        examples=['2026-10-09'],
-    )
-
-
-class CoverageRatioRequestRead(BaseModel):
-    """
-    Metered usage per billing bucket and day, aggregated by the caller, that the coverage ratio compares against provider billing.
-    """
-
-    meteredDays: Optional[CoverageMeteredDaysRead] = Field(
-        None, description='The per-day metered rows and the span of days they cover.'
-    )
-
-
-class AggregateRatioUnavailableReason(Enum):
-    """
-    Why the aggregate ratio cannot be calculated: no eligible billing credential, no provider with overlapping records, a non-positive compared billing total, or no spend in the period. Absent when the ratio is available.
-    """
-
-    NO_BILLING_CREDENTIAL = 'NO_BILLING_CREDENTIAL'
-    NO_COMPARABLE_PROVIDERS = 'NO_COMPARABLE_PROVIDERS'
-    NON_POSITIVE_BILLING_TOTAL = 'NON_POSITIVE_BILLING_TOTAL'
-    ZERO_SPEND_PERIOD = 'ZERO_SPEND_PERIOD'
-
-
-class Confidence1(Enum):
-    """
-    Coverage confidence: HIGH when every provider compares the full requested period, adjusted when any provider compares a shorter period or none.
-    """
-
-    HIGH = 'HIGH'
-    adjusted = 'adjusted'
-
-
-class State(StrEnum):
-    """
-    Overall coverage state
-    """
-
-    VALID = 'VALID'
-    NO_INTEGRATION = 'NO_INTEGRATION'
-    ZERO_SPEND_PERIOD = 'ZERO_SPEND_PERIOD'
-    DATA_UNAVAILABLE = 'DATA_UNAVAILABLE'
 
 
 class CoworkOrgLinkRequestRead(BaseModel):
@@ -1343,7 +1434,7 @@ class CoworkOrgLinkRequestRead(BaseModel):
     )
 
 
-class State1(StrEnum):
+class State(StrEnum):
     LINKED = 'LINKED'
     LINKED_BY_ANOTHER_ACCOUNT = 'LINKED_BY_ANOTHER_ACCOUNT'
     NOT_LINKED = 'NOT_LINKED'
@@ -1353,7 +1444,7 @@ class CoworkOrgLinkResponseRead(BaseModel):
     claudeOrgUuid: Optional[str] = None
     id: Optional[str] = None
     source: Optional[str] = None
-    state: Optional[State1] = None
+    state: Optional[State] = None
     toolName: Optional[str] = Field(
         None,
         description='The name shown in Cowork in place of Revenium, or null when none is set.',
@@ -1897,9 +1988,9 @@ class MetricType11(StrEnum):
     AUDIO_COUNT = 'AUDIO_COUNT'
 
 
-class Risk(StrEnum):
+class Risk(Enum):
     """
-    Risk level based on usage percentage. For a grouped budget, from its highest group
+    Risk level based on usage percentage. For a grouped budget, from its highest group. Null only when unavailable is set
     """
 
     LOW = 'LOW'
@@ -2060,7 +2151,7 @@ class PaymentSource(StrEnum):
     INVOICE_ONLY_NO_PAYMENT = 'INVOICE_ONLY_NO_PAYMENT'
 
 
-class State2(Enum):
+class State1(Enum):
     """
     The current state of the invoice in its lifecycle
     """
@@ -2105,7 +2196,7 @@ class Source7(StrEnum):
     API = 'API'
 
 
-class Type(StrEnum):
+class Type1(StrEnum):
     """
     The type of the metering element definition
     """
@@ -2133,7 +2224,7 @@ class Currency1(Enum):
     ZWG = 'ZWG'
 
 
-class Type1(StrEnum):
+class Type2(StrEnum):
     CONSUMER = 'CONSUMER'
 
 
@@ -2179,7 +2270,7 @@ class PaymentProvider1(Enum):
     STRIPE = 'STRIPE'
 
 
-class Type2(StrEnum):
+class Type3(StrEnum):
     """
     The transaction type category for this charge
     """
@@ -2283,7 +2374,7 @@ class SourceType(Enum):
     INTERNAL = 'INTERNAL'
 
 
-class Type3(StrEnum):
+class Type4(StrEnum):
     """
     The type of the source
     """
@@ -2368,7 +2459,7 @@ class Persona(Enum):
     platform_engineering = 'platform_engineering'
 
 
-class Code(StrEnum):
+class Code2(StrEnum):
     """
     Error code
     """
@@ -2376,9 +2467,12 @@ class Code(StrEnum):
     NOT_FOUND = 'NOT_FOUND'
     UNSUPPORTED_TYPE = 'UNSUPPORTED_TYPE'
     VALIDATION_ERROR = 'VALIDATION_ERROR'
+    NOT_CALCULABLE = 'NOT_CALCULABLE'
+    SPEND_UNAVAILABLE = 'SPEND_UNAVAILABLE'
+    DEPARTMENT_DELETED = 'DEPARTMENT_DELETED'
 
 
-class Type4(StrEnum):
+class Type5(StrEnum):
     """
     Error type
     """
@@ -2386,6 +2480,9 @@ class Type4(StrEnum):
     NOT_FOUND = 'NOT_FOUND'
     UNSUPPORTED_TYPE = 'UNSUPPORTED_TYPE'
     VALIDATION_ERROR = 'VALIDATION_ERROR'
+    NOT_CALCULABLE = 'NOT_CALCULABLE'
+    SPEND_UNAVAILABLE = 'SPEND_UNAVAILABLE'
+    DEPARTMENT_DELETED = 'DEPARTMENT_DELETED'
 
 
 class ErrorDetail(BaseModel):
@@ -2393,14 +2490,86 @@ class ErrorDetail(BaseModel):
     Error detail information
     """
 
-    code: Optional[Code] = Field(None, description='Error code', examples=['NOT_FOUND'])
+    code: Optional[Code2] = Field(
+        None, description='Error code', examples=['NOT_FOUND']
+    )
     message: Optional[str] = Field(
         None,
         description='Human-readable error message',
         examples=['AI Anomaly with id jR2kmLs not found'],
     )
-    type: Optional[Type4] = Field(
+    type: Optional[Type5] = Field(
         None, description='Error type', examples=['NOT_FOUND']
+    )
+
+
+class BeforeValueType(StrEnum):
+    """
+    How to format before, taken from the setting as it was before this save; equals valueType unless the save also changed the setting's unit
+    """
+
+    TEXT = 'TEXT'
+    NUMBER = 'NUMBER'
+    CURRENCY_USD = 'CURRENCY_USD'
+    PERCENT = 'PERCENT'
+    YES_NO = 'YES_NO'
+
+
+class Change(StrEnum):
+    """
+    CHANGED for a setting; ADDED or REMOVED for one list item
+    """
+
+    CHANGED = 'CHANGED'
+    ADDED = 'ADDED'
+    REMOVED = 'REMOVED'
+
+
+class ValueType(StrEnum):
+    """
+    How to format after. Format before with beforeValueType: the two differ when the same save also changed the setting's unit, such as a budget switched from cost to tokens with its limit.
+    """
+
+    TEXT = 'TEXT'
+    NUMBER = 'NUMBER'
+    CURRENCY_USD = 'CURRENCY_USD'
+    PERCENT = 'PERCENT'
+    YES_NO = 'YES_NO'
+
+
+class FieldChange(BaseModel):
+    """
+    One setting changed, or one list item added or removed
+    """
+
+    after: Optional[str] = Field(
+        None,
+        description="The value after; null when cleared and on a REMOVED item, except settings whose cleared state has a name: `Whole team` for a budget's grouping, `Not grouped` for an alert's grouping, `Immediately` for an alert's persistence.",
+        examples=['1500'],
+    )
+    before: Optional[str] = Field(
+        None,
+        description='The value before; null when not set, on a create, and on an ADDED item. Numbers are plain (1500), labels are display text, booleans On or Off.',
+        examples=['1000'],
+    )
+    beforeValueType: Optional[BeforeValueType] = Field(
+        None,
+        description="How to format before, taken from the setting as it was before this save; equals valueType unless the save also changed the setting's unit",
+    )
+    change: Optional[Change] = Field(
+        None, description='CHANGED for a setting; ADDED or REMOVED for one list item'
+    )
+    field: Optional[str] = Field(
+        None, description="The setting's key", examples=['hardLimit']
+    )
+    label: Optional[str] = Field(
+        None,
+        description="The setting's label as shown on screen",
+        examples=['Hard limit'],
+    )
+    valueType: Optional[ValueType] = Field(
+        None,
+        description="How to format after. Format before with beforeValueType: the two differ when the same save also changed the setting's unit, such as a budget switched from cost to tokens with its limit.",
     )
 
 
@@ -2501,6 +2670,11 @@ class GroupedBudgetProgressResource(BaseModel):
     )
     metricType: Optional[MetricType14] = Field(
         None, description='Metric type being tracked', examples=['TOTAL_COST']
+    )
+    spendNotInAnyDepartment: Optional[float] = Field(
+        None,
+        description='Spend in this window from calls with no email or from people in no department at the time of the call. Not covered by this budget, never a group, never alerted.',
+        examples=[1250.0],
     )
     threshold: Optional[float] = Field(
         None,
@@ -2745,7 +2919,7 @@ class Resolution(StrEnum):
     PERIOD = 'PERIOD'
 
 
-class Type5(StrEnum):
+class Type6(StrEnum):
     """
     What kind of number the metric is. COUNT is a whole-number count, DURATION is a length of time, PERCENT is a percentage, MONEY is an amount of money, SCORE is a rating.
     """
@@ -2782,7 +2956,7 @@ class JobTypeMetricDefinition(BaseModel):
         description='Where you report the metric. PER_JOB means on one job (POST /v2/api/jobs/{agenticJobId}/outcome/metrics). PERIOD means for a time period and dimension value (POST /v2/api/jobs/types/{type}/facts).',
         examples=['PER_JOB'],
     )
-    type: Optional[Type5] = Field(
+    type: Optional[Type6] = Field(
         None,
         description='What kind of number the metric is. COUNT is a whole-number count, DURATION is a length of time, PERCENT is a percentage, MONEY is an amount of money, SCORE is a rating.',
         examples=['COUNT'],
@@ -3182,7 +3356,7 @@ class MarketplaceSettingsResourceWrite(BaseModel):
     )
 
 
-class Type6(StrEnum):
+class Type7(StrEnum):
     """
     The type of the metering element definition
     """
@@ -3303,7 +3477,7 @@ class Currency4(Enum):
     ZWG = 'ZWG'
 
 
-class Type9(StrEnum):
+class Type10(StrEnum):
     CONSUMER = 'CONSUMER'
 
 
@@ -3547,7 +3721,7 @@ class TrialPeriod(Enum):
     NONE = 'NONE'
 
 
-class Type11(StrEnum):
+class Type12(StrEnum):
     """
     The plan type determining the billing model. SUBSCRIPTION represents recurring billing with optional metered usage.
     """
@@ -3555,7 +3729,7 @@ class Type11(StrEnum):
     SUBSCRIPTION = 'SUBSCRIPTION'
 
 
-class Type12(StrEnum):
+class Type13(StrEnum):
     """
     The metering/aggregation method for this plan element, determining how metric values are counted, summed, or analyzed for billing. This is the plan element's `type` field and is distinct from a rating aggregation's `aggregationType` field. COUNT_DISTINCT_VALUE_BY_NAME and DISTINCT_VALUE_BY_NAME are valid here but are not valid `aggregationType` values.
     """
@@ -3594,7 +3768,7 @@ class PlanElement(BaseModel):
         description='The name of the metering element for identification purposes',
         examples=['Shipping Weight'],
     )
-    type: Type12 = Field(
+    type: Type13 = Field(
         ...,
         description="The metering/aggregation method for this plan element, determining how metric values are counted, summed, or analyzed for billing. This is the plan element's `type` field and is distinct from a rating aggregation's `aggregationType` field. COUNT_DISTINCT_VALUE_BY_NAME and DISTINCT_VALUE_BY_NAME are valid here but are not valid `aggregationType` values.",
         examples=['COUNT'],
@@ -3631,7 +3805,7 @@ class PlanElementRead(BaseModel):
         description='The name of the metering element for identification purposes',
         examples=['Shipping Weight'],
     )
-    type: Type12 = Field(
+    type: Type13 = Field(
         ...,
         description="The metering/aggregation method for this plan element, determining how metric values are counted, summed, or analyzed for billing. This is the plan element's `type` field and is distinct from a rating aggregation's `aggregationType` field. COUNT_DISTINCT_VALUE_BY_NAME and DISTINCT_VALUE_BY_NAME are valid here but are not valid `aggregationType` values.",
         examples=['COUNT'],
@@ -3643,7 +3817,7 @@ class PlanElementRead(BaseModel):
     )
 
 
-class Type14(StrEnum):
+class Type15(StrEnum):
     """
     The plan type determining the billing model. SUBSCRIPTION represents recurring billing with optional metered usage.
     """
@@ -3921,26 +4095,6 @@ class PrimaryAssignmentResponseRead(BaseModel):
         description='When this assignment became effective',
         examples=['2024-01-15T10:30:00Z'],
     )
-
-
-class CodingAssistantPricingMode(Enum):
-    """
-    How coverage classifies the coding assistants counted under this provider: pay-as-you-go, seat-plan, or unset. GitHub Copilot always reports pay-as-you-go here because its metered usage participates in reconciliation, regardless of the team's saved pricing setting. Other assistants follow the team's pricing policy. This field does not change that setting. Absent when no assistant is counted under this provider.
-    """
-
-    pay_as_you_go = 'pay-as-you-go'
-    seat_plan = 'seat-plan'
-    unset = 'unset'
-
-
-class ComparisonState(StrEnum):
-    """
-    Whether this row compares the full requested window, a shorter shared window, or no overlapping records
-    """
-
-    full_window = 'full-window'
-    partial_window = 'partial-window'
-    no_overlap = 'no-overlap'
 
 
 class QuotaConsumed(BaseModel):
@@ -4232,7 +4386,7 @@ class SessionIdentityResource(BaseModel):
     )
 
 
-class Type15(StrEnum):
+class Type16(StrEnum):
     """
     The scope at which the setup fee is applied. ORGANIZATION applies the fee once per organization, SUBSCRIPTION applies the fee for each new subscription
     """
@@ -4259,7 +4413,7 @@ class SetupFee(BaseModel):
         description='The name of the setup fee for identification and display on invoices',
         examples=['Onboarding Fee'],
     )
-    type: Type15 = Field(
+    type: Type16 = Field(
         ...,
         description='The scope at which the setup fee is applied. ORGANIZATION applies the fee once per organization, SUBSCRIPTION applies the fee for each new subscription',
         examples=['SUBSCRIPTION'],
@@ -4284,7 +4438,7 @@ class SetupFeeRead(BaseModel):
         description='The name of the setup fee for identification and display on invoices',
         examples=['Onboarding Fee'],
     )
-    type: Type15 = Field(
+    type: Type16 = Field(
         ...,
         description='The scope at which the setup fee is applied. ORGANIZATION applies the fee once per organization, SUBSCRIPTION applies the fee for each new subscription',
         examples=['SUBSCRIPTION'],
@@ -4449,7 +4603,7 @@ class SourceClassificationWrite(BaseModel):
     )
 
 
-class Type17(StrEnum):
+class Type18(StrEnum):
     """
     The type of the source
     """
@@ -4584,7 +4738,7 @@ class SourceResource(BaseModel):
         description='The unique identifier of the team that owns this source',
         examples=['a91XJp'],
     )
-    type: Type17 = Field(..., description='The type of the source', examples=['API'])
+    type: Type18 = Field(..., description='The type of the source', examples=['API'])
     updated: Optional[str] = Field(
         None,
         description='The updated timestamp (ISO 8601 extended date-time format, e.g., 2024-09-01T00:00:00Z)',
@@ -4711,7 +4865,7 @@ class SourceResourceRead(BaseModel):
         description='The unique identifier of the team that owns this source',
         examples=['a91XJp'],
     )
-    type: Type17 = Field(..., description='The type of the source', examples=['API'])
+    type: Type18 = Field(..., description='The type of the source', examples=['API'])
     updated: Optional[str] = Field(
         None,
         description='The updated timestamp (ISO 8601 extended date-time format, e.g., 2024-09-01T00:00:00Z)',
@@ -4838,7 +4992,7 @@ class SourceResourceWrite(BaseModel):
         description='The unique identifier of the team that owns this source',
         examples=['a91XJp'],
     )
-    type: Type17 = Field(..., description='The type of the source', examples=['API'])
+    type: Type18 = Field(..., description='The type of the source', examples=['API'])
     updated: Optional[str] = Field(
         None,
         description='The updated timestamp (ISO 8601 extended date-time format, e.g., 2024-09-01T00:00:00Z)',
@@ -5148,7 +5302,7 @@ class SubscriptionPatchResource(BaseModel):
     )
 
 
-class Kind(StrEnum):
+class Kind1(StrEnum):
     """
     TEAM: the whole team. DEPARTMENTS: departmentIds plus the user's own emails. SELF: only the user's own emails.
     """
@@ -5173,7 +5327,7 @@ class TeamAccessResource(BaseModel):
         description="For DEPARTMENTS and SELF, the email addresses whose usage is the user's own: their login email and every email the directory links to them, lower-cased and sorted. Empty for TEAM.",
         examples=[['ash@weyland-yutani.io']],
     )
-    kind: Optional[Kind] = Field(
+    kind: Optional[Kind1] = Field(
         None,
         description="TEAM: the whole team. DEPARTMENTS: departmentIds plus the user's own emails. SELF: only the user's own emails.",
     )
@@ -5197,7 +5351,7 @@ class TeamAccessResourceRead(BaseModel):
         description="For DEPARTMENTS and SELF, the email addresses whose usage is the user's own: their login email and every email the directory links to them, lower-cased and sorted. Empty for TEAM.",
         examples=[['ash@weyland-yutani.io']],
     )
-    kind: Optional[Kind] = Field(
+    kind: Optional[Kind1] = Field(
         None,
         description="TEAM: the whole team. DEPARTMENTS: departmentIds plus the user's own emails. SELF: only the user's own emails.",
     )
@@ -5221,7 +5375,7 @@ class TeamAccessResourceWrite(BaseModel):
         description="For DEPARTMENTS and SELF, the email addresses whose usage is the user's own: their login email and every email the directory links to them, lower-cased and sorted. Empty for TEAM.",
         examples=[['ash@weyland-yutani.io']],
     )
-    kind: Optional[Kind] = Field(
+    kind: Optional[Kind1] = Field(
         None,
         description="TEAM: the whole team. DEPARTMENTS: departmentIds plus the user's own emails. SELF: only the user's own emails.",
     )
@@ -5322,7 +5476,7 @@ class InvoiceHoldingPeriod(Enum):
     NONE = 'NONE'
 
 
-class Type20(StrEnum):
+class Type21(StrEnum):
     MANAGING = 'MANAGING'
 
 
@@ -5452,7 +5606,7 @@ class TeamResource(BaseModel):
         description='The ID of the account that owns this team',
         examples=['6PV0xe'],
     )
-    types: Optional[list[Type20]] = Field(
+    types: Optional[list[Type21]] = Field(
         None,
         description="The team type (array with single value). Teams must be type MANAGING, which represents internal business units or teams that manage consumer organizations and want to separate their usage and analytics by group. In the Revenium UI, MANAGING teams are displayed as 'Teams'. Note: If you attempt to create a team with type CONSUMING, it will create an organization instead (see /v2/api/organizations endpoint).",
         examples=[['MANAGING']],
@@ -5604,7 +5758,7 @@ class TeamResourceRead(BaseModel):
         description='The ID of the account that owns this team',
         examples=['6PV0xe'],
     )
-    types: Optional[list[Type20]] = Field(
+    types: Optional[list[Type21]] = Field(
         None,
         description="The team type (array with single value). Teams must be type MANAGING, which represents internal business units or teams that manage consumer organizations and want to separate their usage and analytics by group. In the Revenium UI, MANAGING teams are displayed as 'Teams'. Note: If you attempt to create a team with type CONSUMING, it will create an organization instead (see /v2/api/organizations endpoint).",
         examples=[['MANAGING']],
@@ -6127,19 +6281,6 @@ class UsageBillingRequestRead(BaseModel):
         ...,
         description='Whether usage-based billing is on for your account. When false, the billing screens in the Revenium app (invoices, payment methods, plans and subscriptions) are hidden and your usage stops being rated; usage that arrives while it is false is never rated, including after it is set back to true. Required: omitting it or sending null is rejected with a 400.',
         examples=[True],
-    )
-
-
-class UsageTypeBillingRead(BaseModel):
-    billing: Optional[float] = Field(
-        None,
-        description="Billed amount for this charge type over the row's comparison window",
-        examples=[30.0],
-    )
-    usageType: Optional[str] = Field(
-        None,
-        description="The charge type as recorded from the provider's bill, such as web_search. The set of values is open, so treat an unknown value as unclassified.",
-        examples=['web_search'],
     )
 
 
@@ -7334,9 +7475,23 @@ class V2ApiAiAlertsAnomalyIdBudgetProgressGetParametersQuery(BaseModel):
     includeTrend: Optional[bool] = None
 
 
+class V2ApiAiControlChangesGetParametersQuery(BaseModel):
+    teamId: str
+    since: str
+    until: str
+    subjectType: Optional[str] = None
+    subjectId: Optional[str] = None
+    changeType: Optional[list[str]] = None
+    changedBy: Optional[str] = None
+    apiKeyId: Optional[str] = None
+    page: Optional[int] = 0
+    size: Optional[int] = 20
+
+
 class V2ApiAiCostControlsGetParametersQuery(BaseModel):
     query: Optional[str] = None
     teamId: str
+    createdById: Optional[str] = None
     page: Optional[conint(ge=0)] = 0
     size: Optional[conint(ge=1)] = 10
     sort: Optional[list[str]] = None
@@ -7344,6 +7499,11 @@ class V2ApiAiCostControlsGetParametersQuery(BaseModel):
 
 class V2ApiAiCostControlsIdDeleteParametersQuery(BaseModel):
     changeReason: Optional[str] = None
+
+
+class V2ApiAiCostControlsIdChangesGetParametersQuery(BaseModel):
+    page: Optional[int] = 0
+    size: Optional[int] = 20
 
 
 class Mode(StrEnum):
@@ -7457,136 +7617,6 @@ class Dimension5(StrEnum):
 class V2ApiAiFilterValuesGetParametersQuery(BaseModel):
     teamId: str
     dimension: Dimension5
-
-
-class Period3(StrEnum):
-    """
-    Time period for analytics
-    """
-
-    field_24h = '24h'
-    field_7d = '7d'
-    field_30d = '30d'
-    field_90d = '90d'
-    custom = 'custom'
-
-
-class Provider3(StrEnum):
-    """
-    Filter results by AI provider. Omit to include all providers.
-    """
-
-    anthropic = 'anthropic'
-    anthropic_enterprise = 'anthropic_enterprise'
-    openai = 'openai'
-    azure = 'azure'
-    bedrock = 'bedrock'
-    vertex = 'vertex'
-    openrouter = 'openrouter'
-    litellm = 'litellm'
-    runway = 'runway'
-    fal = 'fal'
-    cursor = 'cursor'
-    github_copilot = 'github_copilot'
-    openai_enterprise = 'openai_enterprise'
-
-
-class UsageType(StrEnum):
-    """
-    Filter by usage type. Omit to include all types.
-    """
-
-    completion = 'completion'
-    image = 'image'
-    embedding = 'embedding'
-    audio = 'audio'
-    video = 'video'
-
-
-class V2ApiBillingCoverageGetParametersQuery(BaseModel):
-    period: Period3 = Field(
-        ..., description='Time period for analytics', examples=['30d']
-    )
-    startDate: Optional[str] = Field(
-        None,
-        description='Filter start date/time in ISO 8601 format.',
-        examples=['2025-09-01T00:00:00Z'],
-    )
-    endDate: Optional[str] = Field(
-        None,
-        description='Filter end date/time in ISO 8601 format.',
-        examples=['2025-09-01T00:00:00Z'],
-    )
-    provider: Optional[Provider3] = Field(
-        None,
-        description='Filter results by AI provider. Omit to include all providers.',
-        examples=['anthropic'],
-    )
-    usageType: Optional[UsageType] = Field(
-        None,
-        description='Filter by usage type. Omit to include all types.',
-        examples=['completion'],
-    )
-    apiKey: Optional[str] = Field(
-        None,
-        description="Narrow results to a single API key id within the caller's organization, matched exactly. Honoured by /billing/chart, /billing/models, /billing/api-keys and /billing/users; other billing endpoints ignore it. On those four, rows and totals cover only charges stored under that id, so a value that matches no stored charge returns a zero total, never the organization total.",
-        examples=['apikey_011K4gLy'],
-    )
-    workspace: Optional[str] = Field(
-        None,
-        description='Narrow results to a single workspace, given as the `id` /billing/workspaces returns, matched exactly. A Revenium name covers every provider workspace merged under it; an `unassigned:` id covers that one provider workspace. Honoured by /billing/chart, /billing/models, /billing/api-keys, /billing/users and /billing/daily; other billing endpoints ignore it. On those five, rows and totals cover only charges stored under that workspace, so a value that matches no workspace returns a zero total, never the organization total.',
-        examples=['unassigned:anthropic:wrkspc_01RqcXmnt6FxhXWUbRnvp6cw'],
-    )
-    minCost: Optional[confloat(ge=0.0)] = Field(
-        None, description='Filter by a starting cost (inclusive).', examples=[1.0]
-    )
-    maxCost: Optional[confloat(ge=0.0)] = Field(
-        None, description='Filter by an ending cost (inclusive).', examples=[20.0]
-    )
-    teamId: str
-
-
-class V2ApiBillingCoveragePostParametersQuery(BaseModel):
-    period: Period3 = Field(
-        ..., description='Time period for analytics', examples=['30d']
-    )
-    startDate: Optional[str] = Field(
-        None,
-        description='Filter start date/time in ISO 8601 format.',
-        examples=['2025-09-01T00:00:00Z'],
-    )
-    endDate: Optional[str] = Field(
-        None,
-        description='Filter end date/time in ISO 8601 format.',
-        examples=['2025-09-01T00:00:00Z'],
-    )
-    provider: Optional[Provider3] = Field(
-        None,
-        description='Filter results by AI provider. Omit to include all providers.',
-        examples=['anthropic'],
-    )
-    usageType: Optional[UsageType] = Field(
-        None,
-        description='Filter by usage type. Omit to include all types.',
-        examples=['completion'],
-    )
-    apiKey: Optional[str] = Field(
-        None,
-        description="Narrow results to a single API key id within the caller's organization, matched exactly. Honoured by /billing/chart, /billing/models, /billing/api-keys and /billing/users; other billing endpoints ignore it. On those four, rows and totals cover only charges stored under that id, so a value that matches no stored charge returns a zero total, never the organization total.",
-        examples=['apikey_011K4gLy'],
-    )
-    workspace: Optional[str] = Field(
-        None,
-        description='Narrow results to a single workspace, given as the `id` /billing/workspaces returns, matched exactly. A Revenium name covers every provider workspace merged under it; an `unassigned:` id covers that one provider workspace. Honoured by /billing/chart, /billing/models, /billing/api-keys, /billing/users and /billing/daily; other billing endpoints ignore it. On those five, rows and totals cover only charges stored under that workspace, so a value that matches no workspace returns a zero total, never the organization total.',
-        examples=['unassigned:anthropic:wrkspc_01RqcXmnt6FxhXWUbRnvp6cw'],
-    )
-    minCost: Optional[confloat(ge=0.0)] = Field(
-        None, description='Filter by a starting cost (inclusive).', examples=[1.0]
-    )
-    maxCost: Optional[confloat(ge=0.0)] = Field(
-        None, description='Filter by an ending cost (inclusive).', examples=[20.0]
-    )
-    teamId: str
 
 
 class V2ApiBillingSeatsGetParametersQuery(BaseModel):
@@ -7791,7 +7821,7 @@ class PayState(StrEnum):
     INVOICE_ONLY = 'INVOICE_ONLY'
 
 
-class State3(StrEnum):
+class State2(StrEnum):
     """
     Filter by invoice state(s). Accepts a single value or a comma-separated list.
     """
@@ -7804,8 +7834,21 @@ class State3(StrEnum):
     PARTIALLY_PAID = 'PARTIALLY_PAID'
 
 
+class PaymentSource4(StrEnum):
+    """
+    Filter by payment source(s). Accepts a single value or a comma-separated list.
+    """
+
+    EXTERNAL_PAYMENT_NOTIFICATION = 'EXTERNAL_PAYMENT_NOTIFICATION'
+    PAYMENT_VIA_PAYMENT_PROVIDER = 'PAYMENT_VIA_PAYMENT_PROVIDER'
+    INVOICE_ONLY_NO_PAYMENT = 'INVOICE_ONLY_NO_PAYMENT'
+
+
 class V2ApiInvoicesGetParametersQuery(BaseModel):
-    invoiceNumber: Optional[str] = Field(None, description='The invoice number')
+    invoiceNumber: Optional[str] = Field(
+        None,
+        description='Filter by invoice number: matches any invoice whose number contains this text, within the other filters. Ignores case; % and _ match themselves.',
+    )
     startDate: Optional[str] = Field(
         None,
         description='Filter start date/time in ISO 8601 format.',
@@ -7841,15 +7884,24 @@ class V2ApiInvoicesGetParametersQuery(BaseModel):
         description='Filter by invoice pay state(s). Accepts a single value or a comma-separated list.',
         examples=['PAID,UNPAID'],
     )
-    states: Optional[list[State3]] = Field(
+    states: Optional[list[State2]] = Field(
         None,
         description='Filter by invoice state(s). Accepts a single value or a comma-separated list.',
         examples=['FINALIZED,ISSUED'],
     )
+    paymentSources: Optional[list[PaymentSource4]] = Field(
+        None,
+        description='Filter by payment source(s). Accepts a single value or a comma-separated list.',
+        examples=['INVOICE_ONLY_NO_PAYMENT'],
+    )
+    failedPaymentsOnly: Optional[bool] = Field(
+        None,
+        description='When true, return only invoices whose payment was attempted and failed.',
+    )
     teamId: str
     page: Optional[conint(ge=0)] = 0
     size: Optional[conint(ge=1)] = 10
-    sort: Optional[list[str]] = None
+    sort: Optional[list[str]] = ['timestamp,DESC', 'id,DESC']
 
 
 class V2ApiInvoicesUnpaidTotalsGetParametersQuery(BaseModel):
@@ -8054,7 +8106,7 @@ class V2ApiProductsGetParametersQuery(BaseModel):
     type: Optional[str] = None
     page: Optional[conint(ge=0)] = 0
     size: Optional[conint(ge=1)] = 10
-    sort: Optional[list[str]] = None
+    sort: Optional[list[str]] = ['name,ASC']
 
 
 class V2ApiRefundsGetParametersQuery(BaseModel):
@@ -8091,20 +8143,9 @@ class V2ApiSessionsSessionIdAttributionPostParametersQuery(BaseModel):
     teamId: Optional[str] = None
 
 
-class Period5(StrEnum):
-    HOUR = 'HOUR'
-    EIGHT_HOURS = 'EIGHT_HOURS'
-    TWENTY_FOUR_HOURS = 'TWENTY_FOUR_HOURS'
-    SEVEN_DAYS = 'SEVEN_DAYS'
-    THIRTY_DAYS = 'THIRTY_DAYS'
-    NINETY_DAYS = 'NINETY_DAYS'
-    SIX_MONTHS = 'SIX_MONTHS'
-    TWELVE_MONTHS = 'TWELVE_MONTHS'
-
-
 class V2ApiSkillsGetParametersQuery(BaseModel):
     teamId: str
-    period: Optional[Period5] = None
+    period: Optional[Period2] = None
     page: Optional[conint(ge=0)] = 0
     size: Optional[conint(ge=1)] = 20
     sort: Optional[list[str]] = ['totalCost,DESC']
@@ -8112,7 +8153,7 @@ class V2ApiSkillsGetParametersQuery(BaseModel):
 
 class V2ApiSkillsSkillIdGetParametersQuery(BaseModel):
     teamId: str
-    period: Optional[Period5] = None
+    period: Optional[Period2] = None
 
 
 class V2ApiSourcesGetParametersQuery(BaseModel):
@@ -8123,7 +8164,7 @@ class V2ApiSourcesGetParametersQuery(BaseModel):
     sort: Optional[list[str]] = None
 
 
-class Type22(StrEnum):
+class Type23(StrEnum):
     TOTAL_COST = 'TOTAL_COST'
     COST_PER_TRANSACTION = 'COST_PER_TRANSACTION'
     TOKENS_PER_MINUTE = 'TOKENS_PER_MINUTE'
@@ -8151,7 +8192,7 @@ class Type22(StrEnum):
 
 class V2ApiSourcesAiAlertGetParametersQuery(BaseModel):
     teamId: str
-    type: Optional[Type22] = None
+    type: Optional[Type23] = None
     start: Optional[str] = None
     end: Optional[str] = None
     anomalyId: Optional[str] = None
@@ -8166,6 +8207,7 @@ class V2ApiSourcesAiAnomalyGetParametersQuery(BaseModel):
     query: Optional[str] = None
     teamId: str
     type: Optional[str] = None
+    createdById: Optional[str] = None
     page: Optional[conint(ge=0)] = 0
     size: Optional[conint(ge=1)] = 10
     sort: Optional[list[str]] = None
@@ -8182,6 +8224,11 @@ class V2ApiSourcesAiAnomalyProviderDimensionsApiKeysGetParametersQuery(BaseModel
 
 class V2ApiSourcesAiAnomalyIdDeleteParametersQuery(BaseModel):
     changeReason: Optional[str] = None
+
+
+class V2ApiSourcesAiAnomalyIdChangesGetParametersQuery(BaseModel):
+    page: Optional[int] = 0
+    size: Optional[int] = 20
 
 
 class ModelType(StrEnum):
@@ -8212,7 +8259,7 @@ class V2ApiSourcesAiModelsProvidersGetResponse(RootModel[list[str]]):
 
 class V2ApiSourcesMetricsAiCallCountMetricsByAgentsGetParametersQuery(BaseModel):
     teamId: str
-    period: Optional[Period5] = None
+    period: Optional[Period2] = None
     startDate: Optional[str] = None
     endDate: Optional[str] = None
     agents: Optional[list[str]] = None
@@ -8437,7 +8484,7 @@ class Group(StrEnum):
 
 class V2ApiSourcesMetricsAiCostMetricByModelGetParametersQuery(BaseModel):
     teamId: str
-    period: Optional[Period5] = None
+    period: Optional[Period2] = None
     startDate: Optional[str] = None
     endDate: Optional[str] = None
     models: Optional[list[str]] = None
@@ -8446,7 +8493,7 @@ class V2ApiSourcesMetricsAiCostMetricByModelGetParametersQuery(BaseModel):
 
 class V2ApiSourcesMetricsAiCostMetricByOrganizationGetParametersQuery(BaseModel):
     teamId: str
-    period: Optional[Period5] = None
+    period: Optional[Period2] = None
     startDate: Optional[str] = None
     endDate: Optional[str] = None
     group: Optional[Group] = None
@@ -8455,7 +8502,7 @@ class V2ApiSourcesMetricsAiCostMetricByOrganizationGetParametersQuery(BaseModel)
 
 class V2ApiSourcesMetricsAiCostMetricByProductGetParametersQuery(BaseModel):
     teamId: str
-    period: Optional[Period5] = None
+    period: Optional[Period2] = None
     startDate: Optional[str] = None
     endDate: Optional[str] = None
     group: Optional[Group] = None
@@ -8464,7 +8511,7 @@ class V2ApiSourcesMetricsAiCostMetricByProductGetParametersQuery(BaseModel):
 
 class V2ApiSourcesMetricsAiCostMetricByProviderGetParametersQuery(BaseModel):
     teamId: str
-    period: Optional[Period5] = None
+    period: Optional[Period2] = None
     group: Optional[Group] = None
     startDate: Optional[str] = None
     endDate: Optional[str] = None
@@ -8476,13 +8523,13 @@ class V2ApiSourcesMetricsAiCostMetricByProviderOverTimeGetParametersQuery(BaseMo
     startDate: Optional[str] = None
     endDate: Optional[str] = None
     group: Group
-    period: Optional[Period5] = None
+    period: Optional[Period2] = None
     providers: Optional[list[str]] = None
 
 
 class V2ApiSourcesMetricsAiCostMetricsByAgentsOverTimeGetParametersQuery(BaseModel):
     teamId: str
-    period: Optional[Period5] = None
+    period: Optional[Period2] = None
     group: Optional[Group] = None
     startDate: Optional[str] = None
     endDate: Optional[str] = None
@@ -8493,7 +8540,7 @@ class V2ApiSourcesMetricsAiCostMetricsBySubscriberCredentialGetParametersQuery(
     BaseModel
 ):
     teamId: str
-    period: Optional[Period5] = None
+    period: Optional[Period2] = None
     group: Group
     startDate: Optional[str] = None
     endDate: Optional[str] = None
@@ -8504,7 +8551,7 @@ class V2ApiSourcesMetricsAiPercentageRevenueMetricByOrganizationGetParametersQue
     BaseModel
 ):
     teamId: str
-    period: Optional[Period5] = None
+    period: Optional[Period2] = None
     startDate: Optional[str] = None
     endDate: Optional[str] = None
     organizations: Optional[list[str]] = None
@@ -8514,7 +8561,7 @@ class V2ApiSourcesMetricsAiPercentageRevenueMetricByProductGetParametersQuery(
     BaseModel
 ):
     teamId: str
-    period: Optional[Period5] = None
+    period: Optional[Period2] = None
     startDate: Optional[str] = None
     endDate: Optional[str] = None
     products: Optional[list[str]] = None
@@ -8522,7 +8569,7 @@ class V2ApiSourcesMetricsAiPercentageRevenueMetricByProductGetParametersQuery(
 
 class V2ApiSourcesMetricsAiPerformanceMetricByModelGetParametersQuery(BaseModel):
     teamId: str
-    period: Optional[Period5] = None
+    period: Optional[Period2] = None
     group: Optional[Group] = None
     startDate: Optional[str] = None
     endDate: Optional[str] = None
@@ -8531,7 +8578,7 @@ class V2ApiSourcesMetricsAiPerformanceMetricByModelGetParametersQuery(BaseModel)
 
 class V2ApiSourcesMetricsAiPerformanceMetricByProviderGetParametersQuery(BaseModel):
     teamId: str
-    period: Optional[Period5] = None
+    period: Optional[Period2] = None
     group: Optional[Group] = None
     startDate: Optional[str] = None
     endDate: Optional[str] = None
@@ -8540,7 +8587,7 @@ class V2ApiSourcesMetricsAiPerformanceMetricByProviderGetParametersQuery(BaseMod
 
 class V2ApiSourcesMetricsAiPerformanceMetricsByAgentsGetParametersQuery(BaseModel):
     teamId: str
-    period: Optional[Period5] = None
+    period: Optional[Period2] = None
     group: Optional[Group] = None
     startDate: Optional[str] = None
     endDate: Optional[str] = None
@@ -8549,7 +8596,7 @@ class V2ApiSourcesMetricsAiPerformanceMetricsByAgentsGetParametersQuery(BaseMode
 
 class V2ApiSourcesMetricsAiRevenueMetricByOrganizationGetParametersQuery(BaseModel):
     teamId: str
-    period: Optional[Period5] = None
+    period: Optional[Period2] = None
     startDate: Optional[str] = None
     endDate: Optional[str] = None
     group: Optional[Group] = None
@@ -8559,7 +8606,7 @@ class V2ApiSourcesMetricsAiRevenueMetricByOrganizationGetParametersQuery(BaseMod
 
 class V2ApiSourcesMetricsAiRevenueMetricByProductGetParametersQuery(BaseModel):
     teamId: str
-    period: Optional[Period5] = None
+    period: Optional[Period2] = None
     startDate: Optional[str] = None
     endDate: Optional[str] = None
     group: Optional[Group] = None
@@ -8568,7 +8615,7 @@ class V2ApiSourcesMetricsAiRevenueMetricByProductGetParametersQuery(BaseModel):
 
 class V2ApiSourcesMetricsAiTokensPerMinuteByProviderGetParametersQuery(BaseModel):
     teamId: str
-    period: Optional[Period5] = None
+    period: Optional[Period2] = None
     startDate: Optional[str] = None
     endDate: Optional[str] = None
     providers: Optional[list[str]] = None
@@ -8577,7 +8624,7 @@ class V2ApiSourcesMetricsAiTokensPerMinuteByProviderGetParametersQuery(BaseModel
 
 class V2ApiSourcesMetricsAiTotalCostByModelGetParametersQuery(BaseModel):
     teamId: str
-    period: Optional[Period5] = None
+    period: Optional[Period2] = None
     startDate: Optional[str] = None
     endDate: Optional[str] = None
     provider: Optional[str] = None
@@ -8586,7 +8633,7 @@ class V2ApiSourcesMetricsAiTotalCostByModelGetParametersQuery(BaseModel):
 
 class V2ApiSourcesMetricsAiTotalCostByProviderOverTimeGetParametersQuery(BaseModel):
     teamId: str
-    period: Optional[Period5] = None
+    period: Optional[Period2] = None
     startDate: Optional[str] = None
     endDate: Optional[str] = None
     providers: Optional[list[str]] = None
@@ -8759,7 +8806,7 @@ class AIAnomalyResource(BaseModel):
     )
     changeReason: Optional[constr(max_length=500)] = Field(
         None,
-        description='Why you are making this change. Optional plain text, trimmed, up to 500 characters; an empty value means no reason. Write-only: it is never returned on this item. Read it back as `reason` on the change history entries and in the change history CSV export. A reason sent with a save that changes nothing is dropped, unless the save is recorded anyway because a different person or API key made it.',
+        description='Why you are making this change. Optional plain text, trimmed, up to 500 characters; an empty value means no reason. Write-only: it is never returned on this item. Read it back as `reason` on the change history entries and in the change history CSV export, and as `lastChangeReason` on the change history summary while it is the newest change, where a Member or Department Admin who sees the budget reads it too. A reason sent with a save that changes nothing is dropped, unless the save is recorded anyway because a different person or API key made it.',
         examples=['Threshold lowered after the October invoice'],
     )
     created: Optional[str] = Field(
@@ -8904,7 +8951,7 @@ class AIAnomalyResourceRead(BaseModel):
     )
     changeReason: Optional[constr(max_length=500)] = Field(
         None,
-        description='Why you are making this change. Optional plain text, trimmed, up to 500 characters; an empty value means no reason. Write-only: it is never returned on this item. Read it back as `reason` on the change history entries and in the change history CSV export. A reason sent with a save that changes nothing is dropped, unless the save is recorded anyway because a different person or API key made it.',
+        description='Why you are making this change. Optional plain text, trimmed, up to 500 characters; an empty value means no reason. Write-only: it is never returned on this item. Read it back as `reason` on the change history entries and in the change history CSV export, and as `lastChangeReason` on the change history summary while it is the newest change, where a Member or Department Admin who sees the budget reads it too. A reason sent with a save that changes nothing is dropped, unless the save is recorded anyway because a different person or API key made it.',
         examples=['Threshold lowered after the October invoice'],
     )
     created: Optional[str] = Field(
@@ -9049,7 +9096,7 @@ class AIAnomalyResourceWrite(BaseModel):
     )
     changeReason: Optional[constr(max_length=500)] = Field(
         None,
-        description='Why you are making this change. Optional plain text, trimmed, up to 500 characters; an empty value means no reason. Write-only: it is never returned on this item. Read it back as `reason` on the change history entries and in the change history CSV export. A reason sent with a save that changes nothing is dropped, unless the save is recorded anyway because a different person or API key made it.',
+        description='Why you are making this change. Optional plain text, trimmed, up to 500 characters; an empty value means no reason. Write-only: it is never returned on this item. Read it back as `reason` on the change history entries and in the change history CSV export, and as `lastChangeReason` on the change history summary while it is the newest change, where a Member or Department Admin who sees the budget reads it too. A reason sent with a save that changes nothing is dropped, unless the save is recorded anyway because a different person or API key made it.',
         examples=['Threshold lowered after the October invoice'],
     )
     created: Optional[str] = Field(
@@ -9204,6 +9251,11 @@ class AIModelResource(BaseModel):
     """
 
     field_links: Optional[dict[str, Link]] = Field(None, alias='_links')
+    cacheCreation12hrCostPerInputToken: Optional[float] = Field(
+        None,
+        description='The cost per input token for 12-hour-TTL cache creation in USD (OpenAI). Null when the model publishes no 12-hour cache write price.',
+        examples=[5e-06],
+    )
     cacheCreation1hrCostPerInputToken: Optional[float] = Field(
         None,
         description='The cost per input token for 1-hour-TTL cache creation in USD (for models that support prompt caching)',
@@ -9327,6 +9379,11 @@ class AIModelResourceRead(BaseModel):
     """
 
     field_links: Optional[dict[str, Link]] = Field(None, alias='_links')
+    cacheCreation12hrCostPerInputToken: Optional[float] = Field(
+        None,
+        description='The cost per input token for 12-hour-TTL cache creation in USD (OpenAI). Null when the model publishes no 12-hour cache write price.',
+        examples=[5e-06],
+    )
     cacheCreation1hrCostPerInputToken: Optional[float] = Field(
         None,
         description='The cost per input token for 1-hour-TTL cache creation in USD (for models that support prompt caching)',
@@ -9980,6 +10037,11 @@ class BudgetProgressItemSuccess3(BaseModel):
         description='Remaining budget (threshold - currentValue), null if threshold is zero',
         examples=[249.5],
     )
+    spendNotInAnyDepartment: Optional[float] = Field(
+        None,
+        description='Spend in this window from calls with no email or from people in no department at the time of the call. Only present for Department budgets. Not covered by this budget, never a group, never alerted.',
+        examples=[1250.0],
+    )
     threshold: Optional[float] = Field(
         None, description='Budget threshold value', examples=[1000.0]
     )
@@ -10007,6 +10069,7 @@ class BudgetProgressResource(BaseModel):
     metricType: Optional[MetricType3] = Field(
         None, description='Metric type being tracked', examples=['TOTAL_COST']
     )
+    notice: Optional[BudgetNoticeResource] = None
     percentUsed: Optional[float] = Field(
         None,
         description='Share of the budget used, as a fraction: currentValue divided by threshold. For example 0.75 means 75%. A value above 1 means the budget is exceeded. Null when the threshold is zero.',
@@ -10025,8 +10088,75 @@ class BudgetProgressResource(BaseModel):
     )
 
 
+class ChangeEntryResource(BaseModel):
+    """
+    One recorded save of a budget or alert: who, when, and what changed
+    """
+
+    changeType: Optional[ChangeType] = Field(None, description='The kind of change')
+    changedAt: Optional[str] = Field(
+        None,
+        description='When the change was saved, UTC with milliseconds',
+        examples=['2026-10-28T14:14:03.512Z'],
+    )
+    changedBy: Optional[ChangedBy] = Field(
+        None, description='Who made the change, masked'
+    )
+    fieldChanges: Optional[list[FieldChange]] = Field(
+        None,
+        description='What changed, in screen order; empty for a starting state and for a save that changed no setting',
+    )
+    reason: Optional[str] = Field(
+        None,
+        description='The reason given with the change; null when none and always null on a starting state',
+    )
+    relation: Optional[Relation] = Field(
+        None,
+        description="SELF, or LINKED_ALERT for a change to the budget's linked alert",
+    )
+    revision: Optional[int] = Field(
+        None,
+        description='The revision number; every item saved in one request shares it',
+        examples=[140223991],
+    )
+    subject: Optional[ChangeSubject] = Field(None, description='The item changed')
+    summary: Optional[str] = Field(
+        None,
+        description='Set only when fieldChanges is empty: `Starting state when change history began`, `First recorded state; earlier values were not recorded`, or `Saved, no setting changed`',
+    )
+
+
+class ChangeHistorySummaryResource(BaseModel):
+    """
+    Who created an item and who changed it last, from its change history
+    """
+
+    createdAt: Optional[str] = Field(
+        None,
+        description='When the item was created; null when it was created before change history began',
+        examples=['2026-10-24T09:00:00.000Z'],
+    )
+    createdBy: Optional[ChangedBy] = None
+    historyStartsAt: Optional[str] = Field(
+        None,
+        description="When the item's recorded history starts; null when the item has no recorded history",
+        examples=['2026-10-22T21:03:55.120Z'],
+    )
+    lastChangeReason: Optional[str] = Field(
+        None,
+        description="The reason given with the item's newest own change; null when none was given, and null with lastChangedBy",
+        examples=['Raised for the Q4 launch'],
+    )
+    lastChangedAt: Optional[str] = Field(
+        None,
+        description="When the item's newest own change was saved; null with lastChangedBy",
+        examples=['2026-10-28T14:14:03.512Z'],
+    )
+    lastChangedBy: Optional[ChangedBy] = None
+
+
 class CollectionModel(BaseModel):
-    field_embedded: Optional[FieldEmbedded5] = Field(None, alias='_embedded')
+    field_embedded: Optional[FieldEmbedded6] = Field(None, alias='_embedded')
     field_links: Optional[dict[str, Link]] = Field(None, alias='_links')
 
 
@@ -10135,7 +10265,7 @@ class CostControlResource(BaseModel):
     )
     changeReason: Optional[constr(max_length=500)] = Field(
         None,
-        description='Why you are making this change. Optional plain text, trimmed, up to 500 characters; an empty value means no reason. Write-only: it is never returned on this item. Read it back as `reason` on the change history entries and in the change history CSV export. A reason sent with a save that changes nothing is dropped, unless the save is recorded anyway because a different person or API key made it.',
+        description='Why you are making this change. Optional plain text, trimmed, up to 500 characters; an empty value means no reason. Write-only: it is never returned on this item. Read it back as `reason` on the change history entries and in the change history CSV export, and as `lastChangeReason` on the change history summary while it is the newest change, where a Member or Department Admin who sees the budget reads it too. A reason sent with a save that changes nothing is dropped, unless the save is recorded anyway because a different person or API key made it.',
         examples=['Raised for the Q4 launch'],
     )
     created: Optional[str] = Field(
@@ -10143,9 +10273,14 @@ class CostControlResource(BaseModel):
         description='The creation timestamp (ISO 8601 extended date-time format)',
         examples=['2026-04-21T00:00:00Z'],
     )
+    createdAs: Optional[CreatedAs] = Field(
+        None,
+        description='The role the creator acted under. Null with createdBy. A rule created before roles were recorded reads ADMINISTRATOR, the only role that could create one then.',
+        examples=['ADMINISTRATOR'],
+    )
     createdBy: Optional[str] = Field(
         None,
-        description='Who created this rule: the user\'s email address; for an API key, its owner\'s email followed by "via API key" and the key\'s id and name; "Revenium Support" when Revenium staff made the change. Empty for rules created before this was recorded. A Member sees the author\'s role, `administrator`, instead of a name; a Department Admin sees the name only on a rule over a department they administer.',
+        description='Who created this rule: the user\'s email address; for an API key, its owner\'s email followed by "via API key" and the key\'s id and name; "Revenium Support" when Revenium staff made the change. Empty for rules created before this was recorded. A Member sees the author\'s role, `administrator` or `department admin`, instead of a name; a Department Admin sees the name only on a rule over a department they administer.',
         examples=['user@example.com'],
     )
     denyMessage: Optional[constr(max_length=2000)] = Field(
@@ -10191,13 +10326,18 @@ class CostControlResource(BaseModel):
     )
     locked: Optional[bool] = Field(
         None,
-        description="Present only for a Member or Department Admin. True when the rule binds them but its figure is not theirs to see: a per-person limit on a metric other than cost inside a department, whose total is one person's balance, or a per-department limit on a metric other than cost. Its spend is not shown to them anywhere. False when they may see the rule's spend: in full when every figure on it is theirs, including the total of a shared limit they are under, such as a company-wide limit or a limit on a department above theirs, or only their own rows on a rule split per person or per department. Their answer also leaves out `notificationChannelIds`, `notificationEmails` and any person a filter names outside their scope, and gives `createdBy` and `modifiedBy` as the author's role wherever it may not name them.",
+        description="Present only for a Member or Department Admin. True when the rule binds them but its figure is not theirs to see: a per-person limit on a metric other than cost inside a department, whose total is one person's balance, or a per-department limit on a metric other than cost. Its spend is not shown to them anywhere. False when they may see the rule's spend: in full when every figure on it is theirs, including the total of a shared limit they are under, such as a company-wide limit or a limit on a department above theirs, or only their own rows on a rule split per person or per department. Their answer also leaves out `notificationChannelIds`, `notificationEmails`, `aiAnomaly` and any person a filter names outside their scope, except on a rule a Department Admin may update, which they get whole. It gives `createdBy` and `modifiedBy` as the author's role wherever it may not name them.",
         examples=[True],
     )
     metricType: Optional[MetricType6] = Field(
         ...,
         description='The AI metric the rule evaluates against',
         examples=['TOTAL_COST'],
+    )
+    modifiedAs: Optional[ModifiedAs] = Field(
+        None,
+        description='The role the author of the last change acted under, in the same form as createdAs. Null with modifiedBy.',
+        examples=['DEPARTMENT_ADMIN'],
     )
     modifiedBy: Optional[str] = Field(
         None,
@@ -10268,7 +10408,7 @@ class CostControlResourceRead(BaseModel):
     )
     changeReason: Optional[constr(max_length=500)] = Field(
         None,
-        description='Why you are making this change. Optional plain text, trimmed, up to 500 characters; an empty value means no reason. Write-only: it is never returned on this item. Read it back as `reason` on the change history entries and in the change history CSV export. A reason sent with a save that changes nothing is dropped, unless the save is recorded anyway because a different person or API key made it.',
+        description='Why you are making this change. Optional plain text, trimmed, up to 500 characters; an empty value means no reason. Write-only: it is never returned on this item. Read it back as `reason` on the change history entries and in the change history CSV export, and as `lastChangeReason` on the change history summary while it is the newest change, where a Member or Department Admin who sees the budget reads it too. A reason sent with a save that changes nothing is dropped, unless the save is recorded anyway because a different person or API key made it.',
         examples=['Raised for the Q4 launch'],
     )
     created: Optional[str] = Field(
@@ -10276,9 +10416,14 @@ class CostControlResourceRead(BaseModel):
         description='The creation timestamp (ISO 8601 extended date-time format)',
         examples=['2026-04-21T00:00:00Z'],
     )
+    createdAs: Optional[CreatedAs] = Field(
+        None,
+        description='The role the creator acted under. Null with createdBy. A rule created before roles were recorded reads ADMINISTRATOR, the only role that could create one then.',
+        examples=['ADMINISTRATOR'],
+    )
     createdBy: Optional[str] = Field(
         None,
-        description='Who created this rule: the user\'s email address; for an API key, its owner\'s email followed by "via API key" and the key\'s id and name; "Revenium Support" when Revenium staff made the change. Empty for rules created before this was recorded. A Member sees the author\'s role, `administrator`, instead of a name; a Department Admin sees the name only on a rule over a department they administer.',
+        description='Who created this rule: the user\'s email address; for an API key, its owner\'s email followed by "via API key" and the key\'s id and name; "Revenium Support" when Revenium staff made the change. Empty for rules created before this was recorded. A Member sees the author\'s role, `administrator` or `department admin`, instead of a name; a Department Admin sees the name only on a rule over a department they administer.',
         examples=['user@example.com'],
     )
     denyMessage: Optional[constr(max_length=2000)] = Field(
@@ -10324,13 +10469,18 @@ class CostControlResourceRead(BaseModel):
     )
     locked: Optional[bool] = Field(
         None,
-        description="Present only for a Member or Department Admin. True when the rule binds them but its figure is not theirs to see: a per-person limit on a metric other than cost inside a department, whose total is one person's balance, or a per-department limit on a metric other than cost. Its spend is not shown to them anywhere. False when they may see the rule's spend: in full when every figure on it is theirs, including the total of a shared limit they are under, such as a company-wide limit or a limit on a department above theirs, or only their own rows on a rule split per person or per department. Their answer also leaves out `notificationChannelIds`, `notificationEmails` and any person a filter names outside their scope, and gives `createdBy` and `modifiedBy` as the author's role wherever it may not name them.",
+        description="Present only for a Member or Department Admin. True when the rule binds them but its figure is not theirs to see: a per-person limit on a metric other than cost inside a department, whose total is one person's balance, or a per-department limit on a metric other than cost. Its spend is not shown to them anywhere. False when they may see the rule's spend: in full when every figure on it is theirs, including the total of a shared limit they are under, such as a company-wide limit or a limit on a department above theirs, or only their own rows on a rule split per person or per department. Their answer also leaves out `notificationChannelIds`, `notificationEmails`, `aiAnomaly` and any person a filter names outside their scope, except on a rule a Department Admin may update, which they get whole. It gives `createdBy` and `modifiedBy` as the author's role wherever it may not name them.",
         examples=[True],
     )
     metricType: Optional[MetricType6] = Field(
         ...,
         description='The AI metric the rule evaluates against',
         examples=['TOTAL_COST'],
+    )
+    modifiedAs: Optional[ModifiedAs] = Field(
+        None,
+        description='The role the author of the last change acted under, in the same form as createdAs. Null with modifiedBy.',
+        examples=['DEPARTMENT_ADMIN'],
     )
     modifiedBy: Optional[str] = Field(
         None,
@@ -10401,7 +10551,7 @@ class CostControlResourceWrite(BaseModel):
     )
     changeReason: Optional[constr(max_length=500)] = Field(
         None,
-        description='Why you are making this change. Optional plain text, trimmed, up to 500 characters; an empty value means no reason. Write-only: it is never returned on this item. Read it back as `reason` on the change history entries and in the change history CSV export. A reason sent with a save that changes nothing is dropped, unless the save is recorded anyway because a different person or API key made it.',
+        description='Why you are making this change. Optional plain text, trimmed, up to 500 characters; an empty value means no reason. Write-only: it is never returned on this item. Read it back as `reason` on the change history entries and in the change history CSV export, and as `lastChangeReason` on the change history summary while it is the newest change, where a Member or Department Admin who sees the budget reads it too. A reason sent with a save that changes nothing is dropped, unless the save is recorded anyway because a different person or API key made it.',
         examples=['Raised for the Q4 launch'],
     )
     created: Optional[str] = Field(
@@ -10409,9 +10559,14 @@ class CostControlResourceWrite(BaseModel):
         description='The creation timestamp (ISO 8601 extended date-time format)',
         examples=['2026-04-21T00:00:00Z'],
     )
+    createdAs: Optional[CreatedAs] = Field(
+        None,
+        description='The role the creator acted under. Null with createdBy. A rule created before roles were recorded reads ADMINISTRATOR, the only role that could create one then.',
+        examples=['ADMINISTRATOR'],
+    )
     createdBy: Optional[str] = Field(
         None,
-        description='Who created this rule: the user\'s email address; for an API key, its owner\'s email followed by "via API key" and the key\'s id and name; "Revenium Support" when Revenium staff made the change. Empty for rules created before this was recorded. A Member sees the author\'s role, `administrator`, instead of a name; a Department Admin sees the name only on a rule over a department they administer.',
+        description='Who created this rule: the user\'s email address; for an API key, its owner\'s email followed by "via API key" and the key\'s id and name; "Revenium Support" when Revenium staff made the change. Empty for rules created before this was recorded. A Member sees the author\'s role, `administrator` or `department admin`, instead of a name; a Department Admin sees the name only on a rule over a department they administer.',
         examples=['user@example.com'],
     )
     denyMessage: Optional[constr(max_length=2000)] = Field(
@@ -10457,13 +10612,18 @@ class CostControlResourceWrite(BaseModel):
     )
     locked: Optional[bool] = Field(
         None,
-        description="Present only for a Member or Department Admin. True when the rule binds them but its figure is not theirs to see: a per-person limit on a metric other than cost inside a department, whose total is one person's balance, or a per-department limit on a metric other than cost. Its spend is not shown to them anywhere. False when they may see the rule's spend: in full when every figure on it is theirs, including the total of a shared limit they are under, such as a company-wide limit or a limit on a department above theirs, or only their own rows on a rule split per person or per department. Their answer also leaves out `notificationChannelIds`, `notificationEmails` and any person a filter names outside their scope, and gives `createdBy` and `modifiedBy` as the author's role wherever it may not name them.",
+        description="Present only for a Member or Department Admin. True when the rule binds them but its figure is not theirs to see: a per-person limit on a metric other than cost inside a department, whose total is one person's balance, or a per-department limit on a metric other than cost. Its spend is not shown to them anywhere. False when they may see the rule's spend: in full when every figure on it is theirs, including the total of a shared limit they are under, such as a company-wide limit or a limit on a department above theirs, or only their own rows on a rule split per person or per department. Their answer also leaves out `notificationChannelIds`, `notificationEmails`, `aiAnomaly` and any person a filter names outside their scope, except on a rule a Department Admin may update, which they get whole. It gives `createdBy` and `modifiedBy` as the author's role wherever it may not name them.",
         examples=[True],
     )
     metricType: Optional[MetricType6] = Field(
         ...,
         description='The AI metric the rule evaluates against',
         examples=['TOTAL_COST'],
+    )
+    modifiedAs: Optional[ModifiedAs] = Field(
+        None,
+        description='The role the author of the last change acted under, in the same form as createdAs. Null with modifiedBy.',
+        examples=['DEPARTMENT_ADMIN'],
     )
     modifiedBy: Optional[str] = Field(
         None,
@@ -11087,7 +11247,7 @@ class EntityModelAIAnomalyResourceRead(BaseModel):
     )
     changeReason: Optional[constr(max_length=500)] = Field(
         None,
-        description='Why you are making this change. Optional plain text, trimmed, up to 500 characters; an empty value means no reason. Write-only: it is never returned on this item. Read it back as `reason` on the change history entries and in the change history CSV export. A reason sent with a save that changes nothing is dropped, unless the save is recorded anyway because a different person or API key made it.',
+        description='Why you are making this change. Optional plain text, trimmed, up to 500 characters; an empty value means no reason. Write-only: it is never returned on this item. Read it back as `reason` on the change history entries and in the change history CSV export, and as `lastChangeReason` on the change history summary while it is the newest change, where a Member or Department Admin who sees the budget reads it too. A reason sent with a save that changes nothing is dropped, unless the save is recorded anyway because a different person or API key made it.',
         examples=['Threshold lowered after the October invoice'],
     )
     created: Optional[str] = Field(
@@ -11241,6 +11401,11 @@ class EntityModelAICompletionMetricResourceRead(BaseModel):
         None,
         description='Version of the agentic job definition this run executed, so cost can be compared across revisions of the same workflow. Null when no job was attributed.',
         examples=['v2'],
+    )
+    cacheCreation12hTokenCount: Optional[int] = Field(
+        None,
+        description="The portion of cacheCreationTokenCount written to the model's 12-hour prompt cache (OpenAI ttl_12h_tokens), which OpenAI charges more to write than its default 30-minute cache. Never part of inputTokenCount. Null when the source did not report a 12-hour count.",
+        examples=[100000],
     )
     cacheCreation1hTokenCount: Optional[int] = Field(
         None,
@@ -11631,6 +11796,11 @@ class EntityModelAICompletionMetricResourceRead(BaseModel):
 
 class EntityModelAIModelResourceRead(BaseModel):
     field_links: Optional[dict[str, Link]] = Field(None, alias='_links')
+    cacheCreation12hrCostPerInputToken: Optional[float] = Field(
+        None,
+        description='The cost per input token for 12-hour-TTL cache creation in USD (OpenAI). Null when the model publishes no 12-hour cache write price.',
+        examples=[5e-06],
+    )
     cacheCreation1hrCostPerInputToken: Optional[float] = Field(
         None,
         description='The cost per input token for 1-hour-TTL cache creation in USD (for models that support prompt caching)',
@@ -11809,9 +11979,10 @@ class EntityModelBudgetPortfolioItemResource(BaseModel):
     )
     currentValue: Optional[float] = Field(
         None,
-        description='Current cumulative value in the window. For a grouped budget, every group added together; worstPercentUsed is the figure the per-group alert uses',
+        description='Current cumulative value in the window. For a grouped budget, every group added together; worstPercentUsed is the figure the per-group alert uses. Null only when unavailable is set',
         examples=[850.0],
     )
+    departmentFilter: Optional[BudgetDepartmentFilterResource] = None
     groupCount: Optional[int] = Field(
         None,
         description='Grouped budgets only: how many groups the period has, before any groupLimit cap',
@@ -11832,6 +12003,7 @@ class EntityModelBudgetPortfolioItemResource(BaseModel):
     name: Optional[str] = Field(
         None, description='Alert name', examples=['Monthly OpenAI Budget']
     )
+    notice: Optional[BudgetNoticeResource] = None
     percentUsed: Optional[float] = Field(
         None,
         description='Share of the budget used, as a fraction: currentValue divided by threshold. For example 0.75 means 75%. A value above 1 means the budget is exceeded. Null when the threshold is zero. For a grouped budget, every group added together; worstPercentUsed is the figure the per-group alert uses',
@@ -11844,12 +12016,18 @@ class EntityModelBudgetPortfolioItemResource(BaseModel):
     )
     risk: Optional[Risk] = Field(
         None,
-        description='Risk level based on usage percentage. For a grouped budget, from its highest group',
+        description='Risk level based on usage percentage. For a grouped budget, from its highest group. Null only when unavailable is set',
         examples=['MEDIUM'],
+    )
+    spendNotInAnyDepartment: Optional[float] = Field(
+        None,
+        description='Spend in this window from calls with no email or from people in no department at the time of the call. Not covered by this budget, never a group, never alerted.',
+        examples=[1250.0],
     )
     threshold: Optional[float] = Field(
         None, description='Budget threshold value', examples=[1000.0]
     )
+    unavailable: Optional[BudgetUnavailableResource] = None
     window: Optional[BudgetWindowResource] = Field(
         None, description='Budget window boundaries'
     )
@@ -11875,7 +12053,7 @@ class EntityModelCostControlResourceRead(BaseModel):
     )
     changeReason: Optional[constr(max_length=500)] = Field(
         None,
-        description='Why you are making this change. Optional plain text, trimmed, up to 500 characters; an empty value means no reason. Write-only: it is never returned on this item. Read it back as `reason` on the change history entries and in the change history CSV export. A reason sent with a save that changes nothing is dropped, unless the save is recorded anyway because a different person or API key made it.',
+        description='Why you are making this change. Optional plain text, trimmed, up to 500 characters; an empty value means no reason. Write-only: it is never returned on this item. Read it back as `reason` on the change history entries and in the change history CSV export, and as `lastChangeReason` on the change history summary while it is the newest change, where a Member or Department Admin who sees the budget reads it too. A reason sent with a save that changes nothing is dropped, unless the save is recorded anyway because a different person or API key made it.',
         examples=['Raised for the Q4 launch'],
     )
     created: Optional[str] = Field(
@@ -11883,9 +12061,14 @@ class EntityModelCostControlResourceRead(BaseModel):
         description='The creation timestamp (ISO 8601 extended date-time format)',
         examples=['2026-04-21T00:00:00Z'],
     )
+    createdAs: Optional[CreatedAs] = Field(
+        None,
+        description='The role the creator acted under. Null with createdBy. A rule created before roles were recorded reads ADMINISTRATOR, the only role that could create one then.',
+        examples=['ADMINISTRATOR'],
+    )
     createdBy: Optional[str] = Field(
         None,
-        description='Who created this rule: the user\'s email address; for an API key, its owner\'s email followed by "via API key" and the key\'s id and name; "Revenium Support" when Revenium staff made the change. Empty for rules created before this was recorded. A Member sees the author\'s role, `administrator`, instead of a name; a Department Admin sees the name only on a rule over a department they administer.',
+        description='Who created this rule: the user\'s email address; for an API key, its owner\'s email followed by "via API key" and the key\'s id and name; "Revenium Support" when Revenium staff made the change. Empty for rules created before this was recorded. A Member sees the author\'s role, `administrator` or `department admin`, instead of a name; a Department Admin sees the name only on a rule over a department they administer.',
         examples=['user@example.com'],
     )
     denyMessage: Optional[constr(max_length=2000)] = Field(
@@ -11931,13 +12114,18 @@ class EntityModelCostControlResourceRead(BaseModel):
     )
     locked: Optional[bool] = Field(
         None,
-        description="Present only for a Member or Department Admin. True when the rule binds them but its figure is not theirs to see: a per-person limit on a metric other than cost inside a department, whose total is one person's balance, or a per-department limit on a metric other than cost. Its spend is not shown to them anywhere. False when they may see the rule's spend: in full when every figure on it is theirs, including the total of a shared limit they are under, such as a company-wide limit or a limit on a department above theirs, or only their own rows on a rule split per person or per department. Their answer also leaves out `notificationChannelIds`, `notificationEmails` and any person a filter names outside their scope, and gives `createdBy` and `modifiedBy` as the author's role wherever it may not name them.",
+        description="Present only for a Member or Department Admin. True when the rule binds them but its figure is not theirs to see: a per-person limit on a metric other than cost inside a department, whose total is one person's balance, or a per-department limit on a metric other than cost. Its spend is not shown to them anywhere. False when they may see the rule's spend: in full when every figure on it is theirs, including the total of a shared limit they are under, such as a company-wide limit or a limit on a department above theirs, or only their own rows on a rule split per person or per department. Their answer also leaves out `notificationChannelIds`, `notificationEmails`, `aiAnomaly` and any person a filter names outside their scope, except on a rule a Department Admin may update, which they get whole. It gives `createdBy` and `modifiedBy` as the author's role wherever it may not name them.",
         examples=[True],
     )
     metricType: Optional[MetricType12] = Field(
         ...,
         description='The AI metric the rule evaluates against',
         examples=['TOTAL_COST'],
+    )
+    modifiedAs: Optional[ModifiedAs] = Field(
+        None,
+        description='The role the author of the last change acted under, in the same form as createdAs. Null with modifiedBy.',
+        examples=['DEPARTMENT_ADMIN'],
     )
     modifiedBy: Optional[str] = Field(
         None,
@@ -12447,7 +12635,7 @@ class EntityModelInvoiceResourceRead(BaseModel):
         description='The start date of the billing period covered by this invoice in ISO 8601 extended date-time format',
         examples=['2024-09-01T00:00:00Z'],
     )
-    state: Optional[State2] = Field(
+    state: Optional[State1] = Field(
         None,
         description='The current state of the invoice in its lifecycle',
         examples=['ISSUED'],
@@ -12459,6 +12647,11 @@ class EntityModelInvoiceResourceRead(BaseModel):
     )
     team: ResourceMetadataRead = Field(
         ..., description='The team that owns the product being billed'
+    )
+    timestamp: Optional[str] = Field(
+        None,
+        description='When the invoice was generated, in ISO 8601 extended date-time format. The startDate and endDate filters and a sort by timestamp read this value',
+        examples=['2024-10-01T00:05:00Z'],
     )
     totalAdjusted: float = Field(
         ...,
@@ -12643,7 +12836,7 @@ class EntityModelMeteringElementDefinitionResourceRead(BaseModel):
         description='The unique identifier of the team that owns this metering element definition',
         examples=['a91XJp'],
     )
-    type: Type = Field(
+    type: Type1 = Field(
         ...,
         description='The type of the metering element definition',
         examples=['NUMBER'],
@@ -12759,7 +12952,7 @@ class EntityModelOrganizationResourceRead(BaseModel):
         description='The ID of the account that owns this customer organization. Format: Revenium hashid (URL-safe encoded string).',
         examples=['6PV0xe'],
     )
-    types: Optional[list[Type1]] = Field(
+    types: Optional[list[Type2]] = Field(
         None,
         description='The organization type (array with single value). Use CONSUMER for organizations (end customers who consume APIs and accumulate usage costs). Note: MANAGING is used by team endpoints (see /v2/api/teams) and should not be used when creating organizations.',
         examples=[['CONSUMER']],
@@ -12891,7 +13084,7 @@ class EntityModelPeriodChargeResourceRead(BaseModel):
         description='Indicates whether this charge occurred during an active trial period. Trial charges may be waived or handled differently',
         examples=[False],
     )
-    type: Type2 = Field(
+    type: Type3 = Field(
         ...,
         description='The transaction type category for this charge',
         examples=['TRANSACTIONAL'],
@@ -13134,7 +13327,7 @@ class EntityModelSourceResourceRead(BaseModel):
         description='The unique identifier of the team that owns this source',
         examples=['a91XJp'],
     )
-    type: Type3 = Field(..., description='The type of the source', examples=['API'])
+    type: Type4 = Field(..., description='The type of the source', examples=['API'])
     updated: Optional[str] = Field(
         None,
         description='The updated timestamp (ISO 8601 extended date-time format, e.g., 2024-09-01T00:00:00Z)',
@@ -13372,34 +13565,34 @@ class EntityModelUserResourceRead(BaseModel):
     )
 
 
-class FieldEmbedded11(BaseModel):
+class FieldEmbedded12(BaseModel):
     ingestionFailureResourceList: Optional[
         list[EntityModelIngestionFailureResourceRead]
     ] = None
 
 
 class IngestionFailurePagedModelRead(BaseModel):
-    field_embedded: Optional[FieldEmbedded11] = Field(None, alias='_embedded')
-    field_links: Optional[dict[str, Link]] = Field(None, alias='_links')
-    page: Optional[PageMetadataRead] = None
-
-
-class FieldEmbedded12(BaseModel):
-    invoiceResourceList: Optional[list[EntityModelInvoiceResourceRead]] = None
-
-
-class InvoicePagedModelRead(BaseModel):
     field_embedded: Optional[FieldEmbedded12] = Field(None, alias='_embedded')
     field_links: Optional[dict[str, Link]] = Field(None, alias='_links')
     page: Optional[PageMetadataRead] = None
 
 
 class FieldEmbedded13(BaseModel):
+    invoiceResourceList: Optional[list[EntityModelInvoiceResourceRead]] = None
+
+
+class InvoicePagedModelRead(BaseModel):
+    field_embedded: Optional[FieldEmbedded13] = Field(None, alias='_embedded')
+    field_links: Optional[dict[str, Link]] = Field(None, alias='_links')
+    page: Optional[PageMetadataRead] = None
+
+
+class FieldEmbedded14(BaseModel):
     jobResourceList: Optional[list[EntityModelJobResourceRead]] = None
 
 
 class JobPagedModelRead(BaseModel):
-    field_embedded: Optional[FieldEmbedded13] = Field(None, alias='_embedded')
+    field_embedded: Optional[FieldEmbedded14] = Field(None, alias='_embedded')
     field_links: Optional[dict[str, Link]] = Field(None, alias='_links')
     page: Optional[PageMetadataRead] = None
 
@@ -13706,14 +13899,14 @@ class JobTypeEconomicsResource(BaseModel):
     )
 
 
-class FieldEmbedded14(BaseModel):
+class FieldEmbedded15(BaseModel):
     meteringElementDefinitionResourceList: Optional[
         list[EntityModelMeteringElementDefinitionResourceRead]
     ] = None
 
 
 class MeteringElementDefinitionPagedModelRead(BaseModel):
-    field_embedded: Optional[FieldEmbedded14] = Field(None, alias='_embedded')
+    field_embedded: Optional[FieldEmbedded15] = Field(None, alias='_embedded')
     field_links: Optional[dict[str, Link]] = Field(None, alias='_links')
     page: Optional[PageMetadataRead] = None
 
@@ -13761,7 +13954,7 @@ class MeteringElementDefinitionResource(BaseModel):
         description='The unique identifier of the team that owns this metering element definition',
         examples=['a91XJp'],
     )
-    type: Type6 = Field(
+    type: Type7 = Field(
         ...,
         description='The type of the metering element definition',
         examples=['NUMBER'],
@@ -13816,7 +14009,7 @@ class MeteringElementDefinitionResourceRead(BaseModel):
         description='The unique identifier of the team that owns this metering element definition',
         examples=['a91XJp'],
     )
-    type: Type6 = Field(
+    type: Type7 = Field(
         ...,
         description='The type of the metering element definition',
         examples=['NUMBER'],
@@ -13871,7 +14064,7 @@ class MeteringElementDefinitionResourceWrite(BaseModel):
         description='The unique identifier of the team that owns this metering element definition',
         examples=['a91XJp'],
     )
-    type: Type6 = Field(
+    type: Type7 = Field(
         ...,
         description='The type of the metering element definition',
         examples=['NUMBER'],
@@ -13883,12 +14076,12 @@ class MeteringElementDefinitionResourceWrite(BaseModel):
     )
 
 
-class FieldEmbedded15(BaseModel):
+class FieldEmbedded16(BaseModel):
     organizationResourceList: Optional[list[EntityModelOrganizationResourceRead]] = None
 
 
 class OrganizationPagedModelRead(BaseModel):
-    field_embedded: Optional[FieldEmbedded15] = Field(None, alias='_embedded')
+    field_embedded: Optional[FieldEmbedded16] = Field(None, alias='_embedded')
     field_links: Optional[dict[str, Link]] = Field(None, alias='_links')
     page: Optional[PageMetadataRead] = None
 
@@ -14001,7 +14194,7 @@ class OrganizationResource(BaseModel):
         description='The ID of the account that owns this customer organization. Format: Revenium hashid (URL-safe encoded string).',
         examples=['6PV0xe'],
     )
-    types: Optional[list[Type9]] = Field(
+    types: Optional[list[Type10]] = Field(
         None,
         description='The organization type (array with single value). Use CONSUMER for organizations (end customers who consume APIs and accumulate usage costs). Note: MANAGING is used by team endpoints (see /v2/api/teams) and should not be used when creating organizations.',
         examples=[['CONSUMER']],
@@ -14126,7 +14319,7 @@ class OrganizationResourceRead(BaseModel):
         description='The ID of the account that owns this customer organization. Format: Revenium hashid (URL-safe encoded string).',
         examples=['6PV0xe'],
     )
-    types: Optional[list[Type9]] = Field(
+    types: Optional[list[Type10]] = Field(
         None,
         description='The organization type (array with single value). Use CONSUMER for organizations (end customers who consume APIs and accumulate usage costs). Note: MANAGING is used by team endpoints (see /v2/api/teams) and should not be used when creating organizations.',
         examples=[['CONSUMER']],
@@ -14282,116 +14475,6 @@ class PrHealthDigestSettingsResourceWrite(BaseModel):
         None,
         description="IANA time zone the day and hour are in. Null until saved, so a client can offer the viewer's own zone. Required when either switch is on.",
         examples=['America/New_York'],
-    )
-
-
-class ProviderRatioItemRead(BaseModel):
-    assistantsWithUsageNamedHere: Optional[list[str]] = Field(
-        None,
-        description="The coding assistants this row's copy may name that also produced metered coding-assistant usage for the organization in the requested window, as coding assistant names such as ClaudeCode or CodexCli, sorted alphabetically. Three states: absent means this row names no assistant at all; an empty list means it names at least one and none of them produced usage in the window; a check that cannot complete yields an empty list and sets codingAssistantUsageUnknown. The evidence is scoped to the organization and the window and never to this row's invoice, so a name here never claims the assistant's spend is billed on this provider or counted in its metered figure; codingAssistantUsagePresent answers that question instead.",
-        examples=[['CodexCli']],
-    )
-    billedSeats: Optional[int] = Field(
-        None,
-        description='The number of people this provider invoiced over the requested period. Absent for providers billed per token, where absent does not mean zero.',
-        examples=[381],
-    )
-    billing: Optional[float] = Field(
-        None,
-        description='Billing cost for this provider over comparisonStartDate to comparisonEndDate, the window it is compared with metered cost in. Zero on a no-overlap row. See periodBilling for the whole requested period.',
-        examples=[15.0],
-    )
-    billingCredentialConnected: Optional[bool] = Field(
-        None,
-        description='True when a billing credential for this provider is connected. When false, the row has no billing figure or ratio, and it is left out of aggregateRatio and hiddenSpend.',
-        examples=[True],
-    )
-    codingAssistantPricingMode: Optional[CodingAssistantPricingMode] = Field(
-        None,
-        description="How coverage classifies the coding assistants counted under this provider: pay-as-you-go, seat-plan, or unset. GitHub Copilot always reports pay-as-you-go here because its metered usage participates in reconciliation, regardless of the team's saved pricing setting. Other assistants follow the team's pricing policy. This field does not change that setting. Absent when no assistant is counted under this provider.",
-        examples=['pay-as-you-go'],
-    )
-    codingAssistantUsagePresent: Optional[bool] = Field(
-        None,
-        description="True when the period has coding-assistant usage that this provider's invoice covers, such as Claude Code for Anthropic Enterprise. It says nothing about spend, and is false for providers whose assistants cannot be matched to the invoice.",
-        examples=[True],
-    )
-    codingAssistantUsageUnknown: Optional[bool] = Field(
-        None,
-        description='True when the coding-assistant checks for this provider could not finish, for example after a timeout. The coding-assistant fields for this row then have no answer rather than meaning none.',
-        examples=[False],
-    )
-    comparisonEndDate: Optional[date_aliased] = Field(
-        None,
-        description="Last date included in this row's metered/billed comparison, or null when the datasets do not overlap",
-        examples=['2026-08-31'],
-    )
-    comparisonStartDate: Optional[date_aliased] = Field(
-        None,
-        description="First date included in this row's metered/billed comparison, or null when the datasets do not overlap",
-        examples=['2026-08-27'],
-    )
-    comparisonState: Optional[ComparisonState] = Field(
-        None,
-        description='Whether this row compares the full requested window, a shorter shared window, or no overlapping records',
-        examples=['partial-window'],
-    )
-    credentialNames: Optional[list[str]] = Field(
-        None,
-        description='Names of the connected billing credentials whose billing this row reports, sorted. Empty when no billing credential is connected for this row.',
-        examples=[['Engineering Enterprise']],
-    )
-    earliestBilledOn: Optional[date_aliased] = Field(
-        None,
-        description='First active provider billing date, or null when billing has not arrived',
-        examples=['2026-08-01'],
-    )
-    earliestMeteredOn: Optional[date_aliased] = Field(
-        None,
-        description="The first day with metered usage for this provider that Revenium found, or null when it found none. It may be earlier than this provider's own first usage, so null does not prove the provider was never metered.",
-        examples=['2026-02-17'],
-    )
-    label: Optional[str] = Field(
-        None,
-        description='Which of the provider\'s billing keys this row reports, where the provider name alone does not say: Anthropic Console (anthropic) or Claude Enterprise (anthropic_enterprise). Usage that belongs to a key with no billing credential connected says so, for example "Anthropic API usage, no Console key". Absent for providers with one kind of billing key.',
-        examples=['Claude Enterprise'],
-    )
-    metered: Optional[float] = Field(
-        None,
-        description='Metered cost for this provider over comparisonStartDate to comparisonEndDate',
-        examples=[12.5],
-    )
-    periodBilling: Optional[float] = Field(
-        None,
-        description='Billing cost for this provider over the whole requested period, startDate to endDate, whatever comparison window the row uses. Equals billing on a full-window row. Zero when nothing was billed in the period or no billing credential is connected. State and ratio are about the comparison window; this field is not.',
-        examples=[65.09],
-    )
-    previousWindowPredatesTelemetry: Optional[bool] = Field(
-        None,
-        description='True when the previous period ends before the first metered day, so the previous figure is zero because nothing was being metered yet. When true for a row that has a billing credential and overlapping metered and billed dates, the overall trend is not reported.',
-        examples=[True],
-    )
-    provider: Optional[str] = Field(
-        None, description='Provider name', examples=['anthropic']
-    )
-    ratio: Optional[float] = Field(
-        None,
-        description="This provider's metered cost divided by its billed cost. Null when its billed cost is not positive.",
-        examples=[0.65],
-    )
-    revisionWindowStart: Optional[date_aliased] = Field(
-        None,
-        description="The first day for which this provider may still revise its figures. Absent when the provider's figures are final when published.",
-        examples=['2026-08-24'],
-    )
-    state: Optional[str] = Field(
-        None,
-        description="Provider state: 'active' if billing or metered data exists in this row's comparison window (comparisonStartDate to comparisonEndDate), 'no-data' otherwise. A no-overlap row reads 'no-data' even when periodBilling is positive.",
-        examples=['active'],
-    )
-    usageTypeBreakdown: Optional[list[UsageTypeBillingRead]] = Field(
-        None,
-        description='Billed amount per charge type for this provider, in USD, over the same period as billing. Absent when no reliable breakdown exists, and never an empty list.',
     )
 
 
@@ -14618,7 +14701,7 @@ class RatingAggregationRead(BaseModel):
     )
 
 
-class FieldEmbedded18(BaseModel):
+class FieldEmbedded19(BaseModel):
     refundResourceList: Optional[list[EntityModelRefundResourceRead]] = None
 
 
@@ -14627,7 +14710,7 @@ class RefundPagedModelRead(BaseModel):
     Paged model for Refunds
     """
 
-    field_embedded: Optional[FieldEmbedded18] = Field(None, alias='_embedded')
+    field_embedded: Optional[FieldEmbedded19] = Field(None, alias='_embedded')
     field_links: Optional[dict[str, Link]] = Field(None, alias='_links')
     page: Optional[PageMetadataRead] = None
 
@@ -14717,32 +14800,32 @@ class SessionAttributionResource(BaseModel):
     workMode: Optional[str] = None
 
 
-class FieldEmbedded19(BaseModel):
+class FieldEmbedded20(BaseModel):
     skillUsageResourceList: Optional[list[EntityModelSkillUsageResourceRead]] = None
 
 
 class SkillUsagePagedModelRead(BaseModel):
-    field_embedded: Optional[FieldEmbedded19] = Field(None, alias='_embedded')
-    field_links: Optional[dict[str, Link]] = Field(None, alias='_links')
-    page: Optional[PageMetadataRead] = None
-
-
-class FieldEmbedded20(BaseModel):
-    sourceResourceList: Optional[list[EntityModelSourceResourceRead]] = None
-
-
-class SourcePagedModelRead(BaseModel):
     field_embedded: Optional[FieldEmbedded20] = Field(None, alias='_embedded')
     field_links: Optional[dict[str, Link]] = Field(None, alias='_links')
     page: Optional[PageMetadataRead] = None
 
 
 class FieldEmbedded21(BaseModel):
+    sourceResourceList: Optional[list[EntityModelSourceResourceRead]] = None
+
+
+class SourcePagedModelRead(BaseModel):
+    field_embedded: Optional[FieldEmbedded21] = Field(None, alias='_embedded')
+    field_links: Optional[dict[str, Link]] = Field(None, alias='_links')
+    page: Optional[PageMetadataRead] = None
+
+
+class FieldEmbedded22(BaseModel):
     subscriberResourceList: Optional[list[EntityModelSubscriberResourceRead]] = None
 
 
 class SubscriberPagedModelRead(BaseModel):
-    field_embedded: Optional[FieldEmbedded21] = Field(None, alias='_embedded')
+    field_embedded: Optional[FieldEmbedded22] = Field(None, alias='_embedded')
     field_links: Optional[dict[str, Link]] = Field(None, alias='_links')
     page: Optional[PageMetadataRead] = None
 
@@ -15353,12 +15436,12 @@ class SubscriptionResourceWrite(BaseModel):
     )
 
 
-class FieldEmbedded23(BaseModel):
+class FieldEmbedded24(BaseModel):
     toolEventResourceList: Optional[list[EntityModelToolEventResourceRead]] = None
 
 
 class ToolEventPagedModelRead(BaseModel):
-    field_embedded: Optional[FieldEmbedded23] = Field(None, alias='_embedded')
+    field_embedded: Optional[FieldEmbedded24] = Field(None, alias='_embedded')
     field_links: Optional[dict[str, Link]] = Field(None, alias='_links')
     page: Optional[PageMetadataRead] = None
 
@@ -15410,12 +15493,12 @@ class ToolPricingRead(BaseModel):
     )
 
 
-class FieldEmbedded24(BaseModel):
+class FieldEmbedded25(BaseModel):
     userResourceList: Optional[list[EntityModelUserResourceRead]] = None
 
 
 class UserPagedModelRead(BaseModel):
-    field_embedded: Optional[FieldEmbedded24] = Field(None, alias='_embedded')
+    field_embedded: Optional[FieldEmbedded25] = Field(None, alias='_embedded')
     field_links: Optional[dict[str, Link]] = Field(None, alias='_links')
     page: Optional[PageMetadataRead] = None
 
@@ -16340,113 +16423,54 @@ class BudgetPortfolioItemPagedModel(BaseModel):
     page: Optional[PageMetadata] = None
 
 
-class FieldEmbedded6(BaseModel):
-    costControlResourceList: Optional[list[EntityModelCostControlResourceRead]] = None
+class FieldEmbedded5(BaseModel):
+    changes: Optional[list[ChangeEntryResource]] = None
 
 
-class CostControlPagedModelRead(BaseModel):
-    field_embedded: Optional[FieldEmbedded6] = Field(None, alias='_embedded')
-    field_links: Optional[dict[str, Link]] = Field(None, alias='_links')
-    page: Optional[PageMetadataRead] = None
-
-
-class CoverageRatioResponseRead(BaseModel):
-    aggregateRatio: Optional[float] = Field(
-        None,
-        description='Metered cost divided by provider-billed cost across providers that have a billing credential. It is 0 or more and can be above 1. Null when aggregateRatioAvailable is false.',
-        examples=[0.82],
-    )
-    aggregateRatioAvailable: Optional[bool] = Field(
-        None,
-        description='True when at least one provider can be compared and their combined billed cost is positive. A compared provider with zero billing does not prevent the aggregate ratio.',
-        examples=[True],
-    )
-    aggregateRatioUnavailableProviders: Optional[list[str]] = Field(
-        None,
-        description='Providers behind the unavailable aggregate: compared providers for a non-positive billed total, or eligible connected providers when none overlap or the period has no spend. Absent when there are no such providers or the ratio is available.',
-    )
-    aggregateRatioUnavailableReason: Optional[AggregateRatioUnavailableReason] = Field(
-        None,
-        description='Why the aggregate ratio cannot be calculated: no eligible billing credential, no provider with overlapping records, a non-positive compared billing total, or no spend in the period. Absent when the ratio is available.',
-    )
-    byProvider: Optional[list[ProviderRatioItemRead]] = Field(
-        None,
-        description='One row per provider with its metered cost, billed cost and ratio for the period. Absent on states that carry no provider list.',
-    )
-    codingAssistantUsagePresent: Optional[bool] = Field(
-        None,
-        description='True when your organization had any coding-assistant usage in the period, whichever tool or provider. It says nothing about spend and is not used in aggregateRatio or hiddenSpend.',
-        examples=[True],
-    )
-    codingAssistantUsageUnknown: Optional[bool] = Field(
-        None,
-        description='True when the organization-wide coding-assistant check could not finish, for example after a timeout. codingAssistantUsagePresent then has no answer rather than meaning none.',
-        examples=[False],
-    )
-    confidence: Optional[Confidence1] = Field(
-        None,
-        description='Coverage confidence: HIGH when every provider compares the full requested period, adjusted when any provider compares a shorter period or none.',
-        examples=['HIGH'],
-    )
-    earliestMeteredAt: Optional[AwareDatetime] = Field(
-        None,
-        description='First active metered event for this organization, or null when no telemetry has arrived',
-        examples=['2026-08-27T22:27:00Z'],
-    )
-    hiddenSpend: Optional[float] = Field(
-        None,
-        description='Billed cost that Revenium did not meter, in USD: total billed minus total metered across providers with a billing credential, never below 0.',
-        examples=[1250.75],
-    )
-    meteredBasis: Optional[CoverageMeteredBasisRead] = None
-    meteredTotalInComparison: Optional[float] = Field(
-        None,
-        description='Metered cost in USD for the providers that have a billing credential. This is the amount aggregateRatio and hiddenSpend were calculated from.',
-        examples=[7057.33],
-    )
-    meteredTotalOutsideComparison: Optional[float] = Field(
-        None,
-        description='Metered cost in USD for providers with no billing credential, which is left out of aggregateRatio and hiddenSpend. Zero when every provider has a billing credential.',
-        examples=[1088.34],
-    )
-    state: Optional[State] = Field(
-        None, description='Overall coverage state', examples=['VALID']
-    )
-    trend: Optional[float] = Field(
-        None,
-        description='Change in aggregateRatio from the previous period of the same length, as a difference in ratio (0.05 means 5 points higher). Null when there is no usable previous period, for example no earlier billing for a provider or a previous period before metering began.',
-        examples=[0.05],
-    )
-
-
-class FieldEmbedded7(BaseModel):
-    credentialResourceList: Optional[list[EntityModelCredentialResource]] = None
-
-
-class CredentialPagedModel(BaseModel):
-    field_embedded: Optional[FieldEmbedded7] = Field(None, alias='_embedded')
+class ChangeEntryPagedModel(BaseModel):
+    field_embedded: Optional[FieldEmbedded5] = Field(None, alias='_embedded')
     field_links: Optional[dict[str, Link]] = Field(None, alias='_links')
     page: Optional[PageMetadata] = None
 
 
-class FieldEmbedded8(BaseModel):
-    credentialResourceList: Optional[list[EntityModelCredentialResourceRead]] = None
+class FieldEmbedded7(BaseModel):
+    costControlResourceList: Optional[list[EntityModelCostControlResourceRead]] = None
 
 
-class CredentialPagedModelRead(BaseModel):
-    field_embedded: Optional[FieldEmbedded8] = Field(None, alias='_embedded')
+class CostControlPagedModelRead(BaseModel):
+    field_embedded: Optional[FieldEmbedded7] = Field(None, alias='_embedded')
     field_links: Optional[dict[str, Link]] = Field(None, alias='_links')
     page: Optional[PageMetadataRead] = None
 
 
+class FieldEmbedded8(BaseModel):
+    credentialResourceList: Optional[list[EntityModelCredentialResource]] = None
+
+
+class CredentialPagedModel(BaseModel):
+    field_embedded: Optional[FieldEmbedded8] = Field(None, alias='_embedded')
+    field_links: Optional[dict[str, Link]] = Field(None, alias='_links')
+    page: Optional[PageMetadata] = None
+
+
 class FieldEmbedded9(BaseModel):
+    credentialResourceList: Optional[list[EntityModelCredentialResourceRead]] = None
+
+
+class CredentialPagedModelRead(BaseModel):
+    field_embedded: Optional[FieldEmbedded9] = Field(None, alias='_embedded')
+    field_links: Optional[dict[str, Link]] = Field(None, alias='_links')
+    page: Optional[PageMetadataRead] = None
+
+
+class FieldEmbedded10(BaseModel):
     discoveredAgentResourceList: Optional[
         list[EntityModelDiscoveredAgentResourceRead]
     ] = None
 
 
 class DiscoveredAgentPagedModelRead(BaseModel):
-    field_embedded: Optional[FieldEmbedded9] = Field(None, alias='_embedded')
+    field_embedded: Optional[FieldEmbedded10] = Field(None, alias='_embedded')
     field_links: Optional[dict[str, Link]] = Field(None, alias='_links')
     page: Optional[PageMetadataRead] = None
 
@@ -16455,14 +16479,14 @@ class EmbeddedRead(BaseModel):
     periodChargeResourceList: Optional[list[EntityModelPeriodChargeResourceRead]] = None
 
 
-class FieldEmbedded10(BaseModel):
+class FieldEmbedded11(BaseModel):
     enforcementEventResourceList: Optional[
         list[EntityModelEnforcementEventResourceRead]
     ] = None
 
 
 class EnforcementEventPagedModelRead(BaseModel):
-    field_embedded: Optional[FieldEmbedded10] = Field(None, alias='_embedded')
+    field_embedded: Optional[FieldEmbedded11] = Field(None, alias='_embedded')
     field_links: Optional[dict[str, Link]] = Field(None, alias='_links')
     page: Optional[PageMetadataRead] = None
 
@@ -16717,12 +16741,12 @@ class EntityModelToolResourceRead(BaseModel):
     )
 
 
-class FieldEmbedded16(BaseModel):
+class FieldEmbedded17(BaseModel):
     toolResourceList: Optional[list[EntityModelToolResourceRead]] = None
 
 
 class PagedModelEntityModelToolResourceRead(BaseModel):
-    field_embedded: Optional[FieldEmbedded16] = Field(None, alias='_embedded')
+    field_embedded: Optional[FieldEmbedded17] = Field(None, alias='_embedded')
     field_links: Optional[dict[str, Link]] = Field(None, alias='_links')
     page: Optional[PageMetadataRead] = None
 
@@ -16808,7 +16832,7 @@ class Plan(BaseModel):
         description='The number of trial period units before billing begins. For example, 14 with trialPeriod DAY means a 14-day free trial',
         examples=[14],
     )
-    type: Type11 = Field(
+    type: Type12 = Field(
         ...,
         description='The plan type determining the billing model. SUBSCRIPTION represents recurring billing with optional metered usage.',
         examples=['SUBSCRIPTION'],
@@ -16881,7 +16905,7 @@ class PlanRead(BaseModel):
         description='The number of trial period units before billing begins. For example, 14 with trialPeriod DAY means a 14-day free trial',
         examples=[14],
     )
-    type: Type14 = Field(
+    type: Type15 = Field(
         ...,
         description='The plan type determining the billing model. SUBSCRIPTION represents recurring billing with optional metered usage.',
         examples=['SUBSCRIPTION'],
@@ -17310,12 +17334,12 @@ class ProductResourceRead(BaseModel):
     )
 
 
-class FieldEmbedded22(BaseModel):
+class FieldEmbedded23(BaseModel):
     subscriptionResourceList: Optional[list[EntityModelSubscriptionResource]] = None
 
 
 class SubscriptionPagedModel(BaseModel):
-    field_embedded: Optional[FieldEmbedded22] = Field(None, alias='_embedded')
+    field_embedded: Optional[FieldEmbedded23] = Field(None, alias='_embedded')
     field_links: Optional[dict[str, Link]] = Field(None, alias='_links')
     page: Optional[PageMetadata] = None
 
@@ -17610,12 +17634,12 @@ class EntityModelProductResource(BaseModel):
     )
 
 
-class FieldEmbedded17(BaseModel):
+class FieldEmbedded18(BaseModel):
     productResourceList: Optional[list[EntityModelProductResource]] = None
 
 
 class ProductPagedModel(BaseModel):
-    field_embedded: Optional[FieldEmbedded17] = Field(None, alias='_embedded')
+    field_embedded: Optional[FieldEmbedded18] = Field(None, alias='_embedded')
     field_links: Optional[dict[str, Link]] = Field(None, alias='_links')
     page: Optional[PageMetadata] = None
 
